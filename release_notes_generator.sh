@@ -15,7 +15,7 @@ START_VERSION: required
 END_VERSION: optional, default: HEAD
 EOM
 
-while getopts ":j:s:e:fh" opt; do
+while getopts ":j:s:h:f" opt; do
     case ${opt} in
         j) JIRAKEY="${OPTARG}"
             ;;
