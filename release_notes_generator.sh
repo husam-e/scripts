@@ -15,13 +15,15 @@ START_VERSION: required
 END_VERSION: optional, default: HEAD
 EOM
 
-while getopts ":j:s:h:f" opt; do
+while getopts ":j:s:h" opt; do
     case ${opt} in
         j) JIRAKEY="${OPTARG}"
             ;;
         s) SCOPES="${OPTARG}"
             ;;
         h) echo "${USAGE}" && exit 0
+            ;;
+        :) echo "Option -${OPTARG} requires an argument."
             ;;
         \? ) echo "${USAGE}" && exit -2
             ;;
