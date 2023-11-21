@@ -29,6 +29,12 @@ if [ -z "${END_VERSION}" ]; then
   END_VERSION="HEAD"
 fi
 
+if [ -z "${JIRAPROJECT}" ]; then
+  ISSUEPREFIX="#" # use default Github/GitLab issue prefix if no JIRA project specified
+else
+  ISSUEPREFIX="${JIRAPROJECT}-"
+fi
+
 echo "Running a git fetch to update local repositories..."
 git fetch
 echo "Completed git fetch"
@@ -69,8 +75,8 @@ git log ${START_VERSION}...${END_VERSION} --pretty=format:"- [(%h)](${CI_PROJECT
 echo "-----"
 
 # TODO: remove blanks when Issue does not exist
-tickets=($(git log ${START_VERSION}...${END_VERSION} --pretty=format:'%s' --reverse | grep -oe '#[0-9]\+'))
-unique=($(echo "${tickets[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+issues=($(git log ${START_VERSION}...${END_VERSION} --pretty=format:'%s' --reverse | grep -oe "${ISSUEPREFIX}[0-9]\+"))
+unique=($(echo "${issues[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
 echo "Commit range includes ${#unique[@]} Issues"
 list=$(IFS=, ; echo "${unique[*]}")
 # If JIRAPROJECT is set, output JIRA query
