@@ -23,8 +23,6 @@ while getopts ":j:s:h" opt; do
             ;;
         h) echo "${USAGE}" && exit 0
             ;;
-        :) echo "Option -${OPTARG} requires an argument."
-            ;;
         \? ) echo "${USAGE}" && exit -2
             ;;
     esac
