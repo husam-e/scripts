@@ -13,6 +13,9 @@ Usage: release_notes_helper.sh [-j JIRAKEY] [-s SCOPES] <START_VERSION> [END_VER
 "-s": optinal, the scopes to filter commits for - anything that regular `grep` can understand and find in the commit message. Default: ".*"
 START_VERSION: required
 END_VERSION: optional, default: HEAD
+
+Required env vars:
+CI_PROJECT_URL: The URL for the repository (no trailing `/`).
 EOM
 
 while getopts ":j:s:h" opt; do
