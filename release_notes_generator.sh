@@ -10,7 +10,7 @@ Usage: release_notes_helper.sh [-j JIRAKEY] [-s SCOPES] <START_VERSION> [END_VER
     example 5 (from a release tag to main, with JIRA key and scopes): ./release_notes_helper.sh -j MYPROJ -s "(ui)\|(backend)" v1.1.0 origin/main
 
 "-j": optional, the JIRA Project Key e.g. "MYPROJ".
-"-s": optinal, the scopes to filter commits for - anything that regular `grep` can understand and find in the commit message. Default: ".*"
+"-s": optional, the scopes to filter commits for - anything that regular `grep` can understand and find in the commit message. Default: ".*"
 START_VERSION: required
 END_VERSION: optional, default: HEAD
 
