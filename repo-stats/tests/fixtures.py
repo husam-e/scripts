@@ -5,13 +5,21 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Iterable, Mapping
 
 DAY = 86400
 T0 = 1_640_995_200  # 2022-01-01T00:00:00Z
 
 
 class Repo:
-    def __init__(self, path=None):
+    """A throwaway git repository with a controllable commit clock."""
+
+    def __init__(self, path: str | Path | None = None) -> None:
+        """Initialise an empty repo on branch main with a fixed test identity.
+
+        Args:
+            path: Directory to use; a fresh temporary directory when omitted.
+        """
         self.path = Path(path or tempfile.mkdtemp(prefix="repostats-fixture-"))
         self.clock = T0
         self.git("init", "-q", "-b", "main")
@@ -19,7 +27,17 @@ class Repo:
         self.git("config", "user.email", "dev@example.com")
         self.git("config", "commit.gpgsign", "false")
 
-    def git(self, *args, date=None, check=True):
+    def git(self, *args: str, date: int | None = None, check: bool = True) -> str:
+        """Run a git command in the repo with author and committer dates pinned.
+
+        Args:
+            args: Arguments passed to git.
+            date: Unix time for both dates; defaults to the repo clock.
+            check: Raise RuntimeError when git exits non-zero.
+
+        Returns:
+            git's stdout, stripped.
+        """
         env = dict(os.environ)
         d = date if date is not None else self.clock
         iso = f"{d} +0000"
@@ -29,15 +47,27 @@ class Repo:
             raise RuntimeError(f"git {args} failed: {p.stderr}")
         return p.stdout.strip()
 
-    def advance(self, seconds):
+    def advance(self, seconds: int) -> None:
+        """Move the repo clock forward by `seconds`."""
         self.clock += seconds
 
-    def write(self, rel, text):
+    def write(self, rel: str, text: str) -> None:
+        """Write `text` to the file at relative path `rel`, creating parent directories."""
         f = self.path / rel
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(text)
 
-    def commit(self, msg, files=None, advance=3600):
+    def commit(self, msg: str, files: Mapping[str, str] | None = None, advance: int = 3600) -> str:
+        """Write `files`, commit all changes with message `msg`, then advance the clock.
+
+        Args:
+            msg: Commit message.
+            files: Map of relative path to new file content.
+            advance: Seconds to move the clock after committing.
+
+        Returns:
+            The new commit's SHA.
+        """
         for rel, text in (files or {}).items():
             self.write(rel, text)
         self.git("add", "-A")
@@ -45,14 +75,28 @@ class Repo:
         self.advance(advance)
         return self.git("rev-parse", "HEAD")
 
-    def tag(self, name, annotated=False):
+    def tag(self, name: str, annotated: bool = False) -> None:
+        """Tag HEAD as `name`, as an annotated tag when `annotated` is true."""
         if annotated:
             self.git("tag", "-a", name, "-m", name)
         else:
             self.git("tag", name)
 
-    def merge_pr(self, number, branch, title, commits, merge_after=7200, user="dev"):
-        """GitHub 'merge commit' style: branch commits then a --no-ff merge."""
+    def merge_pr(self, number: int, branch: str, title: str, commits: Iterable[tuple[str, Mapping[str, str]]],
+                 merge_after: int = 7200, user: str = "dev") -> str:
+        """Simulate a GitHub 'merge commit' PR: branch commits, then a --no-ff merge into main.
+
+        Args:
+            number: PR number used in the merge subject.
+            branch: Feature branch name.
+            title: PR title, written as the merge body.
+            commits: (message, files) pairs committed on the branch.
+            merge_after: Seconds between the last branch commit and the merge.
+            user: Branch owner shown in the merge subject.
+
+        Returns:
+            The merge commit's SHA.
+        """
         self.git("checkout", "-q", "-b", branch)
         for msg, files in commits:
             self.commit(msg, files)
@@ -63,18 +107,25 @@ class Repo:
         self.advance(3600)
         return self.git("rev-parse", "HEAD")
 
-    def squash_pr(self, number, title, files, body=""):
+    def squash_pr(self, number: int, title: str, files: Mapping[str, str], body: str = "") -> str:
+        """Simulate a GitHub squash merge: one commit on main titled 'title (#number)'.
+
+        Returns:
+            The new commit's SHA.
+        """
         msg = f"{title} (#{number})"
         self.write("x", "")
         os.remove(self.path / "x")
         return self.commit(msg + (f"\n\n{body}" if body else ""), files)
 
 
-def lines(n, prefix="line"):
+def lines(n: int, prefix: str = "line") -> str:
+    """Return `n` numbered text lines, each ending in a newline."""
     return "".join(f"{prefix} {i}\n" for i in range(n))
 
 
-def merge_workflow_repo():
+def merge_workflow_repo() -> Repo:
+    """Build a small merge-commit history: PRs #1-#5 (one revert, one hotfix), two tags and direct commits."""
     r = Repo()
     r.commit("chore: initial commit", {"README.md": lines(5), "src/app.py": lines(40)})
     r.advance(DAY)
@@ -97,7 +148,8 @@ def merge_workflow_repo():
     return r
 
 
-def squash_workflow_repo():
+def squash_workflow_repo() -> Repo:
+    """Build a squash-merge history: PRs #2-#7, a revert of #2 as #8, and one tag."""
     r = Repo()
     r.commit("chore: initial commit", {"app.js": lines(20)})
     r.advance(DAY)
@@ -111,8 +163,15 @@ def squash_workflow_repo():
     return r
 
 
-def synthetic_repo(n_prs=150, seed=7, days=540, style="merge"):
-    """A larger deterministic history with varied sizes, types, reverts and releases."""
+def synthetic_repo(n_prs: int = 150, seed: int = 7, days: int = 540, style: str = "merge") -> Repo:
+    """Build a larger deterministic history with varied sizes, types, reverts and releases.
+
+    Args:
+        n_prs: Number of PRs.
+        seed: Random seed.
+        days: Rough time span of the history.
+        style: "merge" for --no-ff merge commits, anything else for squash commits.
+    """
     import random
     rnd = random.Random(seed)
     r = Repo()

@@ -6,27 +6,45 @@ import json
 import threading
 import urllib.parse
 from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+
+# A recorded request: method, path, query, raw_path, headers (lower-cased names), body and port.
+Request = Dict[str, Any]
+# A handler's answer: (status, headers or None, payload as bytes, str or a JSON-serialisable object).
+Response = Tuple[int, Optional[Mapping[str, str]], Any]
+Handler = Callable[[Request], Response]
 
 
-def iso(t):
+def iso(t: float | None) -> str | None:
+    """Format a Unix time as an ISO-8601 UTC string; None stays None."""
     return None if t is None else datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class MockServer:
-    """handler(req) -> (status, headers_dict, body_bytes|str|obj). req is a dict."""
+    """A threaded HTTP server on 127.0.0.1 that answers every request with `handler`.
 
-    def __init__(self, handler):
+    The handler receives a request dict (method, path, query, raw_path, headers, body, port) and
+    returns (status, headers, payload); a payload that is not bytes or str is sent as JSON.
+    Every request is also recorded in `requests`.
+    """
+
+    def __init__(self, handler: Handler) -> None:
+        """Bind to a free loopback port; call start() or use `with` to begin serving."""
         self.handler = handler
         self.requests = []
         outer = self
 
         class H(http.server.BaseHTTPRequestHandler):
+            """Request handler that records each request and delegates the response to `handler`."""
+
             protocol_version = "HTTP/1.0"
 
-            def log_message(self, *a):
+            def log_message(self, format: str, *args: Any) -> None:
+                """Silence the default per-request logging to stderr."""
                 pass
 
-            def _do(self):
+            def _do(self) -> None:
+                """Read and record the request, then write the handler's response."""
                 n = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(n) if n else b""
                 parsed = urllib.parse.urlparse(self.path)
@@ -55,30 +73,46 @@ class MockServer:
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
 
     @property
-    def url(self):
+    def url(self) -> str:
+        """Base URL of the server, e.g. http://127.0.0.1:PORT."""
         return f"http://127.0.0.1:{self.port}"
 
-    def start(self):
+    def start(self) -> MockServer:
+        """Start serving in a daemon thread and return self."""
         self.thread.start()
         return self
 
-    def stop(self):
+    def stop(self) -> None:
+        """Shut the server down and close its socket."""
         self.httpd.shutdown()
         self.httpd.server_close()
 
-    def __enter__(self):
+    def __enter__(self) -> MockServer:
+        """Start the server for a `with` block."""
         return self.start()
 
-    def __exit__(self, *a):
+    def __exit__(self, *a: object) -> None:
+        """Stop the server when the `with` block ends."""
         self.stop()
 
 
 # ----------------------------------------------------------------- GitHub
 
-def gh_node(number, title, created, merged=None, closed=None, state=None, base="main", head=None, author="alice",
-            author_type="User", additions=10, deletions=2, files=1, commits=1, first_commit=None, merge_oid=None,
-            labels=(), reviews=(), ready=None, draft=False):
-    """reviews: list of (login, type, state, submitted_ts)."""
+def gh_node(number: int, title: str, created: int, merged: int | None = None, closed: int | None = None,
+            state: str | None = None, base: str = "main", head: str | None = None, author: str = "alice",
+            author_type: str = "User", additions: int = 10, deletions: int = 2, files: int = 1, commits: int = 1,
+            first_commit: int | None = None, merge_oid: str | None = None, labels: Iterable[str] = (),
+            reviews: Iterable[tuple[str, str, str, int]] = (), ready: int | None = None,
+            draft: bool = False) -> dict[str, Any]:
+    """Build one GitHub GraphQL pullRequest node with the fields repo_stats queries.
+
+    Times are Unix seconds. The state is MERGED when `merged` is set and OPEN otherwise, unless
+    `state` is given.
+
+    Args:
+        reviews: (login, author __typename, review state, submitted time) tuples.
+        ready: Time of the ready-for-review event, if any.
+    """
     state = state or ("MERGED" if merged else "OPEN")
     return {
         "number": number, "title": title, "state": state, "isDraft": draft, "createdAt": iso(created),
@@ -94,10 +128,17 @@ def gh_node(number, title, created, merged=None, closed=None, state=None, base="
     }
 
 
-def github_handler(nodes, page_size=3, status_override=None, expect_token=None):
-    """Serve nodes (already ordered newest-created first) in pages of page_size via GraphQL cursors."""
+def github_handler(nodes: Sequence[Mapping[str, Any]], page_size: int = 3, status_override: Handler | None = None,
+                   expect_token: str | None = None) -> Handler:
+    """Serve nodes (already ordered newest-created first) in pages of page_size via GraphQL cursors.
 
-    def handler(req):
+    Args:
+        status_override: When set, answers every request instead.
+        expect_token: When set, requests without this bearer token get 401.
+    """
+
+    def handler(req: Request) -> Response:
+        """Answer one GraphQL request with the page selected by its cursor variable."""
         if status_override:
             return status_override(req)
         if expect_token and req["headers"].get("authorization") != f"Bearer {expect_token}":
@@ -115,8 +156,14 @@ def github_handler(nodes, page_size=3, status_override=None, expect_token=None):
 
 # ----------------------------------------------------------------- GitLab
 
-def gl_mr(iid, title, created, merged=None, closed=None, state=None, source="feat/x", author="alice",
-          author_bot=False, merge_sha=None, squash_sha=None, labels=()):
+def gl_mr(iid: int, title: str, created: int, merged: int | None = None, closed: int | None = None,
+          state: str | None = None, source: str = "feat/x", author: str = "alice", author_bot: bool = False,
+          merge_sha: str | None = None, squash_sha: str | None = None, labels: Iterable[str] = ()) -> dict[str, Any]:
+    """Build one GitLab REST merge request object.
+
+    Times are Unix seconds. The state is merged when `merged` is set and opened otherwise, unless
+    `state` is given.
+    """
     state = state or ("merged" if merged else "opened")
     return {"iid": iid, "title": title, "state": state, "created_at": iso(created), "merged_at": iso(merged),
             "closed_at": iso(closed), "source_branch": source, "target_branch": "main",
@@ -124,11 +171,23 @@ def gl_mr(iid, title, created, merged=None, closed=None, state=None, source="fea
             "squash_commit_sha": squash_sha, "labels": list(labels), "draft": False}
 
 
-def gitlab_handler(mrs, commits=None, notes=None, page_size=2, status_override=None):
+def gitlab_handler(mrs: Sequence[Mapping[str, Any]], commits: Mapping[int, list[dict[str, Any]]] | None = None,
+                   notes: Mapping[int, list[dict[str, Any]]] | None = None, page_size: int = 2,
+                   status_override: Handler | None = None) -> Handler:
+    """Serve GitLab merge request lists (paged via X-Next-Page) and per-MR commits and notes.
+
+    Args:
+        mrs: Merge requests in the order the list endpoint returns them.
+        commits: Map of MR iid to its commit objects.
+        notes: Map of MR iid to its note objects.
+        page_size: Merge requests per list page.
+        status_override: When set, answers every request instead.
+    """
     commits = commits or {}
     notes = notes or {}
 
-    def handler(req):
+    def handler(req: Request) -> Response:
+        """Route one GitLab API request; requests without a PRIVATE-TOKEN header get 401."""
         if status_override:
             return status_override(req)
         if req["headers"].get("private-token") is None:
@@ -149,9 +208,11 @@ def gitlab_handler(mrs, commits=None, notes=None, page_size=2, status_override=N
     return handler
 
 
-def gl_note(author, ts, system=False, bot=False):
+def gl_note(author: str, ts: int, system: bool = False, bot: bool = False) -> dict[str, Any]:
+    """Build one GitLab note (MR comment) object."""
     return {"author": {"username": author, "bot": bot}, "created_at": iso(ts), "system": system}
 
 
-def gl_commit(ts):
+def gl_commit(ts: int) -> dict[str, Any]:
+    """Build one GitLab MR commit object authored and created at `ts`."""
     return {"authored_date": iso(ts), "created_at": iso(ts)}

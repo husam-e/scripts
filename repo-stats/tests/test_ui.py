@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence, cast
 
 import helpers
 from helpers import add_remote, collect, rs
@@ -33,13 +34,15 @@ GROUP_OF = {"style": "chore", "build": "chore", "ci": "chore", "revert": "other"
 EVIL = '</script><img src=x onerror=alert(1)> "q" \'s\' & <b class=pwn>b</b>'
 
 
-def group_of(t):
+def group_of(t: str) -> str:
+    """Map a PR type to the dashboard's type group."""
     return t if t in TYPE_GROUPS else GROUP_OF.get(t, "other")
 
 
 # ----------------------------------------------------------------------------------- independent maths
 
-def percentile(v, p):
+def percentile(v: Iterable[float], p: float) -> float | None:
+    """Return the linearly interpolated `p`th percentile (0-100) of `v`, or None when `v` is empty."""
     v = sorted(v)
     if not v:
         return None
@@ -50,7 +53,11 @@ def percentile(v, p):
     return v[lo] + (v[hi] - v[lo]) * (r - lo)
 
 
-def stat_row(vals):
+def stat_row(vals: Iterable[float | None]) -> dict[str, Any] | None:
+    """Compute a statistics row (n, mean, percentiles, min, max, sample SD) as the dashboard does.
+
+    None values are ignored; returns None when no values are left.
+    """
     v = sorted(x for x in vals if x is not None)
     n = len(v)
     if not n:
@@ -65,14 +72,20 @@ COLS = ["n", "mean", "median", "p75", "p90", "p95", "p99", "min", "max", "sd"]
 UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "mo": 30.44 * 86400}
 
 
-def parse_num(cell):
+def parse_num(cell: str) -> float | None:
+    """Parse a number cell such as '1,234.5'; '–' or blank gives None."""
     cell = cell.strip()
     if cell in ("–", ""):
         return None
     return float(cell.replace(",", ""))
 
 
-def parse_dur(cell):
+def parse_dur(cell: str) -> tuple[float | None, float]:
+    """Parse a duration cell such as '3.5h' into seconds.
+
+    Returns:
+        (seconds, seconds per displayed unit); (None, 1) for '–' or blank.
+    """
     cell = cell.strip()
     if cell in ("–", ""):
         return None, 1
@@ -82,25 +95,30 @@ def parse_dur(cell):
     return float(m.group(1).replace(",", "")) * unit, unit
 
 
-def utc(t):
+def utc(t: float) -> dt.datetime:
+    """Convert a Unix time to an aware UTC datetime."""
     return dt.datetime.fromtimestamp(t, dt.timezone.utc)
 
 
-def day_start(t):
+def day_start(t: int) -> int:
+    """Return the start of the UTC day containing `t`."""
     return t - t % DAY
 
 
-def week_start(t):
+def week_start(t: int) -> int:
+    """Return the start of the UTC week (Monday) containing `t`."""
     d = utc(t)
     return day_start(t) - d.weekday() * DAY
 
 
-def month_start(t):
+def month_start(t: int) -> int:
+    """Return the start of the UTC month containing `t`."""
     d = utc(t)
     return int(dt.datetime(d.year, d.month, 1, tzinfo=dt.timezone.utc).timestamp())
 
 
-def next_bucket(t, kind):
+def next_bucket(t: int, kind: str) -> int:
+    """Return the start of the day, week or month bucket after the one starting at `t`."""
     if kind == "day":
         return t + DAY
     if kind == "week":
@@ -110,11 +128,13 @@ def next_bucket(t, kind):
     return int(dt.datetime(y, m, 1, tzinfo=dt.timezone.utc).timestamp())
 
 
-def bucket_start(t, kind):
+def bucket_start(t: int, kind: str) -> int:
+    """Return the start of the `kind` ('day', 'week' or 'month') bucket containing `t`."""
     return {"day": day_start, "week": week_start, "month": month_start}[kind](t)
 
 
-def data_range(data):
+def data_range(data: Mapping[str, Any]) -> tuple[int, int]:
+    """Return the earliest and latest timestamps in the data, the dashboard's 'All time' range."""
     times = [p["merged"] or p["created"] for p in data["prs"] if (p["merged"] or p["created"])]
     times += [p["closed"] for p in data["prs"] if p["closed"]]
     times += [d[0] for d in data["loc"]["days"]]
@@ -122,7 +142,12 @@ def data_range(data):
     return min(times), max(times)
 
 
-def js_range(data, steps):
+def js_range(data: Mapping[str, Any], steps: Sequence[Mapping[str, Any]]) -> tuple[int, int]:
+    """Recompute the dashboard's selected time range after the UI `steps`.
+
+    Returns:
+        (start, end) Unix times, both inclusive.
+    """
     lo_all, hi_all = data_range(data)
     preset, frm, to = "all", None, None
     for s in steps:
@@ -146,7 +171,14 @@ def js_range(data, steps):
     return max(lo, lo_all), min(hi, hi_all + DAY)
 
 
-def selection(data, steps):
+def selection(data: Mapping[str, Any], steps: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], tuple[int, int]]:
+    """Return the merged PRs the dashboard should show after the UI `steps`.
+
+    Applies the time range, type toggles and bot toggle.
+
+    Returns:
+        (selected PRs, (start, end) of the range).
+    """
     lo, hi = js_range(data, steps)
     types = set(TYPE_GROUPS)
     bots = True
@@ -161,7 +193,12 @@ def selection(data, steps):
             and lo <= p["merged"] <= hi], (lo, hi)
 
 
-def period_counts(times, kind, lo, hi):
+def period_counts(times: Iterable[int], kind: str, lo: int, hi: int) -> list[list[int]]:
+    """Count `times` per `kind` bucket from `lo` to `hi`, including empty buckets.
+
+    Returns:
+        [bucket start, count] pairs in time order.
+    """
     out = []
     idx = {}
     t = bucket_start(lo, kind)
@@ -176,7 +213,8 @@ def period_counts(times, kind, lo, hi):
     return out
 
 
-def trimmed_period_counts(times, kind, lo, hi):
+def trimmed_period_counts(times: Iterable[int], kind: str, lo: int, hi: int) -> list[int]:
+    """Per-bucket counts with partial first and last week or month buckets dropped, as the dashboard does."""
     b = period_counts(times, kind, lo, hi)
     if kind != "day" and len(b) > 2:
         if b[0][0] < lo:
@@ -188,7 +226,8 @@ def trimmed_period_counts(times, kind, lo, hi):
 
 # ----------------------------------------------------------------------------------- dataset builders
 
-def build_api_data():
+def build_api_data() -> dict[str, Any]:
+    """Collect the 150-PR synthetic repo through a mock GitHub API with seeded review, bot and state data."""
     base_path = helpers.cached_synthetic(150)
     work = Path(tempfile.mkdtemp(prefix="repostats-uiapi-")) / "repo"
     shutil.copytree(base_path, work, symlinks=True)
@@ -227,10 +266,16 @@ def build_api_data():
     return data
 
 
-def build_datasets(tmp):
+def build_datasets(tmp: Path) -> dict[str, dict[str, Any]]:
+    """Render every UI test dataset to an HTML file in `tmp`.
+
+    Returns:
+        Map of dataset name to {name, html path, collected data}.
+    """
     sets = {}
 
-    def add(name, data):
+    def add(name: str, data: dict[str, Any]) -> None:
+        """Render `data` to `<tmp>/<name>.html` and register it as dataset `name`."""
         path = tmp / f"{name}.html"
         path.write_text(rs.render_html(data), encoding="utf-8")
         sets[name] = {"name": name, "html": str(path), "data": data}
@@ -277,7 +322,8 @@ def build_datasets(tmp):
     return sets
 
 
-def scenarios(sets):
+def scenarios(sets: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return the filter scenarios for the runner: name, UI steps and, optionally, the only datasets to use."""
     sc = [
         ("all", []),
         ("12m", [{"op": "preset", "value": "12m"}]),
@@ -298,11 +344,17 @@ def scenarios(sets):
 
 
 class UiTests(unittest.TestCase):
+    """Assertions on the results of a single ui_runner.js browser run."""
+
     R: dict = {}
     sets: dict = {}
 
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
+        """Build the datasets and run every browser check in one node process.
+
+        Skips the class when node, the playwright package or chromium is missing.
+        """
         if not shutil.which("node"):
             raise unittest.SkipTest("node is not installed")
         probe = subprocess.run(["node", "-e", "require('playwright')"], capture_output=True, text=True, cwd=str(HERE))
@@ -330,7 +382,8 @@ class UiTests(unittest.TestCase):
         cls.shots = shots
 
     # ------------------------------------------------------------------ D1
-    def test_d1_loads_without_console_or_page_errors(self):
+    def test_d1_loads_without_console_or_page_errors(self) -> None:
+        """Every dataset loads without console errors, page errors or dialogs."""
         for row in self.R["load"]:
             with self.subTest(row["ds"], theme=row["theme"], width=row["width"]):
                 self.assertEqual(row["errors"], [])
@@ -339,24 +392,28 @@ class UiTests(unittest.TestCase):
                 self.assertEqual(row["sections"], [], "missing section ids")
                 self.assertEqual(row["themeAttr"], row["theme"])
 
-    def test_d1_no_horizontal_scroll(self):
+    def test_d1_no_horizontal_scroll(self) -> None:
+        """No page scrolls horizontally at any width."""
         for row in self.R["load"]:
             with self.subTest(row["ds"], theme=row["theme"], width=row["width"]):
                 self.assertLessEqual(row["hscroll"], 0, "page scrolls horizontally")
                 self.assertEqual(row["overflowing"], [])
 
-    def test_d1_no_network_requests(self):
+    def test_d1_no_network_requests(self) -> None:
+        """Pages make no network requests."""
         for row in self.R["load"]:
             self.assertEqual(row["attempts"], [], row["ds"])
 
     # ------------------------------------------------------------------ D2
-    def test_d2_default_theme_dark_even_when_os_is_light(self):
+    def test_d2_default_theme_dark_even_when_os_is_light(self) -> None:
+        """The default theme is dark, even when the OS prefers light."""
         step = self.R["theme"]["steps"][0]
         self.assertEqual(step["theme"], "dark")
         self.assertEqual(step["surface"], "#1a1a19")
         self.assertEqual(self.R["themeOsDark"], "dark")
 
-    def test_d2_switch_persist_and_rerender(self):
+    def test_d2_switch_persist_and_rerender(self) -> None:
+        """Switching theme recolours the page and persists across reloads."""
         s = {x["label"]: x for x in self.R["theme"]["steps"]}
         dark, light = s["initial (OS light, nothing stored)"], s["after click 1"]
         self.assertEqual(light["theme"], "light")
@@ -373,7 +430,8 @@ class UiTests(unittest.TestCase):
         self.assertEqual(s["after reload 2"]["barFill"], "#3987e5")
         self.assertEqual(self.R["theme"]["errors"], [])
 
-    def test_d2_all_charts_use_new_palette(self):
+    def test_d2_all_charts_use_new_palette(self) -> None:
+        """Every chart switches to the palette of the selected theme."""
         s = {x["label"]: x for x in self.R["theme"]["steps"]}
         dark_only = {"#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#9085e9", "#e66767"}
         light_only = {"#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#6250d6", "#e34948"}
@@ -382,31 +440,36 @@ class UiTests(unittest.TestCase):
         self.assertTrue(light_only & set(s["after click 1"]["fills"]))
         self.assertNotEqual(s["initial (OS light, nothing stored)"]["chipDot"], s["after click 1"]["chipDot"])
 
-    def test_d2_theme_button_state_text(self):
+    def test_d2_theme_button_state_text(self) -> None:
+        """The theme button's label and pressed state follow the theme."""
         s = {x["label"]: x for x in self.R["theme"]["steps"]}
         self.assertEqual(s["initial (OS light, nothing stored)"]["btn"], ["Dark theme", "true"])
         self.assertEqual(s["after click 1"]["btn"], ["Light theme", "false"])
 
     # ------------------------------------------------------------------ D3
-    def test_d3_no_null_undefined_nan_text(self):
+    def test_d3_no_null_undefined_nan_text(self) -> None:
+        """No null, undefined or NaN text appears on load."""
         for row in self.R["load"]:
             with self.subTest(row["ds"], theme=row["theme"], width=row["width"]):
                 self.assertEqual(row["text"], [])
 
-    def test_d3_no_bad_text_after_every_control(self):
+    def test_d3_no_bad_text_after_every_control(self) -> None:
+        """No bad text or errors appear after using each control."""
         for row in self.R["controls"]:
             with self.subTest(row["ds"]):
                 self.assertEqual(row["issues"], [])
                 self.assertEqual(row["errors"] + row["pageErrors"], [])
 
-    def test_d3_all_sections_have_cards(self):
+    def test_d3_all_sections_have_cards(self) -> None:
+        """Non-empty datasets render all cards and charts."""
         for row in self.R["load"]:
             if row["ds"] in ("empty",):
                 continue
             self.assertGreater(row["cards"], 25, row["ds"])
             self.assertGreater(row["svgs"], 12, row["ds"])
 
-    def test_d3_metric_selector_offers_expected_metrics(self):
+    def test_d3_metric_selector_offers_expected_metrics(self) -> None:
+        """The metric selector offers API-only metrics only for API data."""
         by = {r["ds"]: r for r in self.R["controls"]}
         self.assertIn("lead", by["merge"]["metricOptions"])
         self.assertNotIn("pickup", by["merge"]["metricOptions"])
@@ -414,7 +477,8 @@ class UiTests(unittest.TestCase):
         self.assertIn("open_to_merge", by["api"]["metricOptions"])
 
     # ------------------------------------------------------------------ D4
-    def test_d4_filters_match_independent_counts(self):
+    def test_d4_filters_match_independent_counts(self) -> None:
+        """Filtered KPI, table and chart counts match an independent computation."""
         for item in self.R["filters"]:
             data = self.sets[item["ds"]]["data"]
             with self.subTest(item["ds"], scenario=item["name"]):
@@ -439,7 +503,8 @@ class UiTests(unittest.TestCase):
                     self.assertIsNotNone(dt_, "day table")
                     self.assertEqual(sum(int(float(r[1].replace(",", ""))) for r in dt_["rows"]), len(prs), "sum of daily bars")
 
-    def test_d4_filters_actually_change_numbers(self):
+    def test_d4_filters_actually_change_numbers(self) -> None:
+        """Range, type and bot filters change the merged PR count."""
         by = {(i["ds"], i["name"]): int(i["snap"]["kpis"]["Merged PRs"]["value"].replace(",", "")) for i in self.R["filters"]}
         for ds in ("merge", "api"):
             self.assertGreater(by[(ds, "all")], by[(ds, "12m")])
@@ -450,7 +515,8 @@ class UiTests(unittest.TestCase):
             self.assertEqual(by[(ds, "period-month")], by[(ds, "all")])
         self.assertGreater(by[("api", "all")], by[("api", "bots-off")])
 
-    def test_d4_zero_selection_renders_no_data_states(self):
+    def test_d4_zero_selection_renders_no_data_states(self) -> None:
+        """Empty selections show 'No data' states and a zero count."""
         for item in self.R["filters"]:
             if item["name"] in ("all-types-off", "custom-before-data", "custom-inverted"):
                 with self.subTest(item["ds"], scenario=item["name"]):
@@ -458,7 +524,16 @@ class UiTests(unittest.TestCase):
                     self.assertEqual(item["snap"]["kpis"]["Merged PRs"]["value"], "0")
 
     # ------------------------------------------------------------------ D5
-    def _check_stat_row(self, cells, vals, fmt="num", label=""):
+    def _check_stat_row(self, cells: Sequence[str], vals: Iterable[float | None], fmt: str = "num",
+                        label: str = "") -> None:
+        """Assert that a rendered statistics row matches stat_row(vals) within display rounding.
+
+        Args:
+            cells: Displayed cells: n, then the COLS statistics.
+            vals: Raw values of the metric.
+            fmt: 'num' for plain numbers, anything else for durations.
+            label: Prefix for failure messages.
+        """
         want = stat_row(vals)
         if want is None:
             self.assertTrue(all(c == "–" for c in cells[1:]), (label, cells))
@@ -474,7 +549,8 @@ class UiTests(unittest.TestCase):
                 self.assertIsNotNone(got, (label, key, cell))
                 self.assertAlmostEqual(got, want[key], delta=0.051 * unit + 1.01, msg=f"{label} {key}: shown {cell}, expected {want[key]}")
 
-    def test_d5_size_statistics_match_python(self):
+    def test_d5_size_statistics_match_python(self) -> None:
+        """Size statistics tables match Python's computation."""
         for name in ("merge", "squash", "api"):
             data = self.sets[name]["data"]
             merged = [p for p in data["prs"] if p["state"] == "merged"]
@@ -484,7 +560,8 @@ class UiTests(unittest.TestCase):
                 with self.subTest(name, metric=key):
                     self._check_stat_row(rows[label][:10], [p[key] for p in merged], "num", f"{name}.{key}")
 
-    def test_d5_duration_statistics_match_python(self):
+    def test_d5_duration_statistics_match_python(self) -> None:
+        """Duration statistics tables match Python's computation."""
         keys = {"Coding time": "coding", "Pickup time": "pickup", "Review time": "review", "Open to merge": "open_to_merge",
                 "Lead time": "lead", "Merge to release": "deploy_wait", "Lead time to release": "lead_to_deploy"}
         for name in ("merge", "api"):
@@ -495,7 +572,8 @@ class UiTests(unittest.TestCase):
                 with self.subTest(name, metric=key):
                     self._check_stat_row(row[1:11], [p[key] for p in merged], "dur", f"{name}.{key}")
 
-    def test_d5_prs_per_period_statistics_match_python(self):
+    def test_d5_prs_per_period_statistics_match_python(self) -> None:
+        """PRs-per-period statistics match Python's computation."""
         for name in ("merge", "squash", "api"):
             data = self.sets[name]["data"]
             lo, hi = js_range(data, [])
@@ -505,26 +583,29 @@ class UiTests(unittest.TestCase):
                 with self.subTest(name, kind=kind):
                     self._check_stat_row(rows[f"per {kind}"][:10], trimmed_period_counts(times, kind, lo, hi), "num", f"{name}.per {kind}")
 
-    def test_d5_risk_score_statistics_match_python(self):
+    def test_d5_risk_score_statistics_match_python(self) -> None:
+        """Risk score statistics match Python's computation."""
         for name in ("merge", "api"):
             merged = [p for p in self.sets[name]["data"]["prs"] if p["state"] == "merged"]
             row = self.R["stats"][name]["riskStats"][0]["rows"][0]
             self._check_stat_row(row[1:11], [p["risk"] for p in merged], "num", f"{name}.risk")
 
-    def test_d5_kpis_match_python(self):
+    def test_d5_kpis_match_python(self) -> None:
+        """Headline KPIs match Python's computation."""
         for name in ("merge", "squash", "api"):
             data = self.sets[name]["data"]
             merged = [p for p in data["prs"] if p["state"] == "merged"]
             k = self.R["stats"][name]["snap"]["kpis"]
             lines_ = sorted(p["lines"] for p in merged if p["lines"] is not None)
-            self.assertEqual(int(k["Median PR size"]["value"].replace(",", "")), math.floor(percentile(lines_, 50) + 0.5), name)
+            self.assertEqual(int(k["Median PR size"]["value"].replace(",", "")), math.floor(cast(float, percentile(lines_, 50)) + 0.5), name)
             cfr = sum(1 for p in merged if p["kind"]) / len(merged)
             self.assertAlmostEqual(float(re.sub(r"(Elite|High|Medium|Low)$", "", k["Change failure rate"]["value"]).rstrip("%")), cfr * 100, delta=0.051)
             hi_risk = sum(1 for p in merged if p["risk_level"] in ("high", "critical")) / len(merged)
             self.assertAlmostEqual(float(k["High or critical risk"]["value"].rstrip("%")), hi_risk * 100, delta=0.051)
             self.assertEqual(int(re.sub(r"(Elite|High|Medium|Low)$", "", k["Releases"]["value"]).replace(",", "")), len(data["deploys"]))
 
-    def test_d5_size_bucket_table_matches_python(self):
+    def test_d5_size_bucket_table_matches_python(self) -> None:
+        """The PR size bucket table matches Python's counts."""
         data = self.sets["merge"]["data"]
         merged = [p for p in data["prs"] if p["state"] == "merged"]
         buckets = {"XS": 0, "S": 0, "M": 0, "L": 0, "XL": 0}
@@ -534,13 +615,15 @@ class UiTests(unittest.TestCase):
         rows = {r[0]: int(r[1].replace(",", "")) for r in self.R["stats"]["merge"]["sizeBuckets"][0]["rows"]}
         self.assertEqual(rows, buckets)
 
-    def test_d5_risk_level_table_matches_python(self):
+    def test_d5_risk_level_table_matches_python(self) -> None:
+        """The risk level table matches Python's counts."""
         merged = [p for p in self.sets["merge"]["data"]["prs"] if p["state"] == "merged"]
         want = {lv: sum(1 for p in merged if p["risk_level"] == lv) for lv in ("low", "medium", "high", "critical")}
         rows = {r[0]: int(r[1].replace(",", "")) for r in self.R["stats"]["merge"]["byRisk"][0]["rows"]}
         self.assertEqual(rows, want)
 
-    def test_d5_type_chart_table_matches_python(self):
+    def test_d5_type_chart_table_matches_python(self) -> None:
+        """The PR type chart table matches Python's counts."""
         merged = [p for p in self.sets["merge"]["data"]["prs"] if p["state"] == "merged"]
         want = {g: sum(1 for p in merged if group_of(p["type"]) == g) for g in TYPE_GROUPS}
         rows = self.R["stats"]["merge"]["byTypeChart"][0]["rows"]
@@ -550,28 +633,32 @@ class UiTests(unittest.TestCase):
             got[label] = int(r[1].replace(",", ""))
         self.assertEqual(got, want)
 
-    def test_d5_cdf_percentile_table(self):
+    def test_d5_cdf_percentile_table(self) -> None:
+        """The PR size CDF percentile table matches Python's percentiles."""
         merged = [p for p in self.sets["merge"]["data"]["prs"] if p["state"] == "merged"]
         lines_ = [p["lines"] for p in merged]
         rows = {r[0]: r[1] for r in self.R["stats"]["merge"]["tCdf"][0]["rows"]}
         for pct in (50, 75, 90, 95, 99):
-            want = percentile(lines_, pct)
+            want = cast(float, percentile(lines_, pct))
             shown = rows[f"p{pct}"]
             got = float(shown.replace(",", "").replace("k", "e3").replace("M", "e6"))
             self.assertAlmostEqual(got, want, delta=max(0.06, want * 0.001 + 0.06) if "k" not in shown and "M" not in shown else want * 0.01, msg=f"p{pct} {shown} vs {want}")
 
-    def test_d5_histogram_counts_sum_to_pr_count(self):
+    def test_d5_histogram_counts_sum_to_pr_count(self) -> None:
+        """PR size histogram counts sum to the merged PR count."""
         merged = [p for p in self.sets["merge"]["data"]["prs"] if p["state"] == "merged"]
         rows = self.R["stats"]["merge"]["tHist"][0]["rows"]
         self.assertEqual(sum(int(r[1].replace(",", "")) for r in rows), len(merged))
 
-    def test_all_time_view_counts_release_tagged_after_last_merge(self):
+    def test_all_time_view_counts_release_tagged_after_last_merge(self) -> None:
+        """'All time' counts a release tagged after the last merge."""
         data = self.sets["latetag"]["data"]
         self.assertEqual(len(data["deploys"]), 1)
         k = self.R["stats"]["latetag"]["snap"]["kpis"]
         self.assertEqual(re.sub(r"(Elite|High|Medium|Low)$", "", k["Releases"]["value"]), "1", "release tag dated after the newest PR/commit is dropped from All time")
 
-    def test_kpi_and_dora_median_lead_time_agree(self):
+    def test_kpi_and_dora_median_lead_time_agree(self) -> None:
+        """The KPI tile and the DORA card show the same median lead time."""
         st = self.R["stats"]["mixedlead"]
         kpi = st["snap"]["kpis"]["Median lead time"]["value"]
         dora = st["lead"][0]["rows"][0]
@@ -580,7 +667,8 @@ class UiTests(unittest.TestCase):
         self.assertEqual(kpi_clean, median_cell, "KPI uses lead_to_deploy ?? lead per PR, DORA card uses one metric for all PRs")
 
     # ------------------------------------------------------------------ D6
-    def test_d6_tooltips(self):
+    def test_d6_tooltips(self) -> None:
+        """Chart tooltips show valid text inside the viewport and hide on mouse leave."""
         seen = 0
         for t in self.R["tooltips"]:
             with self.subTest(t["title"], width=t["width"], where=t["where"]):
@@ -600,7 +688,8 @@ class UiTests(unittest.TestCase):
         self.assertEqual(self.R["tooltipErrors"], [])
 
     # ------------------------------------------------------------------ D7
-    def test_d7_table_toggles(self):
+    def test_d7_table_toggles(self) -> None:
+        """Each chart's table toggle swaps chart and table and updates aria-pressed."""
         tb = self.R["tables"]
         self.assertGreaterEqual(len(tb["titles"]), 15)
         for it in tb["items"]:
@@ -617,7 +706,8 @@ class UiTests(unittest.TestCase):
         self.assertEqual(tb["errors"], [])
 
     # ------------------------------------------------------------------ D8
-    def test_d8_empty_and_single_pr(self):
+    def test_d8_empty_and_single_pr(self) -> None:
+        """Empty and single-PR datasets render without errors or bad text."""
         rows = [r for r in self.R["load"] if r["ds"] in ("empty", "single")]
         self.assertTrue(rows)
         for r in rows:
@@ -628,12 +718,14 @@ class UiTests(unittest.TestCase):
         self.assertEqual(by["empty"]["issues"], [])
         self.assertEqual(by["single"]["issues"], [])
 
-    def test_d8_empty_repo_message(self):
+    def test_d8_empty_repo_message(self) -> None:
+        """The empty dataset explains that there are no pull requests."""
         b = self.R["banners"]["empty"]
         self.assertIn("No pull requests", self.R["banners"]["empty"]["banner"] + " ".join(b["li"]))
 
     # ------------------------------------------------------------------ D9
-    def test_d9_git_banner_inferred_and_api_banner_exact(self):
+    def test_d9_git_banner_inferred_and_api_banner_exact(self) -> None:
+        """The banner says git data is inferred and API data is exact."""
         b = self.R["banners"]
         for name in ("merge", "squash", "notags", "single", "empty"):
             self.assertIn("inferred from git history", b[name]["banner"], name)
@@ -642,13 +734,15 @@ class UiTests(unittest.TestCase):
         self.assertTrue(b["api"]["isOk"])
         self.assertNotIn("inferred", b["api"]["banner"].split("\n")[0])
 
-    def test_d9_warnings_listed(self):
+    def test_d9_warnings_listed(self) -> None:
+        """Collection warnings are listed in the banner."""
         b = self.R["banners"]
         for name in ("notags", "empty", "merge", "squash"):
             self.assertEqual(b[name]["li"], self.sets[name]["data"]["meta"]["warnings"], name)
         self.assertTrue(any("release tags" in w for w in b["notags"]["li"]))
 
-    def test_d9_needs_api_labels(self):
+    def test_d9_needs_api_labels(self) -> None:
+        """Metric source labels read 'needs API', 'inferred' or 'exact' as appropriate."""
         b = self.R["banners"]
         for name in ("merge", "squash"):
             src = {r[0]: r[1] for r in b[name]["needsApi"]}
@@ -663,7 +757,8 @@ class UiTests(unittest.TestCase):
         self.assertIn("inferred", src["Lead time to release"], "lead-to-release is built from the inferred first-commit time")
 
     # ------------------------------------------------------------------ D10
-    def test_d10_keyboard_and_aria(self):
+    def test_d10_keyboard_and_aria(self) -> None:
+        """Controls are keyboard reachable and charts and buttons carry ARIA attributes."""
         a = self.R["a11y"]
         seq = a["seq"]
         ids = [s["id"] for s in seq if s]
@@ -681,25 +776,31 @@ class UiTests(unittest.TestCase):
         self.assertEqual(a["lang"], "en")
         self.assertEqual(a["h1"], 1)
 
-    def test_d10_chart_hit_areas_are_keyboard_operable(self):
-        """Line charts expose a tabindex=0 hit rect but have no key handler, so a keyboard user can focus an
-        element that does nothing and cannot read the values. (Table toggle is the fallback.)"""
+    def test_d10_chart_hit_areas_are_keyboard_operable(self) -> None:
+        """No chart hit area is focusable without being operable.
+
+        Line charts expose a tabindex=0 hit rect but have no key handler, so a keyboard user can focus an
+        element that does nothing and cannot read the values. (Table toggle is the fallback.)
+        """
         self.assertEqual(self.R["a11y"]["focusableRects"], 0)
 
     # ------------------------------------------------------------------ D11
-    def test_d11_screenshots_written(self):
+    def test_d11_screenshots_written(self) -> None:
+        """Full-page screenshots are written for each dataset, theme and width."""
         self.assertEqual(len(self.R["shots"]), 5 * 2 * 2)
         for f in self.R["shots"]:
             self.assertGreater(os.path.getsize(f), 20_000, f)
 
     # ------------------------------------------------------------------ misc
-    def test_resize_rerenders_without_scroll(self):
+    def test_resize_rerenders_without_scroll(self) -> None:
+        """Resizing re-renders the charts narrower without horizontal scroll."""
         r = self.R["resize"]
         self.assertLess(r["w1"], r["w0"])
         self.assertLessEqual(r["hscroll"], 0)
         self.assertEqual(r["errors"], [])
 
-    def test_c1_xss_payloads_are_inert_in_browser(self):
+    def test_c1_xss_payloads_are_inert_in_browser(self) -> None:
+        """XSS payloads are displayed as text and never execute."""
         for name, r in self.R["xss"].items():
             with self.subTest(name):
                 self.assertEqual(r["dialogs"], [])

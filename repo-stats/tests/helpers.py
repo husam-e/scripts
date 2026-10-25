@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any, Iterable, Iterator, Mapping
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -23,7 +24,8 @@ TOKEN_VARS = ("GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "GITLAB_PRIVATE_TOKEN"
 CACHE = Path(tempfile.gettempdir()) / "repostats-test-cache"
 
 
-def clean_env(extra=None):
+def clean_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return a copy of os.environ without API tokens, with loopback exempt from proxies, plus `extra`."""
     env = {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
     # loopback must never go through a proxy
     env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost," + env.get("NO_PROXY", "")
@@ -32,7 +34,7 @@ def clean_env(extra=None):
 
 
 @contextlib.contextmanager
-def patched_env(extra=None):
+def patched_env(extra: Mapping[str, str] | None = None) -> Iterator[None]:
     """Remove any real token from os.environ for the duration, optionally set fake ones."""
     saved = dict(os.environ)
     try:
@@ -46,13 +48,14 @@ def patched_env(extra=None):
         os.environ.update(saved)
 
 
-def run_cli(args, env=None, timeout=120, cwd=None):
+def run_cli(args: Iterable[object], env: Mapping[str, str] | None = None, timeout: float = 120,
+            cwd: str | Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run the CLI as a subprocess with real tokens stripped. Returns CompletedProcess."""
     return subprocess.run([sys.executable, SCRIPT, *map(str, args)], capture_output=True, text=True,
                           env=clean_env(env), timeout=timeout, cwd=cwd)
 
 
-def collect(repo, *extra, env=None):
+def collect(repo: fixtures.Repo | str | Path, *extra: str, env: Mapping[str, str] | None = None) -> tuple[dict[str, Any], str]:
     """In-process collect() with stderr swallowed. Returns (data, stderr_text)."""
     path = getattr(repo, "path", repo)
     args = rs.build_parser().parse_args([str(path), *extra])
@@ -62,22 +65,24 @@ def collect(repo, *extra, env=None):
     return data, buf.getvalue()
 
 
-def by_number(data):
+def by_number(data: Mapping[str, Any]) -> dict[int, dict[str, Any]]:
+    """Index a collect() result's PRs by PR number."""
     return {p["number"]: p for p in data["prs"]}
 
 
-def add_remote(repo, url, name="origin"):
+def add_remote(repo: fixtures.Repo, url: str, name: str = "origin") -> fixtures.Repo:
+    """Add a git remote called `name` to `repo` and return the repo."""
     repo.git("remote", "add", name, url)
     return repo
 
 
-def first_parent_shas(repo):
-    """list of (sha, subject) on main, oldest first."""
+def first_parent_shas(repo: fixtures.Repo) -> list[tuple[str, ...]]:
+    """Return (sha, subject) pairs for main's first-parent history, oldest first."""
     out = repo.git("log", "--first-parent", "--reverse", "--format=%H\t%s", "main")
     return [tuple(l.split("\t", 1)) for l in out.splitlines()]
 
 
-def real_line_count(path, exclude_regexes=()):
+def real_line_count(path: str | Path, exclude_regexes: Iterable[str] = ()) -> int:
     """Sum of line counts of text files tracked at HEAD (binary files skipped)."""
     import re
     rxs = [re.compile(x) for x in exclude_regexes]
@@ -94,8 +99,11 @@ def real_line_count(path, exclude_regexes=()):
     return total
 
 
-def cached_synthetic(n, style="merge"):
-    """synthetic_repo() is deterministic but slow to build; keep a copy on disk across test runs."""
+def cached_synthetic(n: int, style: str = "merge") -> Path:
+    """Return the path of a synthetic_repo(n, style=style) copy cached on disk across test runs.
+
+    synthetic_repo() is deterministic but slow to build, so it is built once and reused.
+    """
     key = CACHE / f"synthetic-{n}-{style}-v1"
     if not (key / ".ready").exists():
         shutil.rmtree(key, ignore_errors=True)
@@ -107,14 +115,25 @@ def cached_synthetic(n, style="merge"):
     return key / "repo"
 
 
-def fast_import_repo(n_prs, start=1_640_995_200, step=3 * 3600):
+def fast_import_repo(n_prs: int, start: int = 1_640_995_200, step: int = 3 * 3600) -> Path:
     """Very fast merge-style history (git fast-import) for performance tests. Returns a path."""
     path = Path(tempfile.mkdtemp(prefix="repostats-fastimport-"))
     subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
     out = []
     mark = [0]
 
-    def commit(ref, msg, t, files, frm=None, merge=None):
+    def commit(ref: str, msg: str, t: int, files: Mapping[str, str], frm: str | None = None,
+               merge: str | None = None) -> str:
+        """Append one fast-import commit to the stream and return its mark.
+
+        Args:
+            ref: Branch ref the commit goes on.
+            msg: Commit message.
+            t: Committer time in Unix seconds.
+            files: Map of path to full file content.
+            frm: Mark of the first parent.
+            merge: Mark of the second parent, for merge commits.
+        """
         mark[0] += 1
         out.append(f"commit {ref}\nmark :{mark[0]}\ncommitter Dev <dev@example.com> {t} +0000\n")
         data = msg.encode()
