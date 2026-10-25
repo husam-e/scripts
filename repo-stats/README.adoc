@@ -13,6 +13,12 @@ Generate a self-contained HTML dashboard of code statistics for any git reposito
 Every metric shows count, mean, median, p75, p90, p95, p99, min, max and standard deviation.
 Where a distribution matters, the dashboard adds a histogram and a cumulative frequency chart.
 
+.Overview in the default dark theme (synthetic example repository)
+image::docs/dashboard-dark.png[Dashboard overview in dark theme: KPIs, lines of code over time and monthly churn]
+
+.PR size section in the light theme
+image::docs/dashboard-light.png[PR size statistics, histogram, cumulative frequency and size buckets in light theme]
+
 The tool is one Python file plus one HTML template. It needs Python 3.8 or newer and git, and nothing else.
 The output is a single HTML file. It works offline, and you can mail it, attach it or host it anywhere.
 
