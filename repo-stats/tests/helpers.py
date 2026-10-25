@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Iterable, Mapping
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -25,27 +25,10 @@ CACHE = Path(tempfile.gettempdir()) / "repostats-test-cache"
 
 
 def clean_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Return a copy of os.environ without API tokens, with loopback exempt from proxies, plus `extra`."""
+    """Return a copy of os.environ without API tokens, plus `extra`."""
     env = {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
-    # loopback must never go through a proxy
-    env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost," + env.get("NO_PROXY", "")
     env.update(extra or {})
     return env
-
-
-@contextlib.contextmanager
-def patched_env(extra: Mapping[str, str] | None = None) -> Iterator[None]:
-    """Remove any real token from os.environ for the duration, optionally set fake ones."""
-    saved = dict(os.environ)
-    try:
-        for k in TOKEN_VARS:
-            os.environ.pop(k, None)
-        os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost," + saved.get("NO_PROXY", "")
-        os.environ.update(extra or {})
-        yield
-    finally:
-        os.environ.clear()
-        os.environ.update(saved)
 
 
 def run_cli(args: Iterable[object], env: Mapping[str, str] | None = None, timeout: float = 120,
@@ -60,8 +43,8 @@ def collect(repo: fixtures.Repo | str | Path, *extra: str, env: Mapping[str, str
     path = getattr(repo, "path", repo)
     args = rs.build_parser().parse_args([str(path), *extra])
     buf = io.StringIO()
-    with patched_env(env), contextlib.redirect_stderr(buf):
-        data = rs.collect(args)
+    with contextlib.redirect_stderr(buf):
+        data = rs.collect(args, environ=clean_env(env))
     return data, buf.getvalue()
 
 

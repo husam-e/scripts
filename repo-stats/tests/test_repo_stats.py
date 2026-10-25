@@ -6,6 +6,7 @@ Stdlib only. Deterministic. No real network: API tests use 127.0.0.1 mock server
 from __future__ import annotations
 
 import ast
+import contextlib
 import csv
 import http.client
 import io
@@ -28,8 +29,8 @@ from typing import Any, Callable, Mapping, NoReturn, Sequence, TypeVar
 from unittest import mock
 
 import helpers
-from helpers import (ROOT, SCRIPT, add_remote, by_number, collect, first_parent_shas, patched_env, real_line_count,
-                     run_cli, rs)
+from helpers import (ROOT, SCRIPT, add_remote, by_number, collect, first_parent_shas, real_line_count, run_cli,
+                     rs)
 import fixtures
 from fixtures import DAY, T0, Repo, lines
 import mock_servers as ms
@@ -1322,6 +1323,37 @@ class B3_Tokens(unittest.TestCase):
         self.assertIn("source: api", p.stderr)
         self.assertNotIn("viaenv-777", (out / "o.html").read_text() + p.stderr)
 
+    def test_loopback_api_never_uses_proxy(self) -> None:
+        """Requests to a loopback --api-url bypass http_proxy even when NO_PROXY does not exempt it."""
+        nodes = github_nodes(fixtures.merge_workflow_repo())
+        r = api_repo()
+        with ms.MockServer(ms.github_handler(desc_nodes(nodes), page_size=50, expect_token=FAKE)) as srv, \
+                ms.MockServer(lambda req: (502, {}, {"message": "proxy"})) as proxy:
+            env = {"GITHUB_TOKEN": FAKE, "http_proxy": proxy.url, "HTTP_PROXY": proxy.url, "NO_PROXY": "", "no_proxy": ""}
+            p = run_cli([r.path, "-o", tmpdir() / "o.html", "--provider", "github", "--api-url", srv.url,
+                         "--source", "api"], env=env)
+            reqs, proxied = list(srv.requests), list(proxy.requests)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(reqs)
+        for q in reqs:
+            self.assertEqual(q["headers"]["authorization"], f"Bearer {FAKE}")
+        self.assertEqual(proxied, [])
+
+    def test_collect_uses_given_environ(self) -> None:
+        """collect() reads tokens from its environ argument, not from os.environ."""
+        nodes = github_nodes(fixtures.merge_workflow_repo())
+        r = api_repo()
+        with ms.MockServer(ms.github_handler(desc_nodes(nodes), page_size=50)) as srv:
+            args = rs.build_parser().parse_args([str(r.path), "--provider", "github", "--api-url", srv.url])
+            with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "from-os-environ"}), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                d = rs.collect(args, environ={"GITHUB_TOKEN": "from-param"})
+            auths = [q["headers"].get("authorization") for q in srv.requests]
+        self.assertEqual(d["meta"]["mode"], "api")
+        self.assertTrue(auths)
+        self.assertEqual(set(auths), {"Bearer from-param"})
+        self.assertNotIn("from-os-environ", json.dumps([q["headers"] for q in srv.requests]))
+
 
 class B4_Failures(unittest.TestCase):
     """API failure handling and fallback to git."""
@@ -1965,7 +1997,7 @@ class E2_Serve(unittest.TestCase):
     def _get(self, url: str) -> tuple[int, str, Message]:
         """GET `url` and return (status, body, headers), for error statuses too."""
         try:
-            with urllib.request.urlopen(url, timeout=10) as r:
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(url, timeout=10) as r:
                 return r.status, r.read().decode("utf-8", "replace"), r.headers
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", "replace"), e.headers

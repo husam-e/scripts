@@ -33,7 +33,7 @@ import urllib.request
 import webbrowser
 from email.message import Message
 from pathlib import Path
-from typing import IO, Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, TypedDict, cast
+from typing import IO, Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, TypedDict, cast
 
 __version__ = "0.1.0"
 
@@ -708,6 +708,7 @@ class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
 
 
 _OPENER = urllib.request.build_opener(_SameHostRedirect)
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _SameHostRedirect)
 
 
 def _is_loopback(host: str) -> bool:
@@ -755,7 +756,8 @@ def http_json(url: str, headers: Dict[str, str], body: Any = None, retries: int 
     for attempt in range(retries + 1):
         req = urllib.request.Request(url, data=data, headers=hdrs)
         try:
-            with _OPENER.open(req, timeout=60) as resp:
+            opener = _DIRECT_OPENER if _is_loopback(parsed.hostname or "") else _OPENER
+            with opener.open(req, timeout=60) as resp:
                 raw = resp.read()
                 hdrs_out = resp.headers
         except urllib.error.HTTPError as e:
@@ -1223,10 +1225,10 @@ def write_csv(path: str, records: Iterable[Record]) -> None:
             w.writerow(row)
 
 
-def resolve_token(env_names: Iterable[str]) -> Tuple[Optional[str], Optional[str]]:
-    """Return (token, variable name) from the first non-empty environment variable, or (None, None)."""
+def resolve_token(env_names: Iterable[str], environ: Mapping[str, str]) -> Tuple[Optional[str], Optional[str]]:
+    """Return (token, variable name) from the first non-empty variable in `environ`, or (None, None)."""
     for name in env_names:
-        v = os.environ.get(name)
+        v = environ.get(name)
         if v:
             return v.strip(), name
     return None, None
@@ -1242,8 +1244,12 @@ def parse_date(s: Optional[str]) -> Optional[int]:
         raise ToolError(f"Invalid date '{s}'. Use YYYY-MM-DD.")
 
 
-def collect(args: argparse.Namespace) -> Dict[str, Any]:
+def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
     """Gather all dashboard data for the parsed command line.
+
+    Args:
+        args: Parsed command line.
+        environ: Environment to read API tokens from; defaults to os.environ.
 
     Returns:
         {"meta": ..., "prs": [record, ...], "loc": build_loc_series(...), "deploys": [...]}.
@@ -1305,7 +1311,7 @@ def collect(args: argparse.Namespace) -> Dict[str, Any]:
     token_envs = [args.token_env] if args.token_env else (
         ["GITHUB_TOKEN", "GH_TOKEN"] if provider == "github" else
         ["GITLAB_TOKEN", "GITLAB_PRIVATE_TOKEN"] if provider == "gitlab" else [])
-    token, token_name = resolve_token(token_envs)
+    token, token_name = resolve_token(token_envs, os.environ if environ is None else environ)
 
     source = args.source
     api_prs: Optional[List[PR]] = None

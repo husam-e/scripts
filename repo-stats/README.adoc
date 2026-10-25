@@ -69,6 +69,7 @@ A shallow clone gives incomplete history, and the dashboard warns about it. Run 
 
 Tokens are read from the environment only and are never written to any output.
 A token is sent automatically only to `github.com` and `gitlab.com`.
+API requests to `127.0.0.1`, `::1` or `localhost` never go through a proxy.
 `--serve` binds to 127.0.0.1, serves only the dashboard file, and rejects any request whose Host header is not `127.0.0.1` or `localhost` on the serving port.
 
 == Heuristics
