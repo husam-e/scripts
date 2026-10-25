@@ -14,13 +14,17 @@ import collections
 import concurrent.futures
 import csv
 import datetime as dt
+import email.utils
+import http.client
 import http.server
 import ipaddress
 import json
 import os
 import re
 import subprocess
+import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -94,8 +98,11 @@ DEFAULT_EXCLUDES = [
     r"\.(map|snap|lock)$",
 ]
 
-DEFAULT_FAILURE = r"hot-?fix|rollback|roll back|incident|regression|emergency"
-DEFAULT_TAG_PATTERN = r"^v?\d+(\.\d+)*"
+# Matched anywhere in the branch name and labels, but only at the start of the title (after an optional
+# Conventional Commit prefix), so "feat: add rollback support" is not a failure.
+DEFAULT_FAILURE = r"\bhot-?fix\b|\broll-? ?back\b|\bemergency\b"
+# Version tags; pre-releases (-rc1, -beta, .alpha2, 1.0.0dev) are not deployments.
+DEFAULT_TAG_PATTERN = r"^(?!.*(?:[-._+]|\d)(?i:rc|alpha|beta|dev)(?![A-Za-z]))v?\d+(\.\d+)*"
 
 # file extension -> (language, kind). kind: code | data | docs | other
 LANGUAGES = {
@@ -184,24 +191,45 @@ def run_git(repo, *args, check=True) -> str:
 
 def stream_git(repo, *args):
     """Yield stdout lines of a git command without loading it all in memory."""
-    p = subprocess.Popen(git_cmd(repo, *args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, encoding="utf-8", errors="replace")
-    assert p.stdout is not None
-    for line in p.stdout:
-        yield line
-    p.wait()
-    if p.returncode != 0:
-        raise ToolError(f"git {' '.join(args[:3])} failed: {p.stderr.read().strip()}")
+    # stderr goes to a temp file: a PIPE nobody reads can fill up and deadlock git.
+    with tempfile.TemporaryFile() as err:
+        p = subprocess.Popen(git_cmd(repo, *args), stdout=subprocess.PIPE, stderr=err,
+                             text=True, encoding="utf-8", errors="replace")
+        assert p.stdout is not None
+        with p.stdout:
+            for line in p.stdout:
+                yield line
+        p.wait()
+        if p.returncode != 0:
+            err.seek(0)
+            msg = err.read().decode("utf-8", "replace").strip()
+            raise ToolError(f"git {' '.join(args[:3])} failed: {msg}")
 
 
-def detect_branch(repo: str) -> str:
-    head = run_git(repo, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD", check=False).strip()
+def detect_branch(repo: str, remote: str = "origin") -> str:
+    head = run_git(repo, "symbolic-ref", "-q", "--short", f"refs/remotes/{remote}/HEAD", check=False).strip()
     if head:
         return head
-    for cand in ("origin/main", "origin/master", "main", "master"):
+    for cand in (f"{remote}/main", f"{remote}/master", "main", "master"):
         if run_git(repo, "rev-parse", "--verify", "-q", cand + "^{commit}", check=False).strip():
             return cand
-    return "HEAD"
+    # Fall back to the checked-out branch (e.g. "trunk"), or HEAD when detached.
+    return run_git(repo, "symbolic-ref", "--short", "-q", "HEAD", check=False).strip() or "HEAD"
+
+
+def strip_remote_prefix(repo: str, branch: str) -> str:
+    """'upstream/main' -> 'main' when it names a remote-tracking ref (and no local branch of that name)."""
+    if branch.startswith("refs/remotes/"):
+        branch = branch[len("refs/remotes/"):]
+    elif branch.startswith("refs/heads/"):
+        return branch[len("refs/heads/"):]
+    if "/" not in branch:
+        return branch
+    if run_git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}", check=False).strip():
+        return branch
+    if run_git(repo, "rev-parse", "--verify", "-q", f"refs/remotes/{branch}", check=False).strip():
+        return branch.split("/", 1)[1]
+    return branch
 
 
 def parse_remote(url: str):
@@ -215,12 +243,13 @@ def parse_remote(url: str):
     return m.group(1).lower(), m.group(2)
 
 
+TRUSTED_HOSTS = {"github.com": "github", "gitlab.com": "gitlab"}
+
+
 def detect_provider(host: str):
-    if host == "github.com" or host.startswith("github."):
-        return "github"
-    if "gitlab" in host:
-        return "gitlab"
-    return None
+    """Only the public hosts are auto-detected. Anything else needs --provider and --api-url, so a crafted
+    remote URL (github.evil.example) can never receive a token."""
+    return TRUSTED_HOSTS.get(host)
 
 
 # ---------------------------------------------------------------------------
@@ -236,36 +265,30 @@ def normalize_type(raw: str):
     return t if t in CONVENTIONAL_TYPES else None
 
 
-def classify_type(title: str, branch: str | None = None, first_subject: str | None = None):
+def classify_type(title: str, branch: str | None = None):
     """Return (type, scope, breaking, source). source says how the type was determined."""
-    breaking = False
-    for text, source in ((title, "title"), (first_subject, "commit")):
-        if not text:
-            continue
-        m = CC_RE.match(text)
-        if m:
-            t = normalize_type(m.group("t") or m.group("t2") or "")
-            if t:
-                breaking = bool(m.group("bang")) or "BREAKING CHANGE" in text
-                return t, m.group("scope") or None, breaking, source
+    m = CC_RE.match(title) if title else None
+    if m:
+        t = normalize_type(m.group("t") or m.group("t2") or "")
+        if t:
+            breaking = bool(m.group("bang")) or "BREAKING CHANGE" in title
+            return t, m.group("scope") or None, breaking, "title"
     if branch:
         m = re.match(r"^(?:[\w.-]+/)?([A-Za-z]+)[/_-]", branch)
         if m:
             t = normalize_type(m.group(1))
             if t:
                 return t, None, False, "branch"
-    for text in (title, first_subject):
-        if not text:
-            continue
-        low = text.strip().lower()
-        for pattern, t in KEYWORD_TYPES:
-            if re.match(pattern, low):
-                return t, None, False, "keyword"
+    low = (title or "").strip().lower()
+    for pattern, t in KEYWORD_TYPES:
+        if re.match(pattern, low):
+            return t, None, False, "keyword"
     return "other", None, False, "none"
 
 
 def first_nonblank(text: str) -> str:
-    for line in text.splitlines():
+    # split on "\n" only: str.splitlines() also breaks on U+2028/U+2029/U+0085 inside a title
+    for line in text.split("\n"):
         if line.strip():
             return line.strip()
     return ""
@@ -278,7 +301,7 @@ def parse_message(subject: str, body: str, default_branch: str):
     branch into something else, which are not PRs), merge_style.
     """
     out = {"number": None, "title": None, "branch": None, "sync": False, "has_ref": False}
-    short_default = default_branch.split("/", 1)[-1] if default_branch.startswith("origin/") else default_branch
+    short_default = default_branch[len("origin/"):] if default_branch.startswith("origin/") else default_branch
 
     m = re.match(r"^Merge pull request #(\d+) from (\S+)", subject)
     if m:
@@ -291,7 +314,7 @@ def parse_message(subject: str, body: str, default_branch: str):
         return out
     m = re.search(r"See merge request \S*?!(\d+)", body)
     if m:
-        lines = [ln.strip() for ln in body.splitlines() if ln.strip() and not ln.strip().startswith("See merge request")]
+        lines = [ln.strip() for ln in body.split("\n") if ln.strip() and not ln.strip().startswith("See merge request")]
         bm = re.match(r"^Merge branch '([^']+)'", subject)
         out.update(number=int(m.group(1)), branch=bm.group(1) if bm else None,
                    title=(lines[0] if lines else subject), has_ref=True)
@@ -304,7 +327,11 @@ def parse_message(subject: str, body: str, default_branch: str):
         return out
     m = re.match(r"^Merge (?:remote-tracking )?branch '([^']+)'(?: of \S+)?(?: into '?([^']+)'?)?", subject)
     if m:
-        branch = re.sub(r"^origin/", "", m.group(1))
+        branch = m.group(1)
+        if subject.startswith("Merge remote-tracking branch ") and "/" in branch:
+            branch = branch.split("/", 1)[1]  # any remote name, not only origin
+        else:
+            branch = re.sub(r"^origin/", "", branch)
         out["branch"] = branch
         if branch == short_default:
             out["sync"] = True
@@ -318,7 +345,14 @@ def parse_message(subject: str, body: str, default_branch: str):
 def humanize_branch(branch: str | None):
     if not branch:
         return None
-    name = re.sub(r"^(?:[\w.-]+/)?[A-Za-z]+[/_-]", "", branch, count=1) if re.match(r"^(?:[\w.-]+/)?[A-Za-z]+[/_-]", branch) else branch
+    if re.match(r"^(dependabot|renovate)/", branch):
+        # dependabot/npm_and_yarn/lodash-4.1 -> "lodash 4.1"
+        return re.sub(r"[-_]+", " ", branch.rsplit("/", 1)[-1]).strip() or branch
+    name = branch.rsplit("/", 1)[-1]  # feat/login-page, dev/feat/x -> last segment
+    if "/" not in branch:
+        m = re.match(r"^([A-Za-z]+)[_-](.+)$", branch)  # fix-typo -> typo
+        if m and normalize_type(m.group(1)) not in (None, "revert"):
+            name = m.group(2)
     return re.sub(r"[-_]+", " ", name).strip() or branch
 
 
@@ -391,7 +425,8 @@ class Scanner:
             else:
                 buf.append(line)
         flush()
-        # -m on a merge prints the diff once per parent; --first-parent leaves one. Defensive dedupe.
+        # With --first-parent, -m diffs a merge against its first parent only, so each commit appears once.
+        # Keep a cheap dedupe as a guard against double counting.
         seen = set()
         unique = []
         for c in commits:
@@ -499,7 +534,9 @@ def compute_deploys(repo, graph, tag_pattern, branch):
     out = run_git(repo, "for-each-ref", "--format=%(refname:short)%09%(creatordate:unix)%09%(objectname)%09%(*objectname)",
                   "refs/tags", check=False)
     tags = []
-    for line in out.splitlines():
+    for line in out.split("\n"):
+        if not line:
+            continue
         name, ts, obj, peeled = (line.split("\t") + ["", "", "", ""])[:4]
         sha = peeled or obj
         if not ts or not rx.search(name) or sha not in graph:
@@ -526,12 +563,14 @@ def compute_deploys(repo, graph, tag_pattern, branch):
 # Inferring PRs from git alone
 # ---------------------------------------------------------------------------
 
-def infer_prs_from_git(first_parent, graph, default_branch, commits_as_prs=False):
+def infer_prs_from_git(first_parent, graph, default_branch, commits_as_prs=False, claims=None):
     """Infer PRs from merge commits and squash commits that reference a PR number.
 
+    default_branch is the short branch name (no remote prefix), used to recognise sync merges.
     Returns (prs, direct_commit_count, skipped_sync_merges).
     """
-    claims = claim_branch_commits(first_parent, graph)
+    if claims is None:
+        claims = claim_branch_commits(first_parent, graph)
     prs = []
     direct = 0
     sync = 0
@@ -541,13 +580,9 @@ def infer_prs_from_git(first_parent, graph, default_branch, commits_as_prs=False
         if msg["sync"]:
             sync += 1
             continue
-        if not is_merge and not msg["has_ref"]:
-            if not commits_as_prs:
-                direct += 1
-                continue
-        if is_merge and not msg["has_ref"] and msg["branch"] is None and c["subject"].startswith("Merge"):
-            # a merge with no recognisable branch name; still a merge of something
-            pass
+        if not is_merge and not msg["has_ref"] and not commits_as_prs:
+            direct += 1
+            continue
         branch_shas = claims.get(c["sha"], []) if is_merge else []
         branch_commits = [graph[s] for s in branch_shas if len(graph[s][0]) < 2]
         pr = {
@@ -572,7 +607,6 @@ def infer_prs_from_git(first_parent, graph, default_branch, commits_as_prs=False
             "reviewed": None,
             "local": c,
             "source": "merge-commit" if is_merge else "squash-commit",
-            "first_subject": None,
             "inferred": ["created", "ready", "first_review"],
         }
         if is_merge and branch_commits:
@@ -580,9 +614,6 @@ def infer_prs_from_git(first_parent, graph, default_branch, commits_as_prs=False
             pr["last_commit"] = max(b[1] for b in branch_commits)
             pr["commits"] = len(branch_commits)
             pr["branch_shas"] = branch_shas
-        elif not is_merge:
-            pr["first_commit"] = None
-            pr["commits"] = None
         if pr["title"] is None:
             pr["title"] = humanize_branch(pr["branch"]) or c["subject"]
         prs.append(pr)
@@ -598,11 +629,15 @@ class ApiError(ToolError):
 
 
 class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
-    """Never follow a redirect to another host, so tokens cannot leak."""
+    """Never follow a redirect to another host or to plain http, so tokens cannot leak."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if urllib.parse.urlparse(newurl).netloc != urllib.parse.urlparse(req.full_url).netloc:
-            raise ApiError(f"Refusing cross-host redirect to {urllib.parse.urlparse(newurl).netloc}")
+        old, new = urllib.parse.urlparse(req.full_url), urllib.parse.urlparse(newurl)
+        if new.netloc != old.netloc:
+            raise ApiError(f"Refusing cross-host redirect to {new.netloc}")
+        loopback_http = old.scheme == "http" and _is_loopback(old.hostname or "")
+        if new.scheme != "https" and not (loopback_http and new.scheme == "http"):
+            raise ApiError(f"Refusing redirect to insecure URL {new.scheme}://{new.netloc}")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -616,6 +651,24 @@ def _is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _retry_after(value, default):
+    """Seconds to wait from a Retry-After header (integer seconds or an HTTP date), capped at 60."""
+    if not value:
+        return default
+    value = value.strip()
+    try:
+        wait = int(value)
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=dt.timezone.utc)
+            wait = int(when.timestamp() - time.time())
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return default
+    return min(wait, 60) if wait > 0 else default
 
 
 def http_json(url, headers, body=None, retries=4):
@@ -632,11 +685,11 @@ def http_json(url, headers, body=None, retries=4):
         req = urllib.request.Request(url, data=data, headers=hdrs)
         try:
             with _OPENER.open(req, timeout=60) as resp:
-                return json.loads(resp.read().decode("utf-8")), resp.headers
+                raw = resp.read()
+                hdrs_out = resp.headers
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503, 504) and attempt < retries:
-                wait = int(e.headers.get("Retry-After", "0") or 0) or delay
-                time.sleep(min(wait, 60))
+                time.sleep(_retry_after(e.headers.get("Retry-After") if e.headers else None, delay))
                 delay *= 2
                 continue
             if e.code == 401:
@@ -647,11 +700,22 @@ def http_json(url, headers, body=None, retries=4):
                 raise ApiError("API returned 404: repository not found, or the token cannot see it.")
             raise ApiError(f"API request failed with HTTP {e.code}")
         except urllib.error.URLError as e:
-            if attempt < retries:
+            # A refused connection or an unknown host will not fix itself: fail fast.
+            if attempt < retries and not isinstance(e.reason, (ConnectionRefusedError, socket.gaierror)):
                 time.sleep(delay)
                 delay *= 2
                 continue
             raise ApiError(f"Could not reach the API: {e.reason}")
+        except (OSError, http.client.HTTPException) as e:  # timeouts, resets, truncated responses
+            if attempt < retries:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise ApiError(f"Could not reach the API: {e.__class__.__name__}")
+        try:
+            return json.loads(raw.decode("utf-8")), hdrs_out
+        except ValueError:
+            raise ApiError("API returned a response that is not JSON (a proxy or login page?)")
     raise ApiError("API request failed")
 
 
@@ -666,10 +730,10 @@ def parse_iso(s):
 GITHUB_QUERY = """
 query($owner:String!,$name:String!,$cursor:String){
   repository(owner:$owner,name:$name){
-    pullRequests(first:50,after:$cursor,orderBy:{field:CREATED_AT,direction:DESC}){
+    pullRequests(first:50,after:$cursor,orderBy:{field:UPDATED_AT,direction:DESC}){
       pageInfo{hasNextPage endCursor}
       nodes{
-        number title state isDraft createdAt mergedAt closedAt additions deletions changedFiles
+        number title state createdAt updatedAt mergedAt closedAt additions deletions changedFiles
         headRefName baseRefName
         author{login __typename}
         labels(first:20){nodes{name}}
@@ -684,24 +748,38 @@ query($owner:String!,$name:String!,$cursor:String){
 """
 
 
-def fetch_github(owner, name, token, api_url, since, base_branch, all_bases, max_prs, progress=log):
+def fetch_github(owner, name, token, api_url, since, base_branch, all_bases, max_prs, progress=log, info=None):
+    """PRs newest-updated first. A PR merged after `since` was updated after it too, so paging stops at the
+    first PR whose last activity is older than `since`; collect() then filters by merge (or open) time.
+    `info`, if given, receives the number of PRs seen before the base-branch filter."""
     endpoint = api_url.rstrip("/") + "/graphql"
     headers = {"Authorization": f"Bearer {token}"}
     prs = []
+    seen = 0
     cursor = None
     while True:
         data, _ = http_json(endpoint, headers, {"query": GITHUB_QUERY,
                                                 "variables": {"owner": owner, "name": name, "cursor": cursor}})
+        if not isinstance(data, dict):
+            raise ApiError("GitHub returned an unexpected response")
         if data.get("errors"):
-            msg = "; ".join(e.get("message", "?") for e in data["errors"])[:300]
+            msg = "; ".join(str((e or {}).get("message", "?")) for e in data["errors"])[:300]
             raise ApiError(f"GitHub GraphQL error: {msg}")
-        page = data["data"]["repository"]["pullRequests"]
+        repo_node = (data.get("data") or {}).get("repository")
+        if not repo_node:
+            raise ApiError("GitHub returned no repository: not found, or the token cannot see it.")
+        page = repo_node.get("pullRequests")
+        if not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
+            raise ApiError("GitHub returned an unexpected pullRequests shape")
         stop = False
         for n in page["nodes"]:
-            created = parse_iso(n["createdAt"])
-            if since and created < since:
+            if not n:
+                continue
+            activity = [parse_iso(n.get(k)) for k in ("updatedAt", "createdAt", "mergedAt", "closedAt")]
+            if since and max(t for t in activity if t is not None) < since:
                 stop = True
                 continue
+            seen += 1
             if not all_bases and n.get("baseRefName") != base_branch:
                 continue
             prs.append(github_pr(n))
@@ -709,9 +787,12 @@ def fetch_github(owner, name, token, api_url, since, base_branch, all_bases, max
                 stop = True
                 break
         progress(f"  fetched {len(prs)} pull requests")
-        if stop or not page["pageInfo"]["hasNextPage"]:
+        info_page = page.get("pageInfo") or {}
+        if stop or not info_page.get("hasNextPage"):
             break
-        cursor = page["pageInfo"]["endCursor"]
+        cursor = info_page.get("endCursor")
+    if info is not None:
+        info["seen"] = seen
     return prs
 
 
@@ -728,8 +809,10 @@ def github_pr(n):
         if t and t.get("createdAt"):
             ready = parse_iso(t["createdAt"])
             break
+    merged_at = parse_iso(n.get("mergedAt"))
     reviews = [r for r in (n.get("reviews") or {}).get("nodes", [])
                if r and r.get("submittedAt") and r["state"] != "PENDING"
+               and (merged_at is None or parse_iso(r["submittedAt"]) <= merged_at)  # post-merge reviews do not count
                and (r.get("author") or {}).get("login") != login
                and not _is_bot((r.get("author") or {}).get("login"), (r.get("author") or {}).get("__typename"))]
     first_review = min((parse_iso(r["submittedAt"]) for r in reviews), default=None)
@@ -743,30 +826,32 @@ def github_pr(n):
         "number": n["number"], "sha": merge_commit, "title": n["title"], "branch": n.get("headRefName"),
         "state": state, "author_name": login, "bot": _is_bot(login, author.get("__typename")),
         "created": created, "ready": ready, "first_review": first_review,
-        "merged": parse_iso(n["mergedAt"]), "closed": parse_iso(n["closedAt"]),
+        "merged": merged_at, "closed": parse_iso(n["closedAt"]),
         "first_commit": first_commit, "last_commit": None, "commits": commits.get("totalCount"),
         "additions": n.get("additions"), "deletions": n.get("deletions"), "files": n.get("changedFiles"),
         "labels": [l["name"] for l in (n.get("labels") or {}).get("nodes", []) if l],
         "reviewed": first_review is not None if state == "merged" else None,
-        "source": "api", "inferred": [], "draft": n.get("isDraft"),
-        "local": None, "first_subject": None,
+        "source": "api", "inferred": [], "local": None,
     }
 
 
-def fetch_gitlab(project_path, token, api_url, since, base_branch, all_bases, max_prs, want_reviews, progress=log):
+def fetch_gitlab(project_path, token, api_url, since, base_branch, all_bases, max_prs, want_reviews, progress=log, info=None):
     project = urllib.parse.quote(project_path, safe="")
     base = f"{api_url.rstrip('/')}/projects/{project}"
     headers = {"PRIVATE-TOKEN": token}
     mrs = []
     page = 1
     while True:
-        q = {"state": "all", "scope": "all", "order_by": "created_at", "sort": "desc", "per_page": 100, "page": page}
+        q = {"state": "all", "scope": "all", "order_by": "updated_at", "sort": "desc", "per_page": 100, "page": page}
         if since:
-            q["created_after"] = dt.datetime.fromtimestamp(since, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # updated_after, not created_after: an MR opened before the cutoff but merged after it still counts.
+            q["updated_after"] = dt.datetime.fromtimestamp(since, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         if not all_bases:
             q["target_branch"] = base_branch
         data, hdrs = http_json(f"{base}/merge_requests?{urllib.parse.urlencode(q)}", headers)
-        mrs.extend(data)
+        if not isinstance(data, list):
+            raise ApiError("GitLab returned an unexpected response for merge_requests")
+        mrs.extend(m for m in data if isinstance(m, dict))
         progress(f"  fetched {len(mrs)} merge requests")
         nxt = hdrs.get("X-Next-Page")
         if not data or not nxt or (max_prs and len(mrs) >= max_prs):
@@ -774,6 +859,8 @@ def fetch_gitlab(project_path, token, api_url, since, base_branch, all_bases, ma
         page = int(nxt)
     if max_prs:
         mrs = mrs[:max_prs]
+    if info is not None:
+        info["seen"] = len(mrs)
 
     def details(mr):
         out = {"first_commit": None, "commits": None, "first_review": None}
@@ -787,13 +874,17 @@ def fetch_gitlab(project_path, token, api_url, since, base_branch, all_bases, ma
             if want_reviews:
                 notes, _ = http_json(f"{base}/merge_requests/{iid}/notes?sort=asc&order_by=created_at&per_page=100", headers)
                 me = (mr.get("author") or {}).get("username")
+                merged_at = parse_iso(mr.get("merged_at"))
                 for note in notes:
                     a = note.get("author") or {}
                     if note.get("system") or a.get("username") == me or _is_bot(a.get("username"), "Bot" if a.get("bot") else None):
                         continue
-                    out["first_review"] = parse_iso(note["created_at"])
+                    t = parse_iso(note.get("created_at"))
+                    if t is None or (merged_at is not None and t > merged_at):
+                        continue  # comments after the merge are not a review
+                    out["first_review"] = t
                     break
-        except ApiError as e:
+        except (ApiError, ValueError, KeyError, TypeError, AttributeError) as e:
             out["error"] = str(e)
         return out
 
@@ -815,8 +906,7 @@ def fetch_gitlab(project_path, token, api_url, since, base_branch, all_bases, ma
             "labels": mr.get("labels") or [],
             "reviewed": (ex["first_review"] is not None) if (state == "merged" and want_reviews) else None,
             "source": "api", "inferred": ["ready"] + ([] if want_reviews else ["first_review"]),
-            "squash_sha": mr.get("squash_commit_sha"), "local": None, "first_subject": None,
-            "draft": mr.get("draft") or mr.get("work_in_progress"),
+            "squash_sha": mr.get("squash_commit_sha"), "local": None,
         })
     return result
 
@@ -866,11 +956,26 @@ def local_summary(pr, fp_by_sha):
     return None
 
 
+CC_PREFIX = re.compile(r"^\s*(?:\[[^\]]*\]|[A-Za-z]+(?:\([^)]*\))?!?\s*:)\s*")
+
+
+def is_failure(rx, title, branch, labels, title_start_only):
+    """Branch and labels match anywhere. With the default pattern, the title only matches at its start
+    (after an optional Conventional Commit prefix), so "feat: add rollback support" is not a hotfix."""
+    if rx.search(" ".join(filter(None, [branch, " ".join(labels or [])]))):
+        return True
+    title = title or ""
+    if not title_start_only:
+        return bool(rx.search(title))
+    return any(rx.match(t) for t in (title, title.lstrip("[( "), CC_PREFIX.sub("", title, count=1)))
+
+
 def build_records(prs, ctx):
     """Turn raw PR dicts into the final records embedded in the dashboard."""
     failure_re = ctx["failure_re"]
     fp_by_sha = ctx["fp_by_sha"]
     claimed = ctx["claimed"]
+    claims = ctx.get("claims") or {}
     records = []
     sha_to_pr: dict = {}
     for pr in prs:
@@ -878,19 +983,20 @@ def build_records(prs, ctx):
         if c is not None and pr["source"] == "api":
             if pr["additions"] is None:  # GitLab: size comes from the local commit
                 pr["additions"], pr["deletions"], pr["files"] = c["add"], c["del"], c["files"]
-        first_subject = pr.get("first_subject")
-        t, scope, breaking, tsrc = classify_type(pr["title"] or "", pr.get("branch"), first_subject)
+            if len(c["parents"]) >= 2 and not pr.get("branch_shas"):
+                # merge-commit workflow: the branch commits (e.g. a revert) resolve time to restore
+                pr["branch_shas"] = claims.get(c["sha"], [])
+        t, scope, breaking, tsrc = classify_type(pr["title"] or "", pr.get("branch"))
         if t == "other":
             for label in pr.get("labels") or []:
                 lt = normalize_type(label.split(":")[-1].strip())
                 if lt:
                     t, tsrc = lt, "label"
                     break
-        text_for_failure = " ".join(filter(None, [pr["title"], pr.get("branch"), " ".join(pr.get("labels") or [])]))
         kind = None
         if t == "revert" or (pr["title"] or "").lower().startswith("revert"):
             kind = "revert"
-        elif failure_re.search(text_for_failure):
+        elif is_failure(failure_re, pr["title"], pr.get("branch"), pr.get("labels"), ctx.get("failure_title_start", False)):
             kind = "hotfix"
         add_, del_ = pr["additions"], pr["deletions"]
         lines = (add_ + del_) if add_ is not None and del_ is not None else None
@@ -898,7 +1004,7 @@ def build_records(prs, ctx):
             "id": pr["number"] if pr["number"] is not None else pr["sha"][:8],
             "number": pr["number"],
             "title": pr["title"] if not ctx["redact"] else (f"#{pr['number']}" if pr["number"] is not None else pr["sha"][:8]),
-            "type": t, "scope": scope, "breaking": breaking, "type_source": tsrc,
+            "type": t, "scope": None if ctx["redact"] else scope, "breaking": breaking, "type_source": tsrc,
             "state": pr["state"], "bot": pr.get("bot") or bool(ctx["bot_re"].search(pr.get("author_name") or "")),
             "created": pr["created"], "first_commit": pr["first_commit"], "ready": pr["ready"],
             "first_review": pr["first_review"], "merged": pr["merged"], "closed": pr["closed"],
@@ -940,6 +1046,8 @@ def build_records(prs, ctx):
         rec["release"] = deploy[1] if deploy and merged is not None else None
         rec["deploy_wait"] = span(merged, rec["deployed"])
         rec["lead_to_deploy"] = span(pr["first_commit"], rec["deployed"])
+        if rec["lead_to_deploy"] is not None and pr["source"] != "api":
+            rec["inferred"].append("lead_to_deploy")  # built from the inferred first-commit time
         rec["restore"] = None
         rec["_sha"] = pr.get("sha")
         rec["_c"] = c
@@ -1004,7 +1112,7 @@ def write_csv(path, records):
             row = []
             for c in cols:
                 v = r.get(c)
-                if isinstance(v, str) and v[:1] in "=+-@":
+                if isinstance(v, str) and v and v[0] in "=+-@\t\r":
                     v = "'" + v  # neutralise spreadsheet formula injection
                 row.append("" if v is None else v)
             w.writerow(row)
@@ -1032,10 +1140,10 @@ def collect(args):
     if run_git(repo, "rev-parse", "--is-inside-work-tree", check=False).strip() != "true" \
             and run_git(repo, "rev-parse", "--is-bare-repository", check=False).strip() != "true":
         raise ToolError(f"{repo} is not a git repository")
-    branch = args.branch or detect_branch(repo)
+    branch = args.branch or detect_branch(repo, args.remote)
     if not run_git(repo, "rev-parse", "--verify", "-q", branch + "^{commit}", check=False).strip():
         raise ToolError(f"Branch or ref '{branch}' not found. Pass --branch.")
-    short_branch = branch.split("/", 1)[1] if branch.startswith("origin/") else branch
+    short_branch = strip_remote_prefix(repo, branch)
     warnings: list = []
     if run_git(repo, "rev-parse", "--is-shallow-repository", check=False).strip() == "true":
         warnings.append("This is a shallow clone. History, lines of code over time and timings are incomplete. "
@@ -1059,19 +1167,28 @@ def collect(args):
     loc = build_loc_series(first_parent)
     log(f"  {len(graph)} commits, {len(first_parent)} on the first-parent line")
 
-    deploys, claimed = ([], {})
+    deploys, claimed = [], {}
     if args.deploy_source == "tags":
         deploys, claimed = compute_deploys(repo, graph, args.tag_pattern, branch)
         log(f"  {len(deploys)} release tags")
     else:
         for c in first_parent:
             claimed[c["sha"]] = (c["ct"], "merge")
-        deploys = []
+    claims = claim_branch_commits(first_parent, graph)
 
     # Decide where PR data comes from.
     remote = run_git(repo, "remote", "get-url", args.remote, check=False).strip()
     parsed = parse_remote(remote) if remote else None
-    provider = args.provider or (detect_provider(parsed[0]) if parsed else None)
+    host_provider = detect_provider(parsed[0]) if parsed else None
+    provider = args.provider or host_provider
+    untrusted = None
+    if parsed and provider and provider != host_provider and not args.api_url:
+        # Never derive an API host from an arbitrary remote: a token would go to whoever controls it.
+        untrusted = (f"Remote host {parsed[0]} is not github.com or gitlab.com; pass --provider and --api-url "
+                     "to use its API.")
+    elif parsed and not provider and parsed[0] not in TRUSTED_HOSTS:
+        untrusted = (f"Remote host {parsed[0]} is not github.com or gitlab.com; pass --provider and --api-url "
+                     "to use its API.")
     token_envs = [args.token_env] if args.token_env else (
         ["GITHUB_TOKEN", "GH_TOKEN"] if provider == "github" else
         ["GITLAB_TOKEN", "GITLAB_PRIVATE_TOKEN"] if provider == "gitlab" else [])
@@ -1080,8 +1197,10 @@ def collect(args):
     source = args.source
     api_prs = None
     if source in ("auto", "api"):
-        if not parsed or not provider:
-            msg = "No GitHub or GitLab remote was detected (use --remote or --provider)."
+        if not parsed or not provider or untrusted:
+            msg = "No GitHub or GitLab remote was detected (use --remote, or --provider with --api-url)."
+            if untrusted:
+                msg += " " + untrusted
             if source == "api":
                 raise ToolError(msg)
             warnings.append(msg + " PRs are inferred from git history.")
@@ -1092,27 +1211,40 @@ def collect(args):
             warnings.append(msg + " Using PRs inferred from git history. Set a token for exact open, review and merge times.")
         else:
             host, path = parsed
+            info: dict = {}
             try:
                 log(f"Fetching pull requests from {provider} API (token from ${token_name}) ...")
                 if provider == "github":
+                    if "/" not in path:
+                        raise ApiError(f"Cannot read owner/name from the remote path '{path}'")
                     owner, name = path.split("/", 1)
-                    api_url = args.api_url or ("https://api.github.com" if host == "github.com" else f"https://{host}/api")
-                    api_prs = fetch_github(owner, name, token, api_url, since, short_branch, args.all_bases, args.max_prs)
+                    api_url = args.api_url or "https://api.github.com"
+                    api_prs = fetch_github(owner, name, token, api_url, since, short_branch, args.all_bases, args.max_prs,
+                                           info=info)
                 else:
-                    api_url = args.api_url or f"https://{host}/api/v4"
+                    api_url = args.api_url or "https://gitlab.com/api/v4"
                     api_prs = fetch_gitlab(path, token, api_url, since, short_branch, args.all_bases, args.max_prs,
-                                           not args.no_reviews)
-            except ApiError as e:
+                                           not args.no_reviews, info=info)
+            except (ApiError, ValueError, KeyError, TypeError, AttributeError, IndexError, OSError) as e:
+                detail = str(e) if isinstance(e, ApiError) else f"unexpected response or I/O error: {e.__class__.__name__}: {e}"
                 if source == "api":
-                    raise
-                warnings.append(f"API fetch failed ({e}). Using PRs inferred from git history instead.")
+                    raise ApiError(f"API fetch failed: {detail}")
+                warnings.append(f"API fetch failed ({detail}). Using PRs inferred from git history instead.")
                 api_prs = None
+            if api_prs is not None and not api_prs:
+                seen = info.get("seen", 0)
+                if seen and not args.all_bases:
+                    warnings.append(f"The API returned {seen} pull request(s) but none target '{short_branch}'. "
+                                    "Pass --branch with the base branch name, or --all-bases.")
+                else:
+                    warnings.append("The API returned no pull requests for this repository"
+                                    + (" in the selected date range." if since else "."))
 
     direct = sync = 0
     if api_prs is not None:
         prs, mode = api_prs, "api"
     else:
-        prs, direct, sync = infer_prs_from_git(first_parent, graph, branch, args.commits_as_prs)
+        prs, direct, sync = infer_prs_from_git(first_parent, graph, short_branch, args.commits_as_prs, claims)
         mode = "git"
         if not prs:
             warnings.append("No pull requests could be inferred from git history. This usually means rebase or "
@@ -1124,13 +1256,14 @@ def collect(args):
 
     if since:
         prs = [p for p in prs if (p["merged"] or p["created"] or 0) >= since]
-    if until:
-        prs = [p for p in prs if (p["merged"] or p["created"] or 0) <= until + 86400]
+    if until:  # --until is inclusive of that whole UTC day
+        prs = [p for p in prs if (p["merged"] or p["created"] or 0) < until + 86400]
     if args.max_prs and mode == "git":
         prs = prs[-args.max_prs:]
 
     records = build_records(prs, {
-        "failure_re": failure_re, "bot_re": bot_re, "fp_by_sha": fp_by_sha, "claimed": claimed,
+        "failure_re": failure_re, "failure_title_start": args.failure_pattern is None,
+        "bot_re": bot_re, "fp_by_sha": fp_by_sha, "claimed": claimed, "claims": claims,
         "redact": args.no_titles, "reverts": load_reverts(repo, branch),
     })
     if args.exclude_bots:
@@ -1140,7 +1273,7 @@ def collect(args):
     if since:
         deploys = [d for d in deploys if d["t"] >= since]
     if until:
-        deploys = [d for d in deploys if d["t"] <= until + 86400]
+        deploys = [d for d in deploys if d["t"] < until + 86400]
     # Mark deploy as failure-related when it contains a revert/hotfix PR.
     fail_releases = {r["release"] for r in records if r["kind"] and r["release"]}
     for d in deploys:
@@ -1152,7 +1285,8 @@ def collect(args):
         "mode": mode, "provider": provider if mode == "api" else None,
         "warnings": warnings, "commits": len(graph), "direct_commits": direct, "sync_merges": sync,
         "deploy_source": args.deploy_source, "tag_pattern": args.tag_pattern,
-        "failure_pattern": args.failure_pattern or DEFAULT_FAILURE, "excludes": excludes,
+        "failure_pattern": args.failure_pattern or DEFAULT_FAILURE, "failure_default": args.failure_pattern is None,
+        "tag_default": args.tag_pattern == DEFAULT_TAG_PATTERN, "excludes": excludes,
         "reviews": mode == "api" and not (provider == "gitlab" and args.no_reviews),
         "commits_as_prs": bool(args.commits_as_prs),
         "heuristics": {"risk": RISK, "size_buckets": SIZE_BUCKETS, "sensitive": args.sensitive_pattern or DEFAULT_SENSITIVE,
@@ -1175,8 +1309,8 @@ def build_parser():
     p.add_argument("--title", help="name shown in the dashboard (default: repository name)")
     p.add_argument("--branch", help="branch to analyse (default: the remote's default branch)")
     p.add_argument("--remote", default="origin", help="remote used to find the hosting provider (default: origin)")
-    p.add_argument("--since", metavar="YYYY-MM-DD", help="only include PRs on or after this date")
-    p.add_argument("--until", metavar="YYYY-MM-DD", help="only include PRs on or before this date")
+    p.add_argument("--since", metavar="YYYY-MM-DD", help="only include PRs merged (or opened, if unmerged) on or after this UTC date")
+    p.add_argument("--until", metavar="YYYY-MM-DD", help="only include PRs merged (or opened) on or before this UTC date (inclusive)")
     g = p.add_argument_group("PR data source")
     g.add_argument("--source", choices=["auto", "git", "api"], default="auto",
                    help="auto uses the API when a token is available, otherwise infers PRs from git (default: auto)")
@@ -1194,7 +1328,8 @@ def build_parser():
     g.add_argument("--deploy-source", choices=["tags", "merges"], default="tags",
                    help="what counts as a deployment: release tags, or every merge to the branch (default: tags)")
     g.add_argument("--tag-pattern", default=DEFAULT_TAG_PATTERN, metavar="REGEX", help=f"tags that count as releases (default: {DEFAULT_TAG_PATTERN})")
-    g.add_argument("--failure-pattern", metavar="REGEX", help=f"title/branch/label regex marking a hotfix (default: {DEFAULT_FAILURE})")
+    g.add_argument("--failure-pattern", metavar="REGEX", help=f"regex marking a hotfix, searched in title, branch and labels (default: {DEFAULT_FAILURE}, which "
+                        "matches branch/labels anywhere but the title only at its start)")
     g.add_argument("--sensitive-pattern", metavar="REGEX", help="path regex that raises risk (default: migrations, auth, infra, CI)")
     g.add_argument("--bot-pattern", default=r"\[bot\]$|^dependabot|^renovate|-bot$", metavar="REGEX", help="author regex that marks a bot")
     g.add_argument("--exclude-bots", action="store_true", help="drop bot-authored PRs entirely")
@@ -1207,11 +1342,33 @@ def build_parser():
 
 
 def serve(path: Path, port: int, open_browser: bool):
-    directory = str(path.parent.resolve())
+    """Serve only the dashboard file: `/` and `/<name>` return it, everything else is 404 (no listing)."""
+    target = path.resolve()
+    allowed = {"/", "/" + urllib.parse.quote(path.name), "/" + path.name}
 
-    class Handler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *a, **kw):
-            super().__init__(*a, directory=directory, **kw)
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, head_only):
+            if urllib.parse.urlsplit(self.path).path not in allowed:
+                self.send_error(404, "Not Found")
+                return
+            try:
+                body = target.read_bytes()
+            except OSError:
+                self.send_error(404, "Not Found")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(body)
+
+        def do_GET(self):
+            self._send(False)
+
+        def do_HEAD(self):
+            self._send(True)
 
         def log_message(self, *a):
             pass
@@ -1225,6 +1382,8 @@ def serve(path: Path, port: int, open_browser: bool):
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        httpd.server_close()
 
 
 def main(argv=None):
@@ -1240,12 +1399,20 @@ def main(argv=None):
     except ToolError as e:
         log(f"error: {e}")
         return 1
+    except OSError as e:  # unwritable output, missing git binary, ...
+        where = f" ({e.filename})" if getattr(e, "filename", None) else ""
+        log(f"error: {e.strerror or e}{where}")
+        return 1
     merged = sum(1 for r in data["prs"] if r["state"] == "merged")
     log(f"Wrote {out} ({len(data['prs'])} PRs, {merged} merged, source: {data['meta']['mode']})")
     for w in data["meta"]["warnings"]:
         log(f"warning: {w}")
     if args.serve is not None:
-        serve(out, args.serve, not args.no_open)
+        try:
+            serve(out, args.serve, not args.no_open)
+        except OSError as e:
+            log(f"error: could not serve on 127.0.0.1:{args.serve}: {e.strerror or e}")
+            return 1
     return 0
 
 

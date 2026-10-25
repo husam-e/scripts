@@ -92,7 +92,7 @@ th:first-child, td:first-child { text-align: left; white-space: normal; min-widt
 th.title { text-align: left; }
 th { color: var(--ink2); font-weight: 600; }
 .tablewrap { overflow-x: auto; }
-td.title { text-align: left; white-space: normal; max-width: 420px; overflow-wrap: anywhere; }
+td.title { text-align: left; white-space: normal; min-width: 170px; max-width: 420px; overflow-wrap: break-word; }
 
 #tip { position: fixed; z-index: 50; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--axis);
   border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.18); display: none; max-width: 280px; }
@@ -101,10 +101,12 @@ td.title { text-align: left; white-space: normal; max-width: 420px; overflow-wra
 #tip .r .k { width: 12px; height: 0; border-top: 2px solid; flex: none; }
 #tip .r b { font-weight: 650; margin-left: auto; padding-left: 14px; font-variant-numeric: tabular-nums; }
 #tip .r span.n { color: var(--ink2); }
-dl.method { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 13px; }
+dl.method { margin: 0; display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; font-size: 13px; }
 dl.method dt { font-weight: 600; }
-dl.method dd { margin: 0; color: var(--ink2); }
-@media (max-width: 860px) { .grid { grid-template-columns: minmax(0, 1fr); } dl.method { grid-template-columns: 1fr; } }
+dl.method dd { margin: 0; color: var(--ink2); min-width: 0; overflow-wrap: anywhere; }
+dl.method code { overflow-wrap: anywhere; word-break: break-word; white-space: normal; }
+svg .mark-label { paint-order: stroke; stroke: var(--surface); stroke-width: 3px; stroke-linejoin: round; }
+@media (max-width: 860px) { .grid { grid-template-columns: minmax(0, 1fr); } dl.method { grid-template-columns: minmax(0, 1fr); } dl.method dd { margin-bottom: 6px; } }
 @media (forced-colors: active) { svg .bar, svg path { forced-color-adjust: none; } }
 </style>
 </head>
@@ -228,8 +230,11 @@ function groupBy(items, keyFn) {
 
 /* ------------------------------------------------------------------ state */
 const PRS = DATA.prs, META = DATA.meta;
-const allTimes = [].concat(PRS.map((p) => p.merged || p.created).filter(Boolean), DATA.loc.days.map((d) => d[0]));
-const DATA_LO = Math.min(...allTimes), DATA_HI = Math.max(...allTimes);
+// Every dated event, so a release tagged (or a PR closed) after the last merge still falls inside "All time".
+const allTimes = [].concat(PRS.map((p) => p.merged || p.created), PRS.map((p) => p.closed), DATA.loc.days.map((d) => d[0]), DATA.deploys.map((d) => d.t)).filter((t) => t != null);
+let DATA_LO = Infinity, DATA_HI = -Infinity;
+for (const t of allTimes) { if (t < DATA_LO) DATA_LO = t; if (t > DATA_HI) DATA_HI = t; } // no Math.min(...big array)
+if (!isFinite(DATA_LO)) { DATA_LO = DATA_HI = Math.floor(Date.now() / 1000); }
 const TYPE_GROUPS = ["feat", "fix", "refactor", "docs", "test", "chore", "perf", "other"];
 const GROUP_OF = { style: "chore", build: "chore", ci: "chore", revert: "other" };
 const groupOf = (t) => TYPE_GROUPS.includes(t) ? t : (GROUP_OF[t] || "other");
@@ -239,10 +244,15 @@ const state = { preset: "all", from: null, to: null, types: new Set(TYPE_GROUPS)
 try { const saved = localStorage.getItem("repo-stats-period"); if (saved) state.period = saved; } catch (e) { /* storage may be blocked */ }
 
 function range() {
-  let hi = DATA_HI, lo = DATA_LO;
+  let hi = DATA_HI + DAY - 1, lo = DATA_LO;
   const p = state.preset;
   const months = { "12m": 12, "6m": 6, "3m": 3, "1m": 1 }[p];
-  if (months) { const d = new Date(DATA_HI * 1000); lo = Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - months, d.getUTCDate()) / 1000; }
+  if (months) {
+    // Clamp the day: one month before Mar 31 is Feb 28/29, not Mar 2/3.
+    const d = new Date(DATA_HI * 1000), y = d.getUTCFullYear(), m = d.getUTCMonth() - months;
+    const last = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+    lo = Date.UTC(y, m, Math.min(d.getUTCDate(), last)) / 1000;
+  }
   if (p === "custom") { if (state.from != null) lo = state.from; if (state.to != null) hi = state.to + DAY - 1; }
   return { lo: Math.max(lo, DATA_LO), hi: Math.min(hi, DATA_HI + DAY) };
 }
@@ -412,7 +422,8 @@ function lineChart(host, o) {
   });
   const cross = s("line", { y1: 0, y2: P.ih, stroke: css("--ink2"), "stroke-width": 1, "stroke-dasharray": "3 3", visibility: "hidden" }, P.g);
   const dots = series.map((sr) => s("circle", { r: 4, fill: sr.color, stroke: css("--surface"), "stroke-width": 2, visibility: "hidden" }, P.g));
-  const hit = s("rect", { width: P.iw, height: P.ih, fill: "transparent", tabindex: 0 }, P.g);
+  // Pointer-only hit area; keyboard and screen-reader users get the same values from the Table toggle.
+  const hit = s("rect", { width: P.iw, height: P.ih, fill: "transparent" }, P.g);
   const move = (evt) => {
     const box = P.svg.getBoundingClientRect(), px = (evt.clientX - box.left) * (P.width / box.width) - P.m.l;
     const t = lo + (px / P.iw) * (hi - lo), j = nearestIndex(xs, t), x = P.sx(xs[j]);
@@ -450,7 +461,13 @@ function barChart(host, o) {
       const r = s("rect", { class: "bar", x: stacked ? x0 : x0 + k * w, y: y1, width: Math.max(1, w - (stacked ? 0 : 1)), height: rh, rx: Math.min(4, w / 2), fill: sr.color }, P.g);
       void r;
     });
-    if (i % every === 0 && o.labels !== false) s("text", { x: i * band + band / 2, y: P.ih + 17, "text-anchor": "middle" }, P.g).textContent = c.short || c;
+    if (i % every === 0 && o.labels !== false) {
+      const lt = s("text", { x: i * band + band / 2, y: P.ih + 17, "text-anchor": "middle" }, P.g);
+      lt.textContent = c.short || c;
+      let w = 0;
+      try { w = lt.getComputedTextLength(); } catch (e) { w = 0; }
+      if (i * band + band / 2 + w / 2 > P.iw + P.m.r) lt.setAttribute("x", P.iw + P.m.r - w / 2 - 1); // keep the last label inside
+    }
     const hit = s("rect", { x: i * band, y: 0, width: band, height: P.ih, fill: "transparent" }, P.g);
     hit.addEventListener("pointermove", (evt) => showTip(evt, c.long || c.short || c, series.map((sr) => ({ name: sr.name, color: sr.color, value: (o.tipFmt || fmtInt)(sr.vals[i]) }))));
     hit.addEventListener("pointerleave", hideTip);
@@ -461,7 +478,9 @@ function barChart(host, o) {
 function logBins(values, nb = 28, floor = 1) {
   const v = values.filter((x) => x != null);
   if (!v.length) return [];
-  const lo = Math.max(floor, Math.min(...v)), hi = Math.max(lo * 1.01, Math.max(...v) + 1);
+  let vmin = Infinity, vmax = -Infinity;
+  for (const x of v) { if (x < vmin) vmin = x; if (x > vmax) vmax = x; }
+  const lo = Math.max(floor, vmin), hi = Math.max(lo * 1.01, vmax + 1);
   const useLog = hi / lo > 8;
   const edges = [];
   for (let i = 0; i <= nb; i++) edges.push(useLog ? lo * Math.pow(hi / lo, i / nb) : lo + (hi - lo) * i / nb);
@@ -474,13 +493,24 @@ function logBins(values, nb = 28, floor = 1) {
   }
   return bins;
 }
+/** Fixed-width bins over [lo, hi]; the last bin includes hi. */
+function linearBins(values, lo, hi, width) {
+  const v = values.filter((x) => x != null);
+  if (!v.length) return [];
+  const n = Math.ceil((hi - lo) / width);
+  const bins = Array.from({ length: n }, (_, i) => ({ lo: lo + i * width, hi: Math.min(hi, lo + (i + 1) * width), n: 0 }));
+  for (const x of v) bins[Math.max(0, Math.min(n - 1, Math.floor((x - lo) / width)))].n++;
+  return bins;
+}
 function histChart(host, o) {
-  const bins = logBins(o.values, 28, o.floor || 1);
+  const bins = o.linear ? linearBins(o.values, o.linear.lo, o.linear.hi, o.linear.width) : logBins(o.values, 28, o.floor || 1);
   if (!bins.length) { host.append(h("div", { class: "empty" }, "No data in this range.")); return; }
-  const lo = bins[0].lo, hi = bins[bins.length - 1].hi, useLog = hi / lo > 8;
-  const ymax = Math.max(...bins.map((b) => b.n));
+  const lo = bins[0].lo, hi = bins[bins.length - 1].hi, useLog = !o.linear && hi / lo > 8;
+  let ymax = 0;
+  for (const b of bins) if (b.n > ymax) ymax = b.n;
   const yt = coverTicks(0, ymax, 4, true);
-  const P = plot(host, { h: o.h || 230, x: { type: useLog ? "log" : "linear", domain: [lo, hi], fmt: o.xFmt, ticks: o.durations && useLog ? durTicks(lo, hi) : null }, y: { domain: [0, yt[yt.length - 1]], fmt: fmtCompact, ticks: yt }, label: o.label });
+  const xticks = o.linear ? o.linear.ticks : o.durations && useLog ? durTicks(lo, hi) : null;
+  const P = plot(host, { h: o.h || 230, x: { type: useLog ? "log" : "linear", domain: [lo, hi], fmt: o.xFmt, ticks: xticks }, y: { domain: [0, yt[yt.length - 1]], fmt: fmtCompact, ticks: yt }, label: o.label });
   const color = o.color || css("--c1");
   bins.forEach((b) => {
     if (!b.n) return;
@@ -489,17 +519,34 @@ function histChart(host, o) {
     r.addEventListener("pointermove", (evt) => showTip(evt, `${o.xFmt(b.lo)} – ${o.xFmt(b.hi)}`, [{ name: "PRs", value: fmtInt(b.n) }, { name: "Share", value: fmtPct(b.n / o.values.length) }]));
     r.addEventListener("pointerleave", hideTip);
   });
-  markers(P, o.marks, o.xFmt);
+  markers(P, o.marks, o.xFmt, false);
   o.table && o.table(bins.map((b) => [`${o.xFmt(b.lo)} – ${o.xFmt(b.hi)}`, b.n]), ["Range", "PRs"]);
 }
-function markers(P, marks, fmt) {
-  (marks || []).forEach((mk, i) => {
-    if (mk.v == null) return;
+/** Dashed percentile lines. Labels sit in their own row near the top (14px apart, so they never overlap
+ *  each other), with a halo for legibility. `block` right-aligns them all left of the first line, which for
+ *  a CDF is always empty space (the curve is below p50 there). */
+function markers(P, marks, fmt, block) {
+  const list = (marks || []).filter((mk) => mk.v != null);
+  const ROW = 14;
+  list.forEach((mk) => {
     const x = P.sx(mk.v);
     s("line", { x1: x, x2: x, y1: 0, y2: P.ih, stroke: css("--ink2"), "stroke-width": 1, "stroke-dasharray": "4 3" }, P.g);
-    const left = x > P.iw * 0.75;
-    const t = s("text", { class: "mark-label", x: left ? x - 4 : x + 4, y: 10 + i * 12, "text-anchor": left ? "end" : "start" }, P.g);
+  });
+  const xs = list.map((mk) => Math.max(0, Math.min(P.iw, P.sx(mk.v))));
+  const texts = list.map((mk, i) => {
+    const y = 11 + i * ROW;
+    const t = s("text", { class: "mark-label", x: xs[i] + 4, y, "text-anchor": "start" }, P.g);
     t.textContent = `${mk.label} ${fmt(mk.v)}`;
+    let w = 0;
+    try { w = t.getComputedTextLength(); } catch (e) { w = t.textContent.length * 6; }
+    return { t, w };
+  });
+  if (!block && texts.every(({ w }, i) => xs[i] + 4 + w <= P.iw)) return;  // each label right of its own line
+  // Otherwise right-align every label left of the first line, so no label crosses another dashed line.
+  const x0 = Math.min(...xs) - 4, wmax = Math.max(...texts.map((x) => x.w));
+  texts.forEach(({ t, w }, i) => {
+    if (x0 - wmax >= 0) { t.setAttribute("x", x0); t.setAttribute("text-anchor", "end"); }
+    else if (xs[i] + 4 + w > P.iw) { t.setAttribute("x", Math.max(w, xs[i] - 4)); t.setAttribute("text-anchor", "end"); }
   });
 }
 function cdfChart(host, o) {
@@ -513,7 +560,7 @@ function cdfChart(host, o) {
   const path = [[P.sx(lo), P.sy(0)]];
   pts.forEach(([x, p], i) => { path.push([P.sx(x), i ? P.sy(pts[i - 1][1]) : P.sy(0)], [P.sx(x), P.sy(p)]); });
   line(P.g, path, o.color || css("--c1"));
-  markers(P, o.marks, o.xFmt);
+  markers(P, o.marks, o.xFmt, true);
   const cross = s("line", { y1: 0, y2: P.ih, stroke: css("--ink2"), "stroke-dasharray": "3 3", visibility: "hidden" }, P.g);
   const hit = s("rect", { width: P.iw, height: P.ih, fill: "transparent" }, P.g);
   hit.addEventListener("pointermove", (evt) => {
@@ -599,6 +646,13 @@ function band(kind, value) {
 }
 const bandEl = (b) => b ? h("span", { class: "band", title: "Approximate DORA performance band (see Methodology)" }, b) : null;
 
+/** One lead-time definition everywhere (KPI, DORA card, by-type table): to release when any merged PR in
+ *  the selection has a release, else to merge. In release mode PRs not yet released are left out. */
+function leadMode(prs) {
+  const release = prs.some((p) => p.lead_to_deploy != null);
+  return { release, key: release ? "lead_to_deploy" : "lead", label: release ? "first commit to release" : "first commit to merge" };
+}
+
 /* ------------------------------------------------------------------ sections */
 const METRICS = [
   ["coding", "Coding time", "First commit to PR ready"],
@@ -609,11 +663,12 @@ const METRICS = [
   ["deploy_wait", "Merge to release", "Merged to first release tag"],
   ["lead_to_deploy", "Lead time to release", "First commit to first release tag"],
 ];
-const GIT_PROXY = { coding: "first to last commit on the branch", review: "last commit to merge" };
+const TAG_DESC = () => META.tag_default ? "a version number (v1.2, 1.2.3; pre-releases such as -rc or -beta are not counted)" : META.tag_pattern;
 
 function renderKpis(app, sel) {
   const { merged, deploys, r } = sel;
-  const lead = stats(merged.map((p) => p.lead_to_deploy ?? p.lead));
+  const lm = leadMode(merged);
+  const lead = stats(merged.map((p) => p[lm.key]));
   const size = stats(merged.map((p) => p.lines));
   const days = Math.max(1, (r.hi - r.lo) / DAY);
   const fails = merged.filter((p) => p.kind).length;
@@ -625,7 +680,7 @@ function renderKpis(app, sel) {
   app.append(h("div", { class: "kpis", id: "overview" },
     kpi("Merged PRs", fmtInt(merged.length), `${fmtNum(merged.length / days * 7)} per week`),
     kpi("Median PR size", merged.length ? fmtInt(size.median) : "–", `lines changed · p90 ${fmtInt(size.p90)}`),
-    kpi("Median lead time", fmtDur(lead.median), `p90 ${fmtDur(lead.p90)}`, band("lead", lead.median)),
+    kpi("Median lead time", fmtDur(lead.median), `${lm.label} · p90 ${fmtDur(lead.p90)}`, band("lead", lead.median)),
     kpi("Releases", fmtInt(deploys.length), deploys.length ? `${fmtNum(freq * 7)} per week` : "no release tags matched", deploys.length ? band("freq", freq) : null),
     kpi("Change failure rate", fmtPct(cfr), `${fails} revert/hotfix PRs`, band("cfr", cfr)),
     kpi("High or critical risk", fmtPct(hiRisk), "share of merged PRs"),
@@ -730,7 +785,8 @@ function renderSize(app, sel) {
   const cc = card(grid, "Cumulative frequency of lines changed", { note: "Share of PRs at or below a given size." });
   cdfChart(cc.body, { sorted: st.sorted || [], xFmt: fmtCompact, marks, label: "Cumulative distribution of lines changed", table: cc.table });
 
-  const bc = card(grid, "PRs by size bucket", { note: "XS ≤ 10, S ≤ 100, M ≤ 500, L ≤ 1000, XL > 1000 lines changed." });
+  const SB = META.heuristics.size_buckets;
+  const bc = card(grid, "PRs by size bucket", { note: SB.map(([lim, n], i) => lim == null ? `${n} > ${SB[i - 1][0]}` : `${n} ≤ ${lim}`).join(", ") + " lines changed." });
   const names = META.heuristics.size_buckets.map((b) => b[1]);
   const bucketOf = (v) => META.heuristics.size_buckets.find((b) => b[0] == null || v <= b[0])[1];
   const counts = names.map((n) => lines.filter((v) => bucketOf(v) === n).length);
@@ -743,7 +799,7 @@ function renderSize(app, sel) {
 
 function groupColor(g) { return SERIES()[TYPE_GROUPS.indexOf(g)]; }
 function renderTypes(app, sel) {
-  sectionHead(app, "types", "Pull request types", "Type follows Conventional Commits: read from the PR title, then the first commit, then the branch name, then a keyword guess.");
+  sectionHead(app, "types", "Pull request types", "Type follows Conventional Commits in the PR title; otherwise a type label, the branch name prefix, then a keyword guess.");
   const grid = h("div", { class: "grid" });
   app.append(grid);
   const prs = sel.merged;
@@ -759,19 +815,20 @@ function renderTypes(app, sel) {
   barChart(mc.body, { cats: months.map((t) => ({ short: bucketLabel(t, "month"), long: bucketLabel(t, "month") })), series: sers, stacked: true, label: "Type mix by month", table: mc.table, catName: "Month" });
 
   const tc = card(grid, "Statistics by type", { wide: true });
+  const lm = leadMode(prs);
   const types = [...new Set(prs.map((p) => p.type))].sort((a, b) => prs.filter((p) => p.type === b).length - prs.filter((p) => p.type === a).length);
   tc.body.append(h("div", { class: "tablewrap" }, h("table", null,
-    h("thead", null, h("tr", null, ["Type", "PRs", "Share", "Median lines", "p90 lines", "Median files", "Median lead", "Mean risk", "Breaking"].map((c) => h("th", null, c)))),
+    h("thead", null, h("tr", null, ["Type", "PRs", "Share", "Median lines", "p90 lines", "Median files", lm.release ? "Median lead (to release)" : "Median lead (to merge)", "Mean risk", "Breaking"].map((c) => h("th", null, c)))),
     h("tbody", null, types.map((t) => {
       const sub = prs.filter((p) => p.type === t);
       return h("tr", null, h("td", null, t), h("td", null, fmtInt(sub.length)), h("td", null, fmtPct(sub.length / prs.length)),
         h("td", null, fmtInt(stats(sub.map((p) => p.lines)).median)), h("td", null, fmtInt(stats(sub.map((p) => p.lines)).p90)),
-        h("td", null, fmtInt(stats(sub.map((p) => p.files)).median)), h("td", null, fmtDur(stats(sub.map((p) => p.lead_to_deploy ?? p.lead)).median)),
+        h("td", null, fmtInt(stats(sub.map((p) => p.files)).median)), h("td", null, fmtDur(stats(sub.map((p) => p[lm.key])).median)),
         h("td", null, fmtNum(stats(sub.map((p) => p.risk)).mean)), h("td", null, fmtInt(sub.filter((p) => p.breaking).length)));
     })))));
   const src = groupBy(prs, (p) => p.type_source);
-  const order = ["title", "commit", "label", "branch", "keyword", "none"];
-  tc.body.append(h("p", { class: "note" }, "How the type was determined: " + order.filter((k) => src.has(k)).map((k) => `${k} ${fmtPct(src.get(k).length / prs.length)}`).join(" · ") + ". Only title and commit are real Conventional Commit data; branch, keyword and none are guesses."));
+  const order = ["title", "label", "branch", "keyword", "none"];
+  if (prs.length) tc.body.append(h("p", { class: "note" }, "How the type was determined: " + order.filter((k) => src.has(k)).map((k) => `${k} ${fmtPct(src.get(k).length / prs.length)}`).join(" · ") + ". Only title is real Conventional Commit data; label and branch are conventions, keyword is a guess and none means no signal."));
 }
 
 const RISK_COLOR = { low: "--st-good", medium: "--st-warn", high: "--st-serious", critical: "--st-crit" };
@@ -789,7 +846,9 @@ function renderRisk(app, sel) {
   [...lc.body.querySelectorAll("rect.bar")].forEach((rc, i) => rc.setAttribute("fill", css(RISK_COLOR[visible[i]])));
 
   const hc = card(grid, "Distribution of risk scores");
-  histChart(hc.body, { values: prs.map((p) => p.risk), xFmt: (v) => String(Math.round(v)), label: "Histogram of risk scores", table: hc.table });
+  const hc2 = R.cap || 100;
+  histChart(hc.body, { values: prs.map((p) => p.risk), xFmt: (v) => String(Math.round(v)), label: "Histogram of risk scores", table: hc.table,
+    linear: { lo: 0, hi: hc2, width: 5, ticks: [0, 20, 40, 60, 80, 100].filter((t) => t <= hc2) } });
 
   const tc = card(grid, "Risk over time", { note: "Mean risk score and the percentage of PRs rated high or critical, by month. Both read on a 0–100 scale." });
   const byM = groupBy(prs, (p) => bucketStart(p.merged, "month"));
@@ -856,7 +915,7 @@ function renderDora(app, sel) {
   app.append(grid);
   const { r, merged, deploys } = sel;
   const kind = state.period;
-  const dc = card(grid, `Deployments per ${kind}`, { wide: true, note: META.deploy_source === "tags" ? `A deployment is a release tag matching ${META.tag_pattern}. Highlighted periods contain a release that shipped a revert or hotfix.` : "A deployment is any merge to the branch." });
+  const dc = card(grid, `Deployments per ${kind}`, { wide: true, note: META.deploy_source === "tags" ? `A deployment is a release tag matching ${TAG_DESC()}. Highlighted periods contain a release that shipped a revert or hotfix.` : "A deployment is any merge to the branch." });
   const times = (META.deploy_source === "tags" ? deploys.map((d) => d.t) : merged.map((p) => p.merged));
   const b = countBuckets(times, kind, r.lo, r.hi);
   const fix = countBuckets(deploys.filter((d) => d.fix).map((d) => d.t), kind, r.lo, r.hi);
@@ -875,10 +934,11 @@ function renderDora(app, sel) {
   fc.body.append(h("p", { class: "note" }, `Average ${fmtNum(perDay * 7)} per week.`, bandEl(times.length ? band("freq", perDay) : null)));
 
   const lc = card(grid, "Lead time for changes", { wide: true });
-  const useRelease = merged.some((p) => p.lead_to_deploy != null);
-  const lt = stats(merged.map((p) => useRelease ? p.lead_to_deploy : p.lead));
-  lc.body.append(statsTable([{ label: useRelease ? "First commit to release" : "First commit to merge", st: lt, fmt: fmtDur }]));
-  lc.body.append(h("p", { class: "note" }, useRelease ? "Measured to the first release tag that contains the change." : "No release tags matched, so this stops at merge time.", bandEl(band("lead", lt.median))));
+  const lm = leadMode(merged);
+  const lt = stats(merged.map((p) => p[lm.key]));
+  lc.body.append(statsTable([{ label: lm.release ? "First commit to release" : "First commit to merge", st: lt, fmt: fmtDur }]));
+  const unreleased = lm.release ? merged.filter((p) => p.lead_to_deploy == null).length : 0;
+  lc.body.append(h("p", { class: "note" }, lm.release ? `Measured to the first release tag that contains the change${unreleased ? `; ${unreleased} merged PR(s) not yet released are left out` : ""}. The overview card and the by-type table use the same definition.` : "No merged PR in this range has a release, so this stops at merge time.", bandEl(band("lead", lt.median))));
 
   const cf = card(grid, "Change failure rate", { wide: true, note: "Revert or hotfix PRs as a share of merged PRs, by month." });
   const byM = groupBy(merged, (p) => bucketStart(p.merged, "month"));
@@ -910,9 +970,9 @@ function renderMethod(app) {
 
   const dora = card(grid, "DORA definitions used", { wide: true });
   dora.body.append(h("dl", { class: "method" },
-    h("dt", null, "Deployment"), h("dd", null, META.deploy_source === "tags" ? `A tag whose name matches ${META.tag_pattern}, dated by tag creation.` : "Every merge to the branch."),
-    h("dt", null, "Lead time for changes"), h("dd", null, "First commit of the PR to the first release tag containing the merge (to merge time when no tags exist). First commit time is the author date of the earliest commit, which a rebase can distort."),
-    h("dt", null, "Change failure"), h("dd", null, `A merged PR that is a revert (title starts with Revert, or type revert) or matches the hotfix pattern /${META.failure_pattern}/i in its title, branch or labels. The rate is failures divided by merged PRs.`),
+    h("dt", null, "Deployment"), h("dd", null, META.deploy_source === "tags" ? `A tag whose name matches ${TAG_DESC()}, dated by tag creation.` + (META.tag_default ? ` Pattern: ${META.tag_pattern}` : "") : "Every merge to the branch."),
+    h("dt", null, "Lead time for changes"), h("dd", null, "First commit of the PR to the first release tag containing the merge. When no merged PR in the selected range has a release, it is measured to merge time instead; the same rule is used on every card. First commit time is the author date of the earliest commit, which a rebase can distort."),
+    h("dt", null, "Change failure"), h("dd", null, `A merged PR that is a revert (title starts with Revert, or type revert) or matches the hotfix pattern /${META.failure_pattern}/i in its branch or labels, or ${META.failure_default ? "at the start of its title (after any type prefix)" : "in its title"}. The rate is failures divided by merged PRs.`),
     h("dt", null, "Time to restore"), h("dd", null, "For reverts whose message says \"This reverts commit <sha>\": time from the reverted change's merge to the revert's merge."),
     h("dt", null, "Performance bands"), h("dd", null, "Elite, High, Medium and Low use rounded thresholds from published DORA reports: frequency ≥ daily / ≥ weekly / ≥ monthly; lead time < 1 day / < 1 week / < 1 month; failure rate ≤ 5% / 10% / 15%; restore < 1 hour / < 1 day / < 1 week. DORA revises its definitions, so treat bands as rough.")));
 
