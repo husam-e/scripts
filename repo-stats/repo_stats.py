@@ -31,9 +31,43 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from email.message import Message
 from pathlib import Path
+from typing import IO, Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, TypedDict, cast
 
 __version__ = "0.1.0"
+
+# A first-parent commit summary from Scanner.scan: sha, parents, at, ct, author, subject, body, add, del,
+# lines, files, code_lines, tests, sensitive, langs.
+Commit = Dict[str, Any]
+# A raw PR/MR from the API or inferred from git, before build_records.
+PR = Dict[str, Any]
+# A final per-PR record embedded in the dashboard.
+Record = Dict[str, Any]
+# sha -> (parent shas, author time, committer time)
+Graph = Dict[str, Tuple[Tuple[str, ...], int, int]]
+# sha -> (release time, release name) of the first deployment that contains the commit
+DeployClaims = Dict[str, Tuple[int, str]]
+# [[upper limit or None, result], ...] as used by tier()
+Tiers = Sequence[Sequence[Any]]
+
+
+class ParsedMessage(TypedDict):
+    """PR reference details extracted from a commit message by parse_message."""
+
+    number: Optional[int]
+    title: Optional[str]
+    branch: Optional[str]
+    sync: bool
+    has_ref: bool
+
+
+class RiskFactor(TypedDict):
+    """One contribution to a PR's risk score."""
+
+    name: str
+    points: int
+    detail: str
 
 TEMPLATE_PATH = Path(__file__).with_name("template.html")
 
@@ -141,6 +175,7 @@ MAX_LANGS = 12
 # ---------------------------------------------------------------------------
 
 def log(msg: str) -> None:
+    """Print a progress or error message to stderr."""
     print(msg, file=sys.stderr, flush=True)
 
 
@@ -148,21 +183,24 @@ class ToolError(Exception):
     """An error with a message that is safe and useful to show the user."""
 
 
-def compile_re(pattern: str, what: str, flags: int = 0) -> re.Pattern:
+def compile_re(pattern: str, what: str, flags: int = 0) -> re.Pattern[str]:
+    """Compile a user-supplied regex, raising ToolError that names the option `what` on failure."""
     try:
         return re.compile(pattern, flags)
     except re.error as e:
         raise ToolError(f"Invalid regular expression for {what}: {e}")
 
 
-def tier(value, tiers):
+def tier(value: float, tiers: Tiers) -> Any:
+    """Return the result of the first tier whose limit is None or at least `value`."""
     for limit, result in tiers:
         if limit is None or value <= limit:
             return result
     return tiers[-1][1]
 
 
-def language_of(path: str):
+def language_of(path: str) -> Tuple[str, str]:
+    """Return (language, kind) for a file path; kind is code, data, docs or other."""
     base = path.rsplit("/", 1)[-1]
     if base in SPECIAL_FILES:
         return SPECIAL_FILES[base]
@@ -177,11 +215,13 @@ def language_of(path: str):
 # Git access
 # ---------------------------------------------------------------------------
 
-def git_cmd(repo, *args):
+def git_cmd(repo: str, *args: str) -> List[str]:
+    """Build a git argv for `repo` with stable, unquoted path output."""
     return ["git", "-C", repo, "-c", "core.quotepath=off", "-c", "log.showSignature=false", *args]
 
 
-def run_git(repo, *args, check=True) -> str:
+def run_git(repo: str, *args: str, check: bool = True) -> str:
+    """Run git and return its stdout; with check, raise ToolError on a non-zero exit."""
     p = subprocess.run(git_cmd(repo, *args), capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
     if check and p.returncode != 0:
@@ -189,7 +229,7 @@ def run_git(repo, *args, check=True) -> str:
     return p.stdout
 
 
-def stream_git(repo, *args):
+def stream_git(repo: str, *args: str) -> Iterator[str]:
     """Yield stdout lines of a git command without loading it all in memory."""
     # stderr goes to a temp file: a PIPE nobody reads can fill up and deadlock git.
     with tempfile.TemporaryFile() as err:
@@ -207,6 +247,7 @@ def stream_git(repo, *args):
 
 
 def detect_branch(repo: str, remote: str = "origin") -> str:
+    """Guess the default branch: the remote's HEAD, then main/master, then the checked-out branch."""
     head = run_git(repo, "symbolic-ref", "-q", "--short", f"refs/remotes/{remote}/HEAD", check=False).strip()
     if head:
         return head
@@ -232,7 +273,7 @@ def strip_remote_prefix(repo: str, branch: str) -> str:
     return branch
 
 
-def parse_remote(url: str):
+def parse_remote(url: str) -> Optional[Tuple[str, str]]:
     """Return (host, path) from an https, ssh or scp-style git remote URL, or None."""
     url = url.strip()
     m = re.match(r"^[\w.+-]+://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(.+?)(?:\.git)?/?$", url)
@@ -246,9 +287,12 @@ def parse_remote(url: str):
 TRUSTED_HOSTS = {"github.com": "github", "gitlab.com": "gitlab"}
 
 
-def detect_provider(host: str):
-    """Only the public hosts are auto-detected. Anything else needs --provider and --api-url, so a crafted
-    remote URL (github.evil.example) can never receive a token."""
+def detect_provider(host: str) -> Optional[str]:
+    """Return "github" or "gitlab" for the public hosts only, else None.
+
+    Anything else needs --provider and --api-url, so a crafted remote URL (github.evil.example) can never
+    receive a token.
+    """
     return TRUSTED_HOSTS.get(host)
 
 
@@ -259,14 +303,18 @@ def detect_provider(host: str):
 CC_RE = re.compile(r"^\s*(?:\[(?P<t2>[a-z]+)\]|(?P<t>[A-Za-z]+)(?:\((?P<scope>[^)\n]*)\))?(?P<bang>!)?)\s*:\s*(?P<desc>.*)$")
 
 
-def normalize_type(raw: str):
+def normalize_type(raw: str) -> Optional[str]:
+    """Map a type word or alias to a Conventional Commit type, or None if it is not one."""
     t = raw.lower()
     t = TYPE_ALIASES.get(t, t)
     return t if t in CONVENTIONAL_TYPES else None
 
 
-def classify_type(title: str, branch: str | None = None):
-    """Return (type, scope, breaking, source). source says how the type was determined."""
+def classify_type(title: str, branch: str | None = None) -> Tuple[str, Optional[str], bool, str]:
+    """Return (type, scope, breaking, source).
+
+    source says how the type was determined: title, branch, keyword or none.
+    """
     m = CC_RE.match(title) if title else None
     if m:
         t = normalize_type(m.group("t") or m.group("t2") or "")
@@ -287,6 +335,7 @@ def classify_type(title: str, branch: str | None = None):
 
 
 def first_nonblank(text: str) -> str:
+    """Return the first non-blank line of text, stripped, or ""."""
     # split on "\n" only: str.splitlines() also breaks on U+2028/U+2029/U+0085 inside a title
     for line in text.split("\n"):
         if line.strip():
@@ -294,13 +343,13 @@ def first_nonblank(text: str) -> str:
     return ""
 
 
-def parse_message(subject: str, body: str, default_branch: str):
+def parse_message(subject: str, body: str, default_branch: str) -> ParsedMessage:
     """Extract PR/MR number, title and branch from a commit on the default branch.
 
-    Returns a dict with keys number, title, branch, sync (True for merges of the default
-    branch into something else, which are not PRs), merge_style.
+    sync is True for merges of the default branch into something else, which are not PRs; has_ref is
+    True when the message references a PR/MR number.
     """
-    out = {"number": None, "title": None, "branch": None, "sync": False, "has_ref": False}
+    out: ParsedMessage = {"number": None, "title": None, "branch": None, "sync": False, "has_ref": False}
     short_default = default_branch[len("origin/"):] if default_branch.startswith("origin/") else default_branch
 
     m = re.match(r"^Merge pull request #(\d+) from (\S+)", subject)
@@ -342,7 +391,8 @@ def parse_message(subject: str, body: str, default_branch: str):
     return out
 
 
-def humanize_branch(branch: str | None):
+def humanize_branch(branch: str | None) -> Optional[str]:
+    """Turn a branch name into a readable title ("feat/login-page" -> "login page")."""
     if not branch:
         return None
     if re.match(r"^(dependabot|renovate)/", branch):
@@ -363,14 +413,19 @@ def humanize_branch(branch: str | None):
 class Scanner:
     """Walks the first-parent history of a branch and summarises each commit."""
 
-    def __init__(self, excludes, sensitive_re):
+    def __init__(self, excludes: Iterable[str], sensitive_re: re.Pattern[str]) -> None:
+        """Set up path exclusion regexes and the sensitive-path regex."""
         self.excludes = [compile_re(p, "--exclude") for p in excludes]
         self.sensitive = sensitive_re
 
-    def summarize(self, numstat_lines):
+    def summarize(self, numstat_lines: Iterable[str]) -> Commit:
+        """Sum `git log --numstat` lines into size, file, language, test and sensitive-path stats.
+
+        langs maps language -> [added, deleted, kind].
+        """
         total_add = total_del = files = code_lines = 0
         tests = sensitive = False
-        langs: dict = {}
+        langs: dict[str, list[Any]] = {}
         for line in numstat_lines:
             parts = line.rstrip("\n").split("\t", 2)
             if len(parts) != 3 or parts[0] == "-":
@@ -398,14 +453,15 @@ class Scanner:
         return {"add": total_add, "del": total_del, "lines": total_add + total_del, "files": files,
                 "code_lines": code_lines, "tests": tests, "sensitive": sensitive, "langs": langs}
 
-    def scan(self, repo, branch):
+    def scan(self, repo: str, branch: str) -> List[Commit]:
         """Return a chronologically ordered list of first-parent commit dicts."""
         fmt = "%x1e%H%x1f%P%x1f%at%x1f%ct%x1f%an%x1f%s%x1f%b%x1f"
         args = ["log", "--first-parent", "-m", "--numstat", "--no-renames", "--reverse", f"--format={fmt}", branch]
-        commits = []
-        buf: list = []
+        commits: list[Commit] = []
+        buf: list[str] = []
 
-        def flush():
+        def flush() -> None:
+            """Parse the buffered lines of one commit and append it to commits."""
             if not buf:
                 return
             text = "".join(buf)
@@ -427,8 +483,8 @@ class Scanner:
         flush()
         # With --first-parent, -m diffs a merge against its first parent only, so each commit appears once.
         # Keep a cheap dedupe as a guard against double counting.
-        seen = set()
-        unique = []
+        seen: set[str] = set()
+        unique: list[Commit] = []
         for c in commits:
             if c["sha"] in seen:
                 continue
@@ -437,9 +493,9 @@ class Scanner:
         return unique
 
 
-def load_graph(repo, branch):
-    """sha -> (parents, author time, committer time) for every commit reachable from branch."""
-    graph = {}
+def load_graph(repo: str, branch: str) -> Graph:
+    """Return sha -> (parents, author time, committer time) for every commit reachable from branch."""
+    graph: Graph = {}
     for line in stream_git(repo, "log", "--format=%H %P|%at|%ct", branch):
         left, at, ct = line.rstrip("\n").split("|")
         parts = left.split()
@@ -447,9 +503,9 @@ def load_graph(repo, branch):
     return graph
 
 
-def load_reverts(repo, branch):
-    """sha -> sha (or prefix) of the commit it reverts, from 'This reverts commit' lines."""
-    out = {}
+def load_reverts(repo: str, branch: str) -> Dict[str, str]:
+    """Return sha -> sha (or prefix) of the commit it reverts, from 'This reverts commit' lines."""
+    out: dict[str, str] = {}
     text = run_git(repo, "log", "--format=%x1e%H%x1f%b", "--grep=This reverts commit", branch, check=False)
     for rec in text.split("\x1e"):
         if "\x1f" not in rec:
@@ -461,13 +517,18 @@ def load_reverts(repo, branch):
     return out
 
 
-def build_loc_series(first_parent):
-    """Cumulative lines of code per UTC day, total and per language."""
+def build_loc_series(first_parent: List[Commit]) -> Dict[str, Any]:
+    """Return cumulative lines of code per UTC day, total and per language.
+
+    Returns:
+        {"days": [[day start, total, added, deleted], ...], "langs": language -> per-day lines,
+        "kinds": language -> kind}.
+    """
     day = None
-    days: list = []
-    langs_cum: dict = collections.defaultdict(int)
-    kinds: dict = {}
-    snapshots: list = []  # per day: dict of cumulative lang -> lines
+    days: list[list[int]] = []
+    langs_cum: dict[str, int] = collections.defaultdict(int)
+    kinds: dict[str, str] = {}
+    snapshots: list[Any] = []  # per day: dict of cumulative lang -> lines
     total = 0
     last_ct = 0
     for c in first_parent:
@@ -487,7 +548,7 @@ def build_loc_series(first_parent):
             kinds[lang] = kind
         entry[1] = total
         snapshots[-1] = dict(langs_cum)
-    peak = collections.Counter()
+    peak: collections.Counter[str] = collections.Counter()
     for snap in snapshots:
         for lang, v in snap.items():
             peak[lang] = max(peak[lang], v)
@@ -504,11 +565,11 @@ def build_loc_series(first_parent):
     }
 
 
-def claim_branch_commits(first_parent, graph):
+def claim_branch_commits(first_parent: List[Commit], graph: Graph) -> Dict[str, List[str]]:
     """Map each merge commit on the first-parent line to the commits it brought in."""
     fp_set = {c["sha"] for c in first_parent}
-    claimed: set = set()
-    result = {}
+    claimed: set[str] = set()
+    result: dict[str, list[str]] = {}
     for c in first_parent:
         if len(c["parents"]) < 2:
             continue
@@ -525,10 +586,11 @@ def claim_branch_commits(first_parent, graph):
     return result
 
 
-def compute_deploys(repo, graph, tag_pattern, branch):
-    """Tags matching the pattern, with the first tag that contains each commit.
+def compute_deploys(repo: str, graph: Graph, tag_pattern: str,
+                    branch: str) -> Tuple[List[Dict[str, Any]], DeployClaims]:
+    """Find tags matching the pattern, and the first such tag that contains each commit.
 
-    Returns (deploys, first_tag_time) where first_tag_time maps commit sha -> tag time.
+    Returns (deploys, claimed) where claimed maps commit sha -> (tag time, tag name).
     """
     rx = compile_re(tag_pattern, "--tag-pattern")
     out = run_git(repo, "for-each-ref", "--format=%(refname:short)%09%(creatordate:unix)%09%(objectname)%09%(*objectname)",
@@ -543,8 +605,8 @@ def compute_deploys(repo, graph, tag_pattern, branch):
             continue
         tags.append((int(ts), name, sha))
     tags.sort()
-    claimed: dict = {}
-    deploys = []
+    claimed: DeployClaims = {}
+    deploys: list[dict[str, Any]] = []
     for ts, name, sha in tags:
         stack = [sha]
         members = []
@@ -563,7 +625,9 @@ def compute_deploys(repo, graph, tag_pattern, branch):
 # Inferring PRs from git alone
 # ---------------------------------------------------------------------------
 
-def infer_prs_from_git(first_parent, graph, default_branch, commits_as_prs=False, claims=None):
+def infer_prs_from_git(first_parent: List[Commit], graph: Graph, default_branch: str,
+                       commits_as_prs: bool = False,
+                       claims: Optional[Dict[str, List[str]]] = None) -> Tuple[List[PR], int, int]:
     """Infer PRs from merge commits and squash commits that reference a PR number.
 
     default_branch is the short branch name (no remote prefix), used to recognise sync merges.
@@ -571,7 +635,7 @@ def infer_prs_from_git(first_parent, graph, default_branch, commits_as_prs=False
     """
     if claims is None:
         claims = claim_branch_commits(first_parent, graph)
-    prs = []
+    prs: list[PR] = []
     direct = 0
     sync = 0
     for c in first_parent:
@@ -585,7 +649,7 @@ def infer_prs_from_git(first_parent, graph, default_branch, commits_as_prs=False
             continue
         branch_shas = claims.get(c["sha"], []) if is_merge else []
         branch_commits = [graph[s] for s in branch_shas if len(graph[s][0]) < 2]
-        pr = {
+        pr: PR = {
             "number": msg["number"],
             "sha": c["sha"],
             "title": msg["title"],
@@ -625,13 +689,15 @@ def infer_prs_from_git(first_parent, graph, default_branch, commits_as_prs=False
 # ---------------------------------------------------------------------------
 
 class ApiError(ToolError):
-    pass
+    """A failed or unexpected GitHub/GitLab API call."""
 
 
 class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
     """Never follow a redirect to another host or to plain http, so tokens cannot leak."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    def redirect_request(self, req: urllib.request.Request, fp: IO[bytes], code: int, msg: str,
+                         headers: http.client.HTTPMessage, newurl: str) -> Optional[urllib.request.Request]:
+        """Follow the redirect only if it stays on the same host and on https (or loopback http)."""
         old, new = urllib.parse.urlparse(req.full_url), urllib.parse.urlparse(newurl)
         if new.netloc != old.netloc:
             raise ApiError(f"Refusing cross-host redirect to {new.netloc}")
@@ -645,6 +711,7 @@ _OPENER = urllib.request.build_opener(_SameHostRedirect)
 
 
 def _is_loopback(host: str) -> bool:
+    """Return True for "localhost" or a loopback IP address."""
     if host == "localhost":
         return True
     try:
@@ -653,7 +720,7 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-def _retry_after(value, default):
+def _retry_after(value: Optional[str], default: int) -> int:
     """Seconds to wait from a Retry-After header (integer seconds or an HTTP date), capped at 60."""
     if not value:
         return default
@@ -671,7 +738,11 @@ def _retry_after(value, default):
     return min(wait, 60) if wait > 0 else default
 
 
-def http_json(url, headers, body=None, retries=4):
+def http_json(url: str, headers: Dict[str, str], body: Any = None, retries: int = 4) -> Tuple[Any, Message]:
+    """Send a GET (or a JSON POST when body is given) and return (parsed JSON, response headers).
+
+    Retries rate limits, 5xx and transient network errors with backoff; raises ApiError otherwise.
+    """
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https" and not _is_loopback(parsed.hostname or ""):
         raise ApiError(f"Refusing to send credentials over insecure URL {parsed.scheme}://{parsed.netloc}")
@@ -719,7 +790,8 @@ def http_json(url, headers, body=None, retries=4):
     raise ApiError("API request failed")
 
 
-def parse_iso(s):
+def parse_iso(s: Optional[str]) -> Optional[int]:
+    """Parse an ISO 8601 timestamp into Unix seconds; None or "" gives None."""
     if not s:
         return None
     s = re.sub(r"\.\d+", "", s).replace("Z", "+0000")
@@ -748,13 +820,18 @@ query($owner:String!,$name:String!,$cursor:String){
 """
 
 
-def fetch_github(owner, name, token, api_url, since, base_branch, all_bases, max_prs, progress=log, info=None):
-    """PRs newest-updated first. A PR merged after `since` was updated after it too, so paging stops at the
-    first PR whose last activity is older than `since`; collect() then filters by merge (or open) time.
-    `info`, if given, receives the number of PRs seen before the base-branch filter."""
+def fetch_github(owner: str, name: str, token: str, api_url: str, since: Optional[int], base_branch: str,
+                 all_bases: bool, max_prs: Optional[int], progress: Callable[[str], None] = log,
+                 info: Optional[Dict[str, int]] = None) -> List[PR]:
+    """Fetch pull requests from the GitHub GraphQL API, newest-updated first.
+
+    A PR merged after `since` was updated after it too, so paging stops at the first PR whose last
+    activity is older than `since`; collect() then filters by merge (or open) time. `info`, if given,
+    receives the number of PRs seen before the base-branch filter under "seen".
+    """
     endpoint = api_url.rstrip("/") + "/graphql"
     headers = {"Authorization": f"Bearer {token}"}
-    prs = []
+    prs: list[PR] = []
     seen = 0
     cursor = None
     while True:
@@ -796,11 +873,13 @@ def fetch_github(owner, name, token, api_url, since, base_branch, all_bases, max
     return prs
 
 
-def _is_bot(login, typename=None):
+def _is_bot(login: Optional[str], typename: Optional[str] = None) -> bool:
+    """Return True for a Bot account type or a login ending in [bot] or -bot."""
     return bool(typename == "Bot" or (login and (login.endswith("[bot]") or login.endswith("-bot"))))
 
 
-def github_pr(n):
+def github_pr(n: Dict[str, Any]) -> PR:
+    """Convert one GraphQL pullRequest node into a raw PR dict."""
     author = (n.get("author") or {})
     login = author.get("login")
     created = parse_iso(n["createdAt"])
@@ -812,10 +891,10 @@ def github_pr(n):
     merged_at = parse_iso(n.get("mergedAt"))
     reviews = [r for r in (n.get("reviews") or {}).get("nodes", [])
                if r and r.get("submittedAt") and r["state"] != "PENDING"
-               and (merged_at is None or parse_iso(r["submittedAt"]) <= merged_at)  # post-merge reviews do not count
+               and (merged_at is None or cast(int, parse_iso(r["submittedAt"])) <= merged_at)  # post-merge reviews do not count
                and (r.get("author") or {}).get("login") != login
                and not _is_bot((r.get("author") or {}).get("login"), (r.get("author") or {}).get("__typename"))]
-    first_review = min((parse_iso(r["submittedAt"]) for r in reviews), default=None)
+    first_review = min((cast(int, parse_iso(r["submittedAt"])) for r in reviews), default=None)
     commits = n.get("commits") or {}
     first_commit = None
     if commits.get("nodes"):
@@ -835,14 +914,20 @@ def github_pr(n):
     }
 
 
-def fetch_gitlab(project_path, token, api_url, since, base_branch, all_bases, max_prs, want_reviews, progress=log, info=None):
+def fetch_gitlab(project_path: str, token: str, api_url: str, since: Optional[int], base_branch: str,
+                 all_bases: bool, max_prs: Optional[int], want_reviews: bool,
+                 progress: Callable[[str], None] = log, info: Optional[Dict[str, int]] = None) -> List[PR]:
+    """Fetch merge requests from the GitLab REST API, with per-MR commit and (optionally) review times.
+
+    `info`, if given, receives the number of MRs fetched under "seen".
+    """
     project = urllib.parse.quote(project_path, safe="")
     base = f"{api_url.rstrip('/')}/projects/{project}"
     headers = {"PRIVATE-TOKEN": token}
-    mrs = []
+    mrs: list[dict[str, Any]] = []
     page = 1
     while True:
-        q = {"state": "all", "scope": "all", "order_by": "updated_at", "sort": "desc", "per_page": 100, "page": page}
+        q: dict[str, Any] = {"state": "all", "scope": "all", "order_by": "updated_at", "sort": "desc", "per_page": 100, "page": page}
         if since:
             # updated_after, not created_after: an MR opened before the cutoff but merged after it still counts.
             q["updated_after"] = dt.datetime.fromtimestamp(since, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -862,8 +947,12 @@ def fetch_gitlab(project_path, token, api_url, since, base_branch, all_bases, ma
     if info is not None:
         info["seen"] = len(mrs)
 
-    def details(mr):
-        out = {"first_commit": None, "commits": None, "first_review": None}
+    def details(mr: Dict[str, Any]) -> Dict[str, Any]:
+        """Fetch first commit time, commit count and first review time for one MR.
+
+        API errors are recorded under "error" instead of raised.
+        """
+        out: dict[str, Any] = {"first_commit": None, "commits": None, "first_review": None}
         iid = mr["iid"]
         try:
             commits, _ = http_json(f"{base}/merge_requests/{iid}/commits?per_page=100", headers)
@@ -890,7 +979,7 @@ def fetch_gitlab(project_path, token, api_url, since, base_branch, all_bases, ma
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         extra = list(pool.map(details, mrs))
-    result = []
+    result: list[PR] = []
     for mr, ex in zip(mrs, extra):
         author = mr.get("author") or {}
         state = {"merged": "merged", "closed": "closed", "opened": "open", "locked": "open"}.get(mr["state"], "open")
@@ -915,11 +1004,12 @@ def fetch_gitlab(project_path, token, api_url, since, base_branch, all_bases, ma
 # Enrichment
 # ---------------------------------------------------------------------------
 
-def risk_for(pr):
+def risk_for(pr: Dict[str, Any]) -> Tuple[int, str, List[RiskFactor]]:
     """Score a PR 0..100 using the additive heuristic in RISK. Returns (score, level, factors)."""
-    factors = []
+    factors: list[RiskFactor] = []
 
-    def add(name, pts, detail):
+    def add(name: str, pts: int, detail: str) -> None:
+        """Record a factor if it contributes any points."""
         if pts:
             factors.append({"name": name, "points": pts, "detail": detail})
 
@@ -942,7 +1032,7 @@ def risk_for(pr):
     return score, level, factors
 
 
-def local_summary(pr, fp_by_sha):
+def local_summary(pr: PR, fp_by_sha: Dict[str, Commit]) -> Optional[Commit]:
     """Return the first-parent commit summary that represents this PR's full diff, if trustworthy."""
     if pr.get("local"):
         return pr["local"]
@@ -959,9 +1049,14 @@ def local_summary(pr, fp_by_sha):
 CC_PREFIX = re.compile(r"^\s*(?:\[[^\]]*\]|[A-Za-z]+(?:\([^)]*\))?!?\s*:)\s*")
 
 
-def is_failure(rx, title, branch, labels, title_start_only):
-    """Branch and labels match anywhere. With the default pattern, the title only matches at its start
-    (after an optional Conventional Commit prefix), so "feat: add rollback support" is not a hotfix."""
+def is_failure(rx: re.Pattern[str], title: Optional[str], branch: Optional[str], labels: Optional[List[str]],
+               title_start_only: bool) -> bool:
+    """Return True if the PR looks like a hotfix or rollback.
+
+    Branch and labels match anywhere. With title_start_only (the default pattern), the title only matches
+    at its start (after an optional Conventional Commit prefix), so "feat: add rollback support" is not a
+    hotfix.
+    """
     if rx.search(" ".join(filter(None, [branch, " ".join(labels or [])]))):
         return True
     title = title or ""
@@ -970,14 +1065,20 @@ def is_failure(rx, title, branch, labels, title_start_only):
     return any(rx.match(t) for t in (title, title.lstrip("[( "), CC_PREFIX.sub("", title, count=1)))
 
 
-def build_records(prs, ctx):
-    """Turn raw PR dicts into the final records embedded in the dashboard."""
+def build_records(prs: List[PR], ctx: Dict[str, Any]) -> List[Record]:
+    """Turn raw PR dicts into the final records embedded in the dashboard.
+
+    Args:
+        prs: raw PRs; API PRs may be filled in (size, branch_shas) from the local commit.
+        ctx: failure_re, failure_title_start, bot_re, fp_by_sha, claimed, claims, redact and reverts,
+            as built by collect().
+    """
     failure_re = ctx["failure_re"]
     fp_by_sha = ctx["fp_by_sha"]
     claimed = ctx["claimed"]
     claims = ctx.get("claims") or {}
-    records = []
-    sha_to_pr: dict = {}
+    records: list[Record] = []
+    sha_to_pr: dict[str, Record] = {}
     for pr in prs:
         c = local_summary(pr, fp_by_sha)
         if c is not None and pr["source"] == "api":
@@ -1000,7 +1101,7 @@ def build_records(prs, ctx):
             kind = "hotfix"
         add_, del_ = pr["additions"], pr["deletions"]
         lines = (add_ + del_) if add_ is not None and del_ is not None else None
-        rec = {
+        rec: Record = {
             "id": pr["number"] if pr["number"] is not None else pr["sha"][:8],
             "number": pr["number"],
             "title": pr["title"] if not ctx["redact"] else (f"#{pr['number']}" if pr["number"] is not None else pr["sha"][:8]),
@@ -1020,7 +1121,8 @@ def build_records(prs, ctx):
         rec["risk"], rec["risk_level"] = score, level
         rec["risk_factors"] = [[f["name"], f["points"]] for f in factors]
         # Durations in seconds. None means "not available for this record".
-        def span(a, b):
+        def span(a: Optional[int], b: Optional[int]) -> Optional[int]:
+            """Return b - a, or None if either is missing or b is before a."""
             return b - a if a is not None and b is not None and b >= a else None
 
         merged = pr["merged"] if pr["state"] == "merged" else None
@@ -1054,7 +1156,7 @@ def build_records(prs, ctx):
         records.append(rec)
         if merged is not None:
             for s in {pr.get("sha"), pr.get("squash_sha")} - {None}:
-                sha_to_pr[s] = rec
+                sha_to_pr[cast(str, s)] = rec
             for s in pr.get("branch_shas", []):
                 sha_to_pr[s] = rec
     # Time to restore: reverts that name the reverted commit.
@@ -1084,13 +1186,15 @@ def build_records(prs, ctx):
 # Output
 # ---------------------------------------------------------------------------
 
-def embed_json(obj) -> str:
+def embed_json(obj: Any) -> str:
+    """Serialise obj as JSON that is safe to embed inside an HTML <script> element."""
     text = json.dumps(obj, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
     return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026") \
                .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
 
 
-def render_html(data) -> str:
+def render_html(data: Dict[str, Any]) -> str:
+    """Return template.html with the dashboard data embedded at its data marker."""
     if not TEMPLATE_PATH.exists():
         raise ToolError(f"Missing {TEMPLATE_PATH.name} next to repo_stats.py")
     template = TEMPLATE_PATH.read_text(encoding="utf-8")
@@ -1100,7 +1204,8 @@ def render_html(data) -> str:
     return template.replace(marker, embed_json(data), 1)
 
 
-def write_csv(path, records):
+def write_csv(path: str, records: Iterable[Record]) -> None:
+    """Write one row per PR record to a CSV file, guarding against spreadsheet formula injection."""
     cols = ["id", "title", "type", "scope", "breaking", "state", "bot", "created", "first_commit", "first_review",
             "merged", "additions", "deletions", "files", "commits", "risk", "risk_level", "kind",
             "coding", "pickup", "review", "open_to_merge", "lead", "deployed", "deploy_wait", "lead_to_deploy",
@@ -1109,7 +1214,7 @@ def write_csv(path, records):
         w = csv.writer(f)
         w.writerow(cols)
         for r in records:
-            row = []
+            row: list[Any] = []
             for c in cols:
                 v = r.get(c)
                 if isinstance(v, str) and v and v[0] in "=+-@\t\r":
@@ -1118,7 +1223,8 @@ def write_csv(path, records):
             w.writerow(row)
 
 
-def resolve_token(env_names):
+def resolve_token(env_names: Iterable[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Return (token, variable name) from the first non-empty environment variable, or (None, None)."""
     for name in env_names:
         v = os.environ.get(name)
         if v:
@@ -1126,7 +1232,8 @@ def resolve_token(env_names):
     return None, None
 
 
-def parse_date(s):
+def parse_date(s: Optional[str]) -> Optional[int]:
+    """Parse a YYYY-MM-DD date as UTC midnight in Unix seconds; empty gives None."""
     if not s:
         return None
     try:
@@ -1135,7 +1242,12 @@ def parse_date(s):
         raise ToolError(f"Invalid date '{s}'. Use YYYY-MM-DD.")
 
 
-def collect(args):
+def collect(args: argparse.Namespace) -> Dict[str, Any]:
+    """Gather all dashboard data for the parsed command line.
+
+    Returns:
+        {"meta": ..., "prs": [record, ...], "loc": build_loc_series(...), "deploys": [...]}.
+    """
     repo = os.path.abspath(args.repo)
     if run_git(repo, "rev-parse", "--is-inside-work-tree", check=False).strip() != "true" \
             and run_git(repo, "rev-parse", "--is-bare-repository", check=False).strip() != "true":
@@ -1144,7 +1256,7 @@ def collect(args):
     if not run_git(repo, "rev-parse", "--verify", "-q", branch + "^{commit}", check=False).strip():
         raise ToolError(f"Branch or ref '{branch}' not found. Pass --branch.")
     short_branch = strip_remote_prefix(repo, branch)
-    warnings: list = []
+    warnings: list[str] = []
     if run_git(repo, "rev-parse", "--is-shallow-repository", check=False).strip() == "true":
         warnings.append("This is a shallow clone. History, lines of code over time and timings are incomplete. "
                         "Run `git fetch --unshallow` for full results.")
@@ -1167,7 +1279,8 @@ def collect(args):
     loc = build_loc_series(first_parent)
     log(f"  {len(graph)} commits, {len(first_parent)} on the first-parent line")
 
-    deploys, claimed = [], {}
+    deploys: list[dict[str, Any]] = []
+    claimed: DeployClaims = {}
     if args.deploy_source == "tags":
         deploys, claimed = compute_deploys(repo, graph, args.tag_pattern, branch)
         log(f"  {len(deploys)} release tags")
@@ -1195,7 +1308,7 @@ def collect(args):
     token, token_name = resolve_token(token_envs)
 
     source = args.source
-    api_prs = None
+    api_prs: Optional[List[PR]] = None
     if source in ("auto", "api"):
         if not parsed or not provider or untrusted:
             msg = "No GitHub or GitLab remote was detected (use --remote, or --provider with --api-url)."
@@ -1211,7 +1324,7 @@ def collect(args):
             warnings.append(msg + " Using PRs inferred from git history. Set a token for exact open, review and merge times.")
         else:
             host, path = parsed
-            info: dict = {}
+            info: dict[str, int] = {}
             try:
                 log(f"Fetching pull requests from {provider} API (token from ${token_name}) ...")
                 if provider == "github":
@@ -1295,7 +1408,8 @@ def collect(args):
     return {"meta": meta, "prs": records, "loc": loc, "deploys": deploys}
 
 
-def build_parser():
+def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser."""
     p = argparse.ArgumentParser(
         prog="repo_stats.py",
         description="Generate a self-contained HTML dashboard of code statistics for a git repository.",
@@ -1341,13 +1455,16 @@ def build_parser():
     return p
 
 
-def serve(path: Path, port: int, open_browser: bool):
+def serve(path: Path, port: int, open_browser: bool) -> None:
     """Serve only the dashboard file: `/` and `/<name>` return it, everything else is 404 (no listing)."""
     target = path.resolve()
     allowed = {"/", "/" + urllib.parse.quote(path.name), "/" + path.name}
 
     class Handler(http.server.BaseHTTPRequestHandler):
-        def _send(self, head_only):
+        """Request handler that returns the dashboard file for allowed paths only."""
+
+        def _send(self, head_only: bool) -> None:
+            """Send the dashboard (headers only if head_only), or 404."""
             if urllib.parse.urlsplit(self.path).path not in allowed:
                 self.send_error(404, "Not Found")
                 return
@@ -1364,14 +1481,16 @@ def serve(path: Path, port: int, open_browser: bool):
             if not head_only:
                 self.wfile.write(body)
 
-        def do_GET(self):
+        def do_GET(self) -> None:
+            """Handle GET."""
             self._send(False)
 
-        def do_HEAD(self):
+        def do_HEAD(self) -> None:
+            """Handle HEAD."""
             self._send(True)
 
-        def log_message(self, *a):
-            pass
+        def log_message(self, format: str, *args: Any) -> None:
+            """Silence the default per-request logging."""
 
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{httpd.server_address[1]}/{path.name}"
@@ -1386,7 +1505,8 @@ def serve(path: Path, port: int, open_browser: bool):
         httpd.server_close()
 
 
-def main(argv=None):
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Run the command line and return the process exit code."""
     args = build_parser().parse_args(argv)
     try:
         data = collect(args)
