@@ -1,3 +1,6 @@
 = Scripts
 
 Collection of adhoc/useful scripts here and there.
+
+* `release_notes_generator.sh`: release notes from conventional commits between two revisions.
+* link:repo-stats/README.adoc[`repo-stats`]: a self-contained HTML dashboard of code, PR and DORA statistics for any git repository.
