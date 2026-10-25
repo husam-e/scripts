@@ -65,6 +65,12 @@ Repositories that rebase-merge with no PR number in the message show few or no P
 Lines of code, churn and release data always come from the local clone.
 A shallow clone gives incomplete history, and the dashboard warns about it. Run `git fetch --unshallow` first.
 
+== Security
+
+Tokens are read from the environment only and are never written to any output.
+A token is sent automatically only to `github.com` and `gitlab.com`.
+`--serve` binds to 127.0.0.1, serves only the dashboard file, and rejects any request whose Host header is not `127.0.0.1` or `localhost` on the serving port.
+
 == Heuristics
 
 The dashboard has a Methodology section that prints the rules it used. The defaults are:

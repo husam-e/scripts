@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import http.client
 import io
 import json
 import os
@@ -19,6 +20,7 @@ import tempfile
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from email.message import Message
 from pathlib import Path
@@ -2020,6 +2022,71 @@ class E2_Serve(unittest.TestCase):
         finally:
             proc.send_signal(signal.SIGINT)
             proc.wait(timeout=10)
+
+    def _stop(self, proc: subprocess.Popen[str]) -> None:
+        """Stop the server with SIGINT, killing it if it does not exit within 10 s."""
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    def _get_with_host(self, url: str, host: str, method: str = "GET") -> tuple[int, str]:
+        """Send `method` for `url` to the server with an explicit Host header and return (status, body)."""
+        parts = urllib.parse.urlsplit(url)
+        conn = http.client.HTTPConnection(parts.hostname or "127.0.0.1", parts.port, timeout=10)
+        try:
+            conn.putrequest(method, parts.path, skip_host=True)
+            conn.putheader("Host", host)
+            conn.endheaders()
+            r = conn.getresponse()
+            return r.status, r.read().decode("utf-8", "replace")
+        finally:
+            conn.close()
+
+    def test_host_header_loopback_names_allowed(self) -> None:
+        """Host 127.0.0.1:<port> and localhost:<port> (any case) get the dashboard."""
+        proc, url = self._start(tmpdir())
+        try:
+            port = urllib.parse.urlsplit(url).port
+            for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"LocalHost:{port}"):
+                status, body = self._get_with_host(url, host)
+                self.assertEqual(status, 200, host)
+                self.assertIn("const DATA", body, host)
+        finally:
+            self._stop(proc)
+
+    def test_host_header_foreign_rejected(self) -> None:
+        """A foreign Host (DNS rebinding) or the wrong port gets 421 and no dashboard, for GET and HEAD."""
+        proc, url = self._start(tmpdir())
+        try:
+            port = urllib.parse.urlsplit(url).port or 0
+            wrong = port + 1 if port < 65535 else port - 1
+            for host in (f"evil.example:{port}", f"127.0.0.1:{wrong}", f"localhost:{wrong}", "127.0.0.1", "localhost"):
+                for method in ("GET", "HEAD"):
+                    status, body = self._get_with_host(url, host, method)
+                    self.assertEqual(status, 421, f"{method} {host}")
+                    self.assertNotIn("const DATA", body, f"{method} {host}")
+        finally:
+            self._stop(proc)
+
+    def test_host_header_missing_rejected(self) -> None:
+        """A request with no Host header at all gets 421."""
+        proc, url = self._start(tmpdir())
+        try:
+            parts = urllib.parse.urlsplit(url)
+            conn = http.client.HTTPConnection("127.0.0.1", parts.port, timeout=10)
+            try:
+                conn.putrequest("GET", parts.path, skip_host=True)
+                conn.endheaders()
+                r = conn.getresponse()
+                self.assertEqual(r.status, 421)
+                self.assertNotIn("const DATA", r.read().decode("utf-8", "replace"))
+            finally:
+                conn.close()
+        finally:
+            self._stop(proc)
 
 
 class E3_Python38Syntax(unittest.TestCase):

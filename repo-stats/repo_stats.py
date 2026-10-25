@@ -33,7 +33,7 @@ import urllib.request
 import webbrowser
 from email.message import Message
 from pathlib import Path
-from typing import IO, Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, TypedDict, cast
+from typing import IO, Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, TypedDict, cast
 
 __version__ = "0.1.0"
 
@@ -1456,15 +1456,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def serve(path: Path, port: int, open_browser: bool) -> None:
-    """Serve only the dashboard file: `/` and `/<name>` return it, everything else is 404 (no listing)."""
+    """Serve only the dashboard file: `/` and `/<name>` return it, everything else is 404 (no listing).
+
+    Requests whose Host header is not 127.0.0.1 or localhost on the bound port get 421 (DNS rebinding).
+    """
     target = path.resolve()
     allowed = {"/", "/" + urllib.parse.quote(path.name), "/" + path.name}
+    allowed_hosts: Set[str] = set()  # filled once the server is bound and its real port is known
 
     class Handler(http.server.BaseHTTPRequestHandler):
         """Request handler that returns the dashboard file for allowed paths only."""
 
         def _send(self, head_only: bool) -> None:
-            """Send the dashboard (headers only if head_only), or 404."""
+            """Send the dashboard (headers only if head_only), 421 for a foreign Host, or 404."""
+            host = self.headers.get("Host")
+            if not host or host.lower() not in allowed_hosts:
+                self.send_error(421, "Misdirected Request")
+                return
             if urllib.parse.urlsplit(self.path).path not in allowed:
                 self.send_error(404, "Not Found")
                 return
@@ -1493,6 +1501,8 @@ def serve(path: Path, port: int, open_browser: bool) -> None:
             """Silence the default per-request logging."""
 
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    bound = httpd.server_address[1]
+    allowed_hosts.update({f"127.0.0.1:{bound}", f"localhost:{bound}"})
     url = f"http://127.0.0.1:{httpd.server_address[1]}/{path.name}"
     log(f"Serving {url} (Ctrl+C to stop)")
     if open_browser:
