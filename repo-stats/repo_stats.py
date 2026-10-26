@@ -135,10 +135,10 @@ DEFAULT_EXCLUDES = [
 # Matched anywhere in the branch name and labels, but only at the start of the title (after an optional
 # Conventional Commit prefix), so "feat: add rollback support" is not a failure.
 DEFAULT_FAILURE = r"\bhot-?fix\b|\broll-? ?back\b|\bemergency\b"
-# Dotted version tags (v1.2, 1.2.3, 2024.05.01). Pre-releases are not deployments: -rc1, -beta, .alpha2,
-# 1.0.0dev, -pre, -preview, -next, -canary, -SNAPSHOT, -nightly and PEP 440 1.0.0a1 / 1.0.0b2.
+# Version tags, semver or not (v1, v1.2, 1.2.3, 2024.05.01). Pre-releases are not deployments: -rc1, -beta,
+# .alpha2, 1.0.0dev, -pre, -preview, -next, -canary, -SNAPSHOT, -nightly and PEP 440 1.0.0a1 / 1.0.0b2.
 DEFAULT_TAG_PATTERN = (r"^(?!.*(?:[-._+]|\d)(?i:rc|alpha|beta|dev|pre|preview|next|canary|snapshot|nightly)(?![A-Za-z]))"
-                       r"(?!.*\d[ab]\d)v?\d+(\.\d+)+")
+                       r"(?!.*\d[ab]\d)v?\d+(\.\d+)*")
 
 # file extension -> (language, kind). kind: code | data | docs | other
 LANGUAGES = {

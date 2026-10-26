@@ -664,7 +664,7 @@ const METRICS = [
   ["deploy_wait", "Merge to release", "Merged to first release tag"],
   ["lead_to_deploy", "Lead time to release", "First commit to first release tag"],
 ];
-const TAG_DESC = () => META.tag_default ? "a dotted version number (v1.2, 1.2.3; pre-releases such as -rc, -beta, -preview or -SNAPSHOT are not counted)" : META.tag_pattern;
+const TAG_DESC = () => META.tag_default ? "a version number (v1, v1.2, 1.2.3; pre-releases such as -rc, -beta, -preview or -SNAPSHOT are not counted)" : META.tag_pattern;
 
 function renderKpis(app, sel) {
   const { merged, deploys, r } = sel;

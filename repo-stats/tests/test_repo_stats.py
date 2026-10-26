@@ -2369,12 +2369,14 @@ class F3_Heuristics(unittest.TestCase):
             self.assertEqual(bool(rs.REVERT_TITLE.match(t)), want, t)
 
     def test_default_tag_pattern_excludes_prereleases(self) -> None:
-        """Common pre-release, nightly and single-number tags are not deployments."""
+        """Version tags count, semver or not; common pre-release and nightly tags do not."""
         rx = re.compile(rs.DEFAULT_TAG_PATTERN)
-        for t in ["v1.2.3", "1.2.3", "v1.2", "2024.05.01", "v1.2.3-hotfix1"]:
+        # Non-semver releases count: a release does not need a dot.
+        for t in ["v1.2.3", "1.2.3", "v1.2", "2024.05.01", "v1.2.3-hotfix1", "v1", "v12", "2024", "7"]:
             self.assertTrue(rx.search(t), t)
         for t in ["v1.0.0-rc1", "v2.0.0-beta", "1.0.0dev", "2.0.0-preview", "3.0.0-next.1", "v1.0.0-pre",
-                  "1.0.0-SNAPSHOT", "v4.0.0-canary.3", "20240101-nightly", "1.0.0a1", "1.0.0b2", "2024", "v1"]:
+                  "1.0.0-SNAPSHOT", "v4.0.0-canary.3", "20240101-nightly", "1.0.0a1", "1.0.0b2", "v2-rc1",
+                  "v3-beta", "release-1.0", "latest"]:
             self.assertFalse(rx.search(t), t)
 
 

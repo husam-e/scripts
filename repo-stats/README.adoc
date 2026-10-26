@@ -106,8 +106,8 @@ The score is a triage signal, not a prediction.
 
 Deployment::
 A release tag matching `--tag-pattern`.
-The default is a dotted version such as `v1.2`, `1.2.3` or `2024.05.01`.
-Pre-releases (`-rc`, `-alpha`, `-beta`, `-dev`, `-pre`, `-preview`, `-next`, `-canary`, `-SNAPSHOT`, `-nightly`, and PEP 440 `1.0.0a1` or `1.0.0b2`) are excluded, and so are single-number tags such as `v1`.
+The default is any version number, semver or not, such as `v1`, `v1.2`, `1.2.3` or `2024.05.01`.
+Pre-releases (`-rc`, `-alpha`, `-beta`, `-dev`, `-pre`, `-preview`, `-next`, `-canary`, `-SNAPSHOT`, `-nightly`, and PEP 440 `1.0.0a1` or `1.0.0b2`) are excluded.
 Use `--deploy-source merges` to count every merge as a deployment.
 
 Change failure::
