@@ -799,7 +799,7 @@ class A13_Unicode(unittest.TestCase):
         self.assertEqual(prs[2]["title"], "fix: ñandú ✓")
         self.assertEqual(d["loc"]["days"][-1][1], real_line_count(r.path))
         self.assertEqual(extract_data((out / "o.html").read_text(encoding="utf-8"))["prs"][0]["title"], prs[1]["title"])
-        self.assertGreater(len(list(csv.reader(open(out / "o.csv", encoding="utf-8")))), 2)
+        self.assertGreater(len((out / "o.csv").read_text(encoding="utf-8").splitlines()), 2)
 
 
 class A14_Performance(unittest.TestCase):
@@ -1623,7 +1623,7 @@ class B6_ReviewerFindings(unittest.TestCase):
         out = tmpdir() / "x.csv"
         rec = {"id": 1, "title": "", "type": "\r=1+1", "scope": None, "state": "\t=2", "source": "=3", "risk_level": "@x"}
         rs.write_csv(str(out), [rec])
-        row = list(csv.DictReader(open(out, newline="", encoding="utf-8")))[0]
+        row = list(csv.DictReader(io.StringIO(Path(out).read_text(encoding="utf-8"))))[0]
         self.assertEqual(row["title"], "", "empty string must stay empty (no stray apostrophe)")
         for k in ("type", "state", "source", "risk_level"):
             self.assertFalse(row[k][:1] in ("=", "+", "-", "@", "\t", "\r"), (k, row[k]))
@@ -1797,7 +1797,7 @@ class C2_CsvInjection(unittest.TestCase):
         out = tmpdir()
         p = run_cli([r.path, "-o", out / "o.html", "--csv", out / "o.csv"])
         self.assertEqual(p.returncode, 0, p.stderr)
-        rows = list(csv.DictReader(open(out / "o.csv", newline="", encoding="utf-8")))
+        rows = list(csv.DictReader(io.StringIO((out / "o.csv").read_text(encoding="utf-8"))))
         self.assertEqual(len(rows), len(titles))
         for row in rows:
             for k, v in row.items():
@@ -1811,7 +1811,7 @@ class C2_CsvInjection(unittest.TestCase):
         """Empty CSV cells are not turned into a lone apostrophe."""
         out = tmpdir()
         run_cli([merge_repo().path, "-o", out / "o.html", "--csv", out / "o.csv"])
-        rows = list(csv.DictReader(open(out / "o.csv", newline="", encoding="utf-8")))
+        rows = list(csv.DictReader(io.StringIO((out / "o.csv").read_text(encoding="utf-8"))))
         self.assertTrue(rows)
         for row in rows:
             for k, v in row.items():
@@ -1977,6 +1977,9 @@ class E2_Serve(unittest.TestCase):
         """
         proc = subprocess.Popen([sys.executable, SCRIPT, str(merge_repo().path), "-o", str(out_dir / name), "--serve", "0", "--no-open"],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=helpers.clean_env())
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe:
+                self.addCleanup(pipe.close)
         url = None
         deadline = time.time() + 20
         buf = []
@@ -2015,12 +2018,14 @@ class E2_Serve(unittest.TestCase):
             listening = []
             for fn in ("/proc/net/tcp", "/proc/net/tcp6"):
                 try:
-                    for ln in open(fn).read().splitlines()[1:]:
+                    for ln in Path(fn).read_text().splitlines()[1:]:
                         f = ln.split()
                         if f[3] == "0A" and int(f[1].split(":")[1], 16) == port:
                             listening.append(f[1].split(":")[0])
                 except OSError:
                     pass
+            if not Path("/proc/net/tcp").exists():
+                self.skipTest("no /proc/net/tcp on this platform; loopback binding checked on Linux only")
             self.assertTrue(listening, "listening socket not found")
             for addr in listening:
                 self.assertIn(addr, ("0100007F", "00000000000000000000000001000000"), f"bound to non-loopback {addr}")
@@ -2129,11 +2134,15 @@ class E3_Python38Syntax(unittest.TestCase):
         import py_compile
         pyc = str(tmpdir() / "x.pyc")
         py_compile.compile(str(ROOT / "repo_stats.py"), doraise=True, cfile=pyc)
-        for exe in ("python3.11", "python3.12"):
+        for exe in ("python3.8", "python3.9", "python3.11", "python3.12"):
             if self._has(exe):
                 p = subprocess.run([exe, "-c", "import sys,py_compile; py_compile.compile(sys.argv[1], doraise=True, cfile=sys.argv[2])",
                                     str(ROOT / "repo_stats.py"), pyc], capture_output=True, text=True)
                 self.assertEqual(p.returncode, 0, p.stderr)
+                # Compiling only checks syntax; running --version also evaluates every module-level import,
+                # type alias and TypedDict under that interpreter.
+                p = subprocess.run([exe, SCRIPT, "--version"], capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, f"{exe}: {p.stderr}")
 
     @staticmethod
     def _has(exe: str) -> bool:
@@ -2235,3 +2244,202 @@ class E5_SelfContained(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# =====================================================================================================
+# F. Regression tests for review findings
+# =====================================================================================================
+
+class F1_CommitMessageInjection(unittest.TestCase):
+    """Control characters in commit messages cannot forge diff stats, hide commits or crash the scan."""
+
+    def _repo(self, body: str) -> Repo:
+        """A repo whose second commit changes one line and carries `body` in its message."""
+        r = Repo()
+        r.commit("chore: init", {"a.py": "a\n"})
+        r.commit("feat: innocent (#3)\n\nline one\n" + body, {"a.py": "a\nb\n"})
+        return r
+
+    def test_forged_numstat_in_body_is_ignored(self) -> None:
+        """Fake numstat lines after a \\x1f in the body do not change size, sensitivity or lines of code."""
+        r = self._repo("x\x1f\n999999\t0\tsrc/fake.py\n5\t0\tdb/migrate/x.sql\n")
+        d, _ = collect(r)
+        p = by_number(d)[3]
+        self.assertEqual((p["lines"], p["files"], p["sensitive"]), (1, 1, False))
+        self.assertEqual(d["loc"]["days"][-1][1], 2)
+        self.assertEqual(list(d["loc"]["langs"]), ["Python"])
+
+    def test_record_separator_in_body_does_not_crash_or_hide(self) -> None:
+        """A \\x1e line with bogus fields neither crashes the scan nor replaces the real commit."""
+        for bogus in ("NOTINT", "123"):
+            r = self._repo(f"\x1ea\x1fb\x1f{bogus}\x1f{bogus}\x1fe\x1ff\x1fg\x1f\n")
+            d, _ = collect(r)
+            self.assertEqual(d["meta"]["commits"], 2)
+            self.assertEqual(by_number(d)[3]["lines"], 1)
+            self.assertEqual(d["loc"]["days"][-1][1], 2)
+
+    def test_nul_free_body_with_tabs_and_newlines_kept(self) -> None:
+        """Ordinary bodies still parse: GitLab 'See merge request' references are found."""
+        r = Repo()
+        r.commit("chore: init", {"a.py": "a\n"})
+        r.commit("Some change\n\nfeat: real title\n\tindented\n\nSee merge request grp/proj!42", {"a.py": "a\nb\n"})
+        d, _ = collect(r)
+        self.assertEqual(by_number(d)[42]["title"], "feat: real title")
+
+
+class F2_GitLabDetailErrors(unittest.TestCase):
+    """A failed per-MR GitLab lookup leaves values unknown instead of guessing."""
+
+    MR = ms.gl_mr(1, "fix: small", BASE, merged=BASE + DAY)
+
+    def _fetch(self, handler: ms.Handler) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Run fetch_gitlab against `handler` and return (raw PRs, info)."""
+        info: dict[str, int] = {}
+        with mock.patch.object(rs.time, "sleep", lambda s: None), ms.MockServer(handler) as srv:
+            prs = rs.fetch_gitlab("g/p", FAKE, srv.url + "/api/v4", None, "main", False, None, True,
+                                  progress=lambda m: None, info=info)
+        return prs, info
+
+    def test_notes_failure_is_not_unreviewed(self) -> None:
+        """A 404 on notes gives reviewed=None, no 'unreviewed' risk, and is counted in info."""
+        base = ms.gitlab_handler([self.MR], {1: [ms.gl_commit(T0)]}, {})
+
+        def h(req: ms.Request) -> ms.Response:
+            """Fail notes; answer the rest as the GitLab mock."""
+            return (404, {}, {"message": "nope"}) if req["path"].endswith("/notes") else base(req)
+
+        prs, info = self._fetch(h)
+        self.assertIsNone(prs[0]["reviewed"])
+        self.assertIn("first_review", prs[0]["inferred"])
+        self.assertEqual(prs[0]["first_commit"], T0)  # the commits lookup still worked
+        self.assertEqual(info["detail_errors"], 1)
+        rec = rs.build_records(prs, {"failure_re": re.compile(rs.DEFAULT_FAILURE, re.I), "failure_title_start": True,
+                                     "bot_re": re.compile("x^"), "fp_by_sha": {}, "claimed": {}, "claims": {},
+                                     "redact": False, "reverts": {}})[0]
+        self.assertNotIn("unreviewed", [f[0] for f in rec["risk_factors"]])
+
+    def test_detail_failure_warns_in_collect(self) -> None:
+        """collect() lists failed lookups in the dashboard warnings."""
+        r = api_repo("git@gitlab.com:grp/sub/proj.git")
+        mrs, commits, notes = gitlab_fixture(r)
+        base = ms.gitlab_handler(mrs, commits, notes, page_size=50)
+
+        def h(req: ms.Request) -> ms.Response:
+            """Fail every notes request with 500."""
+            return (500, {}, {"message": "boom"}) if req["path"].endswith("/notes") else base(req)
+
+        with mock.patch.object(rs.time, "sleep", lambda s: None), ms.MockServer(h) as srv:
+            d, _ = collect(r, "--api-url", srv.url + "/api/v4", env={"GITLAB_TOKEN": FAKE})
+        self.assertTrue(any("lookups fail" in w for w in d["meta"]["warnings"]))
+        self.assertTrue(all(p["reviewed"] is None for p in d["prs"]))
+
+    def test_commits_are_paginated(self) -> None:
+        """MR commits are read across pages, so the first commit of a long MR is found."""
+        newest_first = [ms.gl_commit(T0 + 1000 - i) for i in range(150)]
+        base = ms.gitlab_handler([self.MR], {}, {})
+
+        def h(req: ms.Request) -> ms.Response:
+            """Serve 150 commits newest first in pages of 100."""
+            if req["path"].endswith("/commits"):
+                page = int(req["query"].get("page", ["1"])[0])
+                return 200, {"X-Next-Page": "2" if page == 1 else ""}, newest_first[(page - 1) * 100: page * 100]
+            return base(req)
+
+        prs, info = self._fetch(h)
+        self.assertEqual(prs[0]["commits"], 150)
+        self.assertEqual(prs[0]["first_commit"], T0 + 1000 - 149)
+        self.assertEqual(info["detail_errors"], 0)
+
+
+class F3_Heuristics(unittest.TestCase):
+    """Type precedence, revert detection and the default tag pattern."""
+
+    def test_type_order_title_branch_label_keyword(self) -> None:
+        """A label beats a keyword guess; the branch prefix beats a label; the title beats everything."""
+        self.assertEqual(rs.classify_type("Add null check", "patch-1", ["bug"])[::3], ("fix", "label"))
+        self.assertEqual(rs.classify_type("Add null check", "docs/x", ["bug"])[::3], ("docs", "branch"))
+        self.assertEqual(rs.classify_type("perf: faster", "docs/x", ["bug"])[::3], ("perf", "title"))
+        self.assertEqual(rs.classify_type("Add null check", "patch-1", [])[::3], ("feat", "keyword"))
+        self.assertEqual(rs.classify_type("Add null check", "patch-1", ["type: fix"])[::3], ("fix", "label"))
+
+    def test_revert_title_needs_a_word_boundary(self) -> None:
+        """'Revert', 'Reverts' and 'Reverting' are reverts; 'Revertible' is not."""
+        for t, want in [("Revert \"feat: x\"", True), ("Reverts #12", True), ("Reverting the cache", True),
+                        ("Revertible settings toggle", False), ("feat: revert button", False)]:
+            self.assertEqual(bool(rs.REVERT_TITLE.match(t)), want, t)
+
+    def test_default_tag_pattern_excludes_prereleases(self) -> None:
+        """Common pre-release, nightly and single-number tags are not deployments."""
+        rx = re.compile(rs.DEFAULT_TAG_PATTERN)
+        for t in ["v1.2.3", "1.2.3", "v1.2", "2024.05.01", "v1.2.3-hotfix1"]:
+            self.assertTrue(rx.search(t), t)
+        for t in ["v1.0.0-rc1", "v2.0.0-beta", "1.0.0dev", "2.0.0-preview", "3.0.0-next.1", "v1.0.0-pre",
+                  "1.0.0-SNAPSHOT", "v4.0.0-canary.3", "20240101-nightly", "1.0.0a1", "1.0.0b2", "2024", "v1"]:
+            self.assertFalse(rx.search(t), t)
+
+
+class F4_CliAndServe(unittest.TestCase):
+    """Argument validation, the served URL and security headers."""
+
+    def test_max_prs_must_be_positive(self) -> None:
+        """--max-prs 0 or below is rejected by argparse, not silently misapplied."""
+        for v in ("0", "-1", "x"):
+            p = run_cli([merge_repo().path, "--max-prs", v, "-o", tmpdir() / "o.html"])
+            self.assertEqual(p.returncode, 2, v)
+            self.assertIn("--max-prs", p.stderr)
+
+    def test_serve_port_range(self) -> None:
+        """An out-of-range --serve port is a usage error, not a traceback."""
+        for v in ("-5", "70000"):
+            p = run_cli([merge_repo().path, "--serve", v, "--no-open", "-o", tmpdir() / "o.html"])
+            self.assertEqual(p.returncode, 2, v)
+            self.assertNotIn("Traceback", p.stderr)
+
+    def test_served_url_is_percent_encoded_and_has_headers(self) -> None:
+        """A file name with '#' and a space is served at the printed URL, with nosniff and CSP headers."""
+        srv = E2_Serve()
+        out = tmpdir()
+        proc = subprocess.Popen([sys.executable, SCRIPT, str(merge_repo().path), "-o", str(out / "my stats#1.html"),
+                                 "--serve", "0", "--no-open"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=helpers.clean_env())
+        try:
+            url = None
+            for _ in range(200):
+                line = proc.stderr.readline()  # pyright: ignore[reportOptionalMemberAccess]
+                m = re.search(r"Serving (\S+)", line)
+                if m:
+                    url = m.group(1)
+                    break
+                if not line:
+                    break
+            self.assertIsNotNone(url)
+            self.assertTrue(url.endswith("/my%20stats%231.html"), url)  # pyright: ignore[reportOptionalMemberAccess]
+            status, _, headers = srv._get(url)  # pyright: ignore[reportArgumentType]
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+            self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
+        finally:
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=10)
+            for s in (proc.stdout, proc.stderr):
+                if s:
+                    s.close()
+
+    def test_template_has_csp_without_network(self) -> None:
+        """The dashboard's CSP allows no network access and comes before the script."""
+        html = (ROOT / "template.html").read_text(encoding="utf-8")
+        m = re.search(r'<meta http-equiv="Content-Security-Policy" content="([^"]+)">', html)
+        self.assertIsNotNone(m)
+        csp = m.group(1)  # pyright: ignore[reportOptionalMemberAccess]
+        self.assertIn("default-src 'none'", csp)
+        self.assertNotIn("connect-src", csp)
+        self.assertLess(m.start(), html.index("<script>"))  # pyright: ignore[reportOptionalMemberAccess]
+
+    def test_csv_guard_covers_leading_whitespace(self) -> None:
+        """A formula after leading spaces is neutralised too; ordinary text is untouched."""
+        path = tmpdir() / "x.csv"
+        rs.write_csv(str(path), [{"id": 1, "title": "  =HYPERLINK(\"http://x\")"}, {"id": 2, "title": "   "},
+                                 {"id": 3, "title": "fix: ok"}])
+        with open(path, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual([r["title"] for r in rows], ["'  =HYPERLINK(\"http://x\")", "   ", "fix: ok"])

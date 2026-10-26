@@ -2,6 +2,7 @@
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Repository stats</title>
 <style>
@@ -241,7 +242,7 @@ const groupOf = (t) => TYPE_GROUPS.includes(t) ? t : (GROUP_OF[t] || "other");
 const GROUP_NOTE = { chore: "chore (incl. build, ci, style)", other: "other (incl. revert, unclassified)" };
 try { const t = localStorage.getItem("repo-stats-theme"); document.documentElement.dataset.theme = t === "light" ? "light" : "dark"; } catch (e) { document.documentElement.dataset.theme = "dark"; }
 const state = { preset: "all", from: null, to: null, types: new Set(TYPE_GROUPS), bots: true, period: "week" };
-try { const saved = localStorage.getItem("repo-stats-period"); if (saved) state.period = saved; } catch (e) { /* storage may be blocked */ }
+try { const saved = localStorage.getItem("repo-stats-period"); if (["day", "week", "month"].includes(saved)) state.period = saved; } catch (e) { /* storage may be blocked */ }
 
 function range() {
   let hi = DATA_HI + DAY - 1, lo = DATA_LO;
@@ -663,7 +664,7 @@ const METRICS = [
   ["deploy_wait", "Merge to release", "Merged to first release tag"],
   ["lead_to_deploy", "Lead time to release", "First commit to first release tag"],
 ];
-const TAG_DESC = () => META.tag_default ? "a version number (v1.2, 1.2.3; pre-releases such as -rc or -beta are not counted)" : META.tag_pattern;
+const TAG_DESC = () => META.tag_default ? "a dotted version number (v1.2, 1.2.3; pre-releases such as -rc, -beta, -preview or -SNAPSHOT are not counted)" : META.tag_pattern;
 
 function renderKpis(app, sel) {
   const { merged, deploys, r } = sel;
@@ -799,7 +800,7 @@ function renderSize(app, sel) {
 
 function groupColor(g) { return SERIES()[TYPE_GROUPS.indexOf(g)]; }
 function renderTypes(app, sel) {
-  sectionHead(app, "types", "Pull request types", "Type follows Conventional Commits in the PR title; otherwise a type label, the branch name prefix, then a keyword guess.");
+  sectionHead(app, "types", "Pull request types", "Type follows Conventional Commits in the PR title; otherwise the branch name prefix, then a type label, then a keyword guess.");
   const grid = h("div", { class: "grid" });
   app.append(grid);
   const prs = sel.merged;
@@ -827,8 +828,8 @@ function renderTypes(app, sel) {
         h("td", null, fmtNum(stats(sub.map((p) => p.risk)).mean)), h("td", null, fmtInt(sub.filter((p) => p.breaking).length)));
     })))));
   const src = groupBy(prs, (p) => p.type_source);
-  const order = ["title", "label", "branch", "keyword", "none"];
-  if (prs.length) tc.body.append(h("p", { class: "note" }, "How the type was determined: " + order.filter((k) => src.has(k)).map((k) => `${k} ${fmtPct(src.get(k).length / prs.length)}`).join(" · ") + ". Only title is real Conventional Commit data; label and branch are conventions, keyword is a guess and none means no signal."));
+  const order = ["title", "branch", "label", "keyword", "none"];
+  if (prs.length) tc.body.append(h("p", { class: "note" }, "How the type was determined: " + order.filter((k) => src.has(k)).map((k) => `${k} ${fmtPct(src.get(k).length / prs.length)}`).join(" · ") + ". Only title is real Conventional Commit data; branch and label are conventions, keyword is a guess and none means no signal."));
 }
 
 const RISK_COLOR = { low: "--st-good", medium: "--st-warn", high: "--st-serious", critical: "--st-crit" };
@@ -971,7 +972,7 @@ function renderMethod(app) {
   const dora = card(grid, "DORA definitions used", { wide: true });
   dora.body.append(h("dl", { class: "method" },
     h("dt", null, "Deployment"), h("dd", null, META.deploy_source === "tags" ? `A tag whose name matches ${TAG_DESC()}, dated by tag creation.` + (META.tag_default ? ` Pattern: ${META.tag_pattern}` : "") : "Every merge to the branch."),
-    h("dt", null, "Lead time for changes"), h("dd", null, "First commit of the PR to the first release tag containing the merge. When no merged PR in the selected range has a release, it is measured to merge time instead; the same rule is used on every card. First commit time is the author date of the earliest commit, which a rebase can distort."),
+    h("dt", null, "Lead time for changes"), h("dd", null, "First commit of the PR to the first release tag containing the merge. When no merged PR in the selected range has a release, it is measured to merge time instead; the same rule is used on every card. First commit time is the author date of the PR's first commit (the earliest branch commit when inferred from git), which a rebase can distort."),
     h("dt", null, "Change failure"), h("dd", null, `A merged PR that is a revert (title starts with Revert, or type revert) or matches the hotfix pattern /${META.failure_pattern}/i in its branch or labels, or ${META.failure_default ? "at the start of its title (after any type prefix)" : "in its title"}. The rate is failures divided by merged PRs.`),
     h("dt", null, "Time to restore"), h("dd", null, "For reverts whose message says \"This reverts commit <sha>\": time from the reverted change's merge to the revert's merge."),
     h("dt", null, "Performance bands"), h("dd", null, "Elite, High, Medium and Low use rounded thresholds from published DORA reports: frequency ≥ daily / ≥ weekly / ≥ monthly; lead time < 1 day / < 1 week / < 1 month; failure rate ≤ 5% / 10% / 15%; restore < 1 hour / < 1 day / < 1 week. DORA revises its definitions, so treat bands as rough.")));

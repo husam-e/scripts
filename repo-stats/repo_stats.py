@@ -135,8 +135,10 @@ DEFAULT_EXCLUDES = [
 # Matched anywhere in the branch name and labels, but only at the start of the title (after an optional
 # Conventional Commit prefix), so "feat: add rollback support" is not a failure.
 DEFAULT_FAILURE = r"\bhot-?fix\b|\broll-? ?back\b|\bemergency\b"
-# Version tags; pre-releases (-rc1, -beta, .alpha2, 1.0.0dev) are not deployments.
-DEFAULT_TAG_PATTERN = r"^(?!.*(?:[-._+]|\d)(?i:rc|alpha|beta|dev)(?![A-Za-z]))v?\d+(\.\d+)*"
+# Dotted version tags (v1.2, 1.2.3, 2024.05.01). Pre-releases are not deployments: -rc1, -beta, .alpha2,
+# 1.0.0dev, -pre, -preview, -next, -canary, -SNAPSHOT, -nightly and PEP 440 1.0.0a1 / 1.0.0b2.
+DEFAULT_TAG_PATTERN = (r"^(?!.*(?:[-._+]|\d)(?i:rc|alpha|beta|dev|pre|preview|next|canary|snapshot|nightly)(?![A-Za-z]))"
+                       r"(?!.*\d[ab]\d)v?\d+(\.\d+)+")
 
 # file extension -> (language, kind). kind: code | data | docs | other
 LANGUAGES = {
@@ -310,10 +312,12 @@ def normalize_type(raw: str) -> Optional[str]:
     return t if t in CONVENTIONAL_TYPES else None
 
 
-def classify_type(title: str, branch: str | None = None) -> Tuple[str, Optional[str], bool, str]:
+def classify_type(title: str, branch: str | None = None,
+                  labels: Optional[Sequence[str]] = None) -> Tuple[str, Optional[str], bool, str]:
     """Return (type, scope, breaking, source).
 
-    source says how the type was determined: title, branch, keyword or none.
+    The order is: Conventional Commit title, branch prefix, a type label, then a keyword guess from the title.
+    source says which one decided: title, branch, label, keyword or none.
     """
     m = CC_RE.match(title) if title else None
     if m:
@@ -327,6 +331,10 @@ def classify_type(title: str, branch: str | None = None) -> Tuple[str, Optional[
             t = normalize_type(m.group(1))
             if t:
                 return t, None, False, "branch"
+    for label in labels or []:
+        t = normalize_type(label.split(":")[-1].strip())
+        if t:
+            return t, None, False, "label"
     low = (title or "").strip().lower()
     for pattern, t in KEYWORD_TYPES:
         if re.match(pattern, low):
@@ -454,43 +462,44 @@ class Scanner:
                 "code_lines": code_lines, "tests": tests, "sensitive": sensitive, "langs": langs}
 
     def scan(self, repo: str, branch: str) -> List[Commit]:
-        """Return a chronologically ordered list of first-parent commit dicts."""
-        fmt = "%x1e%H%x1f%P%x1f%at%x1f%ct%x1f%an%x1f%s%x1f%b%x1f"
-        args = ["log", "--first-parent", "-m", "--numstat", "--no-renames", "--reverse", f"--format={fmt}", branch]
+        """Return a chronologically ordered list of first-parent commit dicts.
+
+        Commit messages are attacker-controlled text (on GitHub a squash body is the PR description) and git
+        does not escape control characters in them. So metadata and diff stats come from two separate git
+        commands: the metadata one is NUL-delimited (-z), and a message can never contain NUL; the numstat one
+        prints no message text at all.
+        """
+        meta_fmt = "%H%x00%P%x00%at%x00%ct%x00%an%x00%s%x00%b"
         commits: list[Commit] = []
-        buf: list[str] = []
-
-        def flush() -> None:
-            """Parse the buffered lines of one commit and append it to commits."""
-            if not buf:
-                return
-            text = "".join(buf)
-            fields = text.lstrip("\x1e").split("\x1f", 7)
-            if len(fields) < 8:
-                return
-            sha, parents, at, ct, author, subject, body, tail = fields
-            info = self.summarize(tail.split("\n"))
-            info.update(sha=sha, parents=parents.split(), at=int(at), ct=int(ct), author=author,
-                        subject=subject, body=body)
-            commits.append(info)
-
-        for line in stream_git(repo, *args):
-            if line.startswith("\x1e"):
-                flush()
-                buf = [line]
-            else:
-                buf.append(line)
-        flush()
-        # With --first-parent, -m diffs a merge against its first parent only, so each commit appears once.
-        # Keep a cheap dedupe as a guard against double counting.
-        seen: set[str] = set()
-        unique: list[Commit] = []
-        for c in commits:
-            if c["sha"] in seen:
+        by_sha: dict[str, Commit] = {}
+        fields = run_git(repo, "log", "-z", "--first-parent", "--reverse", f"--format={meta_fmt}", branch).split("\0")
+        n = 7
+        for i in range(0, len(fields) - n + 1, n):
+            sha, parents, at, ct, author, subject, body = fields[i:i + n]
+            sha = sha.lstrip("\n")
+            if sha in by_sha:  # guard against double counting
                 continue
-            seen.add(c["sha"])
-            unique.append(c)
-        return unique
+            c: Commit = {"sha": sha, "parents": parents.split(), "at": int(at), "ct": int(ct), "author": author,
+                         "subject": subject, "body": body}
+            by_sha[sha] = c
+            commits.append(c)
+
+        # %x00 cannot appear in a path or in git's numstat output, so it safely marks each commit header.
+        stats: dict[str, list[str]] = {}
+        cur: Optional[list[str]] = None
+        for line in stream_git(repo, "log", "--first-parent", "-m", "--numstat", "--no-renames",
+                               "--format=%x00%H", branch):
+            if line.startswith("\0"):
+                cur = stats.setdefault(line[1:].strip(), [])
+            elif cur is not None:
+                cur.append(line)
+        # With --first-parent, -m diffs a merge against its first parent only, so each commit appears once.
+        for c in commits:
+            info = self.summarize(stats.get(c["sha"], []))
+            info.update(c)
+            c.clear()
+            c.update(info)
+        return commits
 
 
 def load_graph(repo: str, branch: str) -> Graph:
@@ -813,7 +822,7 @@ query($owner:String!,$name:String!,$cursor:String){
         labels(first:20){nodes{name}}
         mergeCommit{oid}
         commits(first:1){totalCount nodes{commit{authoredDate}}}
-        reviews(first:20){nodes{submittedAt state author{login __typename}}}
+        reviews(first:50){nodes{submittedAt state author{login __typename}}}
         timelineItems(first:20,itemTypes:[READY_FOR_REVIEW_EVENT]){nodes{... on ReadyForReviewEvent{createdAt}}}
       }
     }
@@ -949,24 +958,44 @@ def fetch_gitlab(project_path: str, token: str, api_url: str, since: Optional[in
     if info is not None:
         info["seen"] = len(mrs)
 
+    def pages(path: str) -> Iterator[Dict[str, Any]]:
+        """Yield every item of a paginated GitLab list endpoint, following X-Next-Page (at most 50 pages)."""
+        sep = "&" if "?" in path else "?"
+        page = 1
+        for _ in range(50):
+            data, hdrs = http_json(f"{base}{path}{sep}per_page=100&page={page}", headers)
+            if not isinstance(data, list):
+                raise ApiError(f"GitLab returned an unexpected response for {path.split('?')[0]}")
+            for item in data:
+                if isinstance(item, dict):
+                    yield item
+            nxt = hdrs.get("X-Next-Page")
+            if not data or not nxt:
+                return
+            page = int(nxt)
+
     def details(mr: Dict[str, Any]) -> Dict[str, Any]:
         """Fetch first commit time, commit count and first review time for one MR.
 
-        API errors are recorded under "error" instead of raised.
+        API errors are recorded under "commits_error" / "review_error" instead of raised, and the affected
+        values stay None (unknown) rather than being read as "no commits" or "no review".
         """
         out: dict[str, Any] = {"first_commit": None, "commits": None, "first_review": None}
         iid = mr["iid"]
         try:
-            commits, _ = http_json(f"{base}/merge_requests/{iid}/commits?per_page=100", headers)
+            # GitLab lists MR commits newest first, so every page is needed to find the first commit.
+            commits = list(pages(f"/merge_requests/{iid}/commits"))
             times = [parse_iso(c.get("authored_date") or c.get("created_at")) for c in commits]
             times = [t for t in times if t]
             out["first_commit"] = min(times) if times else None
             out["commits"] = len(commits)
-            if want_reviews:
-                notes, _ = http_json(f"{base}/merge_requests/{iid}/notes?sort=asc&order_by=created_at&per_page=100", headers)
+        except (ApiError, ValueError, KeyError, TypeError, AttributeError) as e:
+            out["commits_error"] = str(e)
+        if want_reviews:
+            try:
                 me = (mr.get("author") or {}).get("username")
                 merged_at = parse_iso(mr.get("merged_at"))
-                for note in notes:
+                for note in pages(f"/merge_requests/{iid}/notes?sort=asc&order_by=created_at"):
                     a = note.get("author") or {}
                     if note.get("system") or a.get("username") == me or _is_bot(a.get("username"), "Bot" if a.get("bot") else None):
                         continue
@@ -975,14 +1004,17 @@ def fetch_gitlab(project_path: str, token: str, api_url: str, since: Optional[in
                         continue  # comments after the merge are not a review
                     out["first_review"] = t
                     break
-        except (ApiError, ValueError, KeyError, TypeError, AttributeError) as e:
-            out["error"] = str(e)
+            except (ApiError, ValueError, KeyError, TypeError, AttributeError) as e:
+                out["review_error"] = str(e)
         return out
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         extra = list(pool.map(details, mrs))
+    if info is not None:
+        info["detail_errors"] = sum(1 for ex in extra if "commits_error" in ex or "review_error" in ex)
     result: list[PR] = []
     for mr, ex in zip(mrs, extra):
+        review_known = want_reviews and "review_error" not in ex
         author = mr.get("author") or {}
         state = {"merged": "merged", "closed": "closed", "opened": "open", "locked": "open"}.get(mr["state"], "open")
         created = parse_iso(mr["created_at"])
@@ -995,8 +1027,8 @@ def fetch_gitlab(project_path: str, token: str, api_url: str, since: Optional[in
             "first_commit": ex["first_commit"], "last_commit": None, "commits": ex["commits"],
             "additions": None, "deletions": None, "files": None,
             "labels": mr.get("labels") or [],
-            "reviewed": (ex["first_review"] is not None) if (state == "merged" and want_reviews) else None,
-            "source": "api", "inferred": ["ready"] + ([] if want_reviews else ["first_review"]),
+            "reviewed": (ex["first_review"] is not None) if (state == "merged" and review_known) else None,
+            "source": "api", "inferred": ["ready"] + ([] if review_known else ["first_review"]),
             "squash_sha": mr.get("squash_commit_sha"), "local": None,
         })
     return result
@@ -1048,6 +1080,8 @@ def local_summary(pr: PR, fp_by_sha: Dict[str, Commit]) -> Optional[Commit]:
     return None
 
 
+# "Revert ...", "Reverts #12", "Reverting ..."; not "Revertible settings".
+REVERT_TITLE = re.compile(r"^\s*revert(s|ed|ing)?\b", re.I)
 CC_PREFIX = re.compile(r"^\s*(?:\[[^\]]*\]|[A-Za-z]+(?:\([^)]*\))?!?\s*:)\s*")
 
 
@@ -1089,15 +1123,9 @@ def build_records(prs: List[PR], ctx: Dict[str, Any]) -> List[Record]:
             if len(c["parents"]) >= 2 and not pr.get("branch_shas"):
                 # merge-commit workflow: the branch commits (e.g. a revert) resolve time to restore
                 pr["branch_shas"] = claims.get(c["sha"], [])
-        t, scope, breaking, tsrc = classify_type(pr["title"] or "", pr.get("branch"))
-        if t == "other":
-            for label in pr.get("labels") or []:
-                lt = normalize_type(label.split(":")[-1].strip())
-                if lt:
-                    t, tsrc = lt, "label"
-                    break
+        t, scope, breaking, tsrc = classify_type(pr["title"] or "", pr.get("branch"), pr.get("labels"))
         kind = None
-        if t == "revert" or (pr["title"] or "").lower().startswith("revert"):
+        if t == "revert" or REVERT_TITLE.match(pr["title"] or ""):
             kind = "revert"
         elif is_failure(failure_re, pr["title"], pr.get("branch"), pr.get("labels"), ctx.get("failure_title_start", False)):
             kind = "hotfix"
@@ -1219,8 +1247,8 @@ def write_csv(path: str, records: Iterable[Record]) -> None:
             row: list[Any] = []
             for c in cols:
                 v = r.get(c)
-                if isinstance(v, str) and v and v[0] in "=+-@\t\r":
-                    v = "'" + v  # neutralise spreadsheet formula injection
+                if isinstance(v, str) and v and (v[0] in "=+-@\t\r" or v.lstrip()[:1] in ("=", "+", "-", "@")):
+                    v = "'" + v  # neutralise spreadsheet formula injection, also after leading spaces
                 row.append("" if v is None else v)
             w.writerow(row)
 
@@ -1350,6 +1378,9 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
                     raise ApiError(f"API fetch failed: {detail}")
                 warnings.append(f"API fetch failed ({detail}). Using PRs inferred from git history instead.")
                 api_prs = None
+            if info.get("detail_errors"):
+                warnings.append(f"{info['detail_errors']} merge request(s) had commit or review lookups fail. "
+                                "Their coding time, lead time and review status are left empty, not guessed.")
             if api_prs is not None and not api_prs:
                 seen = info.get("seen", 0)
                 if seen and not args.all_bases:
@@ -1414,6 +1445,28 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
     return {"meta": meta, "prs": records, "loc": loc, "deploys": deploys}
 
 
+def positive_int(value: str) -> int:
+    """argparse type: an integer of at least 1."""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid integer: {value!r}")
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {n}")
+    return n
+
+
+def port_number(value: str) -> int:
+    """argparse type: a TCP port from 0 (any free port) to 65535."""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid port: {value!r}")
+    if not 0 <= n <= 65535:
+        raise argparse.ArgumentTypeError(f"port must be 0-65535, got {n}")
+    return n
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line parser."""
     p = argparse.ArgumentParser(
@@ -1439,7 +1492,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--token-env", metavar="NAME", help="environment variable that holds the API token")
     g.add_argument("--no-reviews", action="store_true", help="GitLab: skip per-MR review lookups (faster, fewer API calls)")
     g.add_argument("--all-bases", action="store_true", help="include PRs that target branches other than the analysed one")
-    g.add_argument("--max-prs", type=int, metavar="N", help="stop after N PRs (newest first)")
+    g.add_argument("--max-prs", type=positive_int, metavar="N", help="stop after N PRs (newest first)")
     g.add_argument("--commits-as-prs", action="store_true",
                    help="git mode: treat every direct commit on the branch as a PR (for repos without PR references)")
     g = p.add_argument_group("heuristics")
@@ -1455,10 +1508,15 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--exclude-bots", action="store_true", help="drop bot-authored PRs entirely")
     g = p.add_argument_group("privacy and viewing")
     g.add_argument("--no-titles", action="store_true", help="replace PR titles with their number in the output")
-    g.add_argument("--serve", nargs="?", const=8000, type=int, metavar="PORT", help="serve the result on localhost and open a browser")
+    g.add_argument("--serve", nargs="?", const=8000, type=port_number, metavar="PORT", help="serve the result on localhost and open a browser")
     g.add_argument("--no-open", action="store_true", help="with --serve, do not open a browser")
     p.add_argument("--version", action="version", version=f"repo-stats {__version__}")
     return p
+
+
+# Same policy as the template's meta tag: inline script and style only, no network access at all.
+CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; "
+       "base-uri 'none'; form-action 'none'")
 
 
 def serve(path: Path, port: int, open_browser: bool) -> None:
@@ -1491,6 +1549,9 @@ def serve(path: Path, port: int, open_browser: bool) -> None:
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", CSP)
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
             if not head_only:
                 self.wfile.write(body)
@@ -1509,7 +1570,7 @@ def serve(path: Path, port: int, open_browser: bool) -> None:
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
     bound = httpd.server_address[1]
     allowed_hosts.update({f"127.0.0.1:{bound}", f"localhost:{bound}"})
-    url = f"http://127.0.0.1:{httpd.server_address[1]}/{path.name}"
+    url = f"http://127.0.0.1:{bound}/{urllib.parse.quote(path.name)}"
     log(f"Serving {url} (Ctrl+C to stop)")
     if open_browser:
         threading.Timer(0.3, webbrowser.open, args=(url,)).start()

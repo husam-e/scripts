@@ -71,6 +71,9 @@ Tokens are read from the environment only and are never written to any output.
 A token is sent automatically only to `github.com` and `gitlab.com`.
 API requests to `127.0.0.1`, `::1` or `localhost` never go through a proxy.
 `--serve` binds to 127.0.0.1, serves only the dashboard file, and rejects any request whose Host header is not `127.0.0.1` or `localhost` on the serving port.
+The dashboard carries a Content-Security-Policy that allows no network access, so it cannot send data anywhere even when opened from a mail attachment.
+Commit messages are read in a separate, NUL-delimited git call, so their text cannot change diff statistics.
+If a GitLab per-MR lookup fails, the review status and timings for that MR are left empty and the dashboard warns; they are never counted as "unreviewed".
 
 == Heuristics
 
@@ -102,11 +105,13 @@ A rule that needs data the source lacks is skipped, never guessed.
 The score is a triage signal, not a prediction.
 
 Deployment::
-A release tag matching `--tag-pattern` (default: semver-like, pre-releases excluded).
+A release tag matching `--tag-pattern`.
+The default is a dotted version such as `v1.2`, `1.2.3` or `2024.05.01`.
+Pre-releases (`-rc`, `-alpha`, `-beta`, `-dev`, `-pre`, `-preview`, `-next`, `-canary`, `-SNAPSHOT`, `-nightly`, and PEP 440 `1.0.0a1` or `1.0.0b2`) are excluded, and so are single-number tags such as `v1`.
 Use `--deploy-source merges` to count every merge as a deployment.
 
 Change failure::
-A merged PR that is a revert, or whose title, branch or labels match `--failure-pattern` (default: hotfix and rollback).
+A merged PR that is a revert (type `revert`, or a title starting with Revert, Reverts, Reverted or Reverting), or whose title, branch or labels match `--failure-pattern` (default: hotfix, rollback and emergency).
 The rate is failures divided by merged PRs.
 
 Time to restore::
