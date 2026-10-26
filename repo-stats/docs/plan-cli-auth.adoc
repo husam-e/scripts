@@ -324,12 +324,25 @@ Use a deploy key or the same short-lived token through a credential helper, not 
 == Keeping least privilege on a laptop
 
 `gh auth login` cannot request fewer scopes than `repo`, `read:org` and `gist`.
-To use a read-only token without putting it in your shell:
+To use a read-only token, keep it in the OS keychain under its own name and give it to the CLI for one command only.
+The value then never appears in shell history, in a file, or in the shell's environment.
 
-* GitHub: create a fine-grained, read-only PAT, then run `gh auth login --with-token < file` and delete the file.
-  `gh` stores the token in the keychain.
-  The gh help warns that fine-grained tokens can confuse some *other* gh commands, so a separate gh account or config dir (`GH_CONFIG_DIR`) keeps your main login untouched.
-* GitLab: create a PAT with only the `read_api` scope, then run `glab auth login --stdin < file`. glab stores it in the keyring when one is available.
+[source,sh]
+----
+# macOS: store once (-w last makes it prompt), then use per run
+security add-generic-password -a "$USER" -s repo-stats-github -w
+GH_TOKEN="$(security find-generic-password -a "$USER" -s repo-stats-github -w)" python3 repo_stats.py /path/to/repo
+
+# Linux (libsecret): store once (prompts), then use per run
+secret-tool store --label="repo-stats GitHub read-only" service repo-stats host github.com
+GH_TOKEN="$(secret-tool lookup service repo-stats host github.com)" python3 repo_stats.py /path/to/repo
+----
+
+For GitLab, store a `read_api` token the same way and set `GITLAB_TOKEN` instead.
+
+Do not load the read-only token with `gh auth login --with-token`.
+gh names its keychain entries by host and username only (`gh:github.com`, checked in gh's source, `internal/config/config.go`).
+A token for the same account replaces the main login's token, even under a separate `GH_CONFIG_DIR`.
 
 [[gaps]]
 == Remaining security gaps
