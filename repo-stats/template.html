@@ -1037,7 +1037,7 @@ function renderBanner() {
   const api = META.mode === "api";
   const box = h("div", { class: "banner" + (api ? " ok" : "") },
     h("strong", null, api ? `Exact PR data from the ${META.provider} API.` : "PR data is inferred from git history."),
-    " ", api ? "Open, review and merge times are real." : "Open and review times are missing, first-commit times are approximate, and PRs that left no trace in git are absent. Run with an API token for accurate results.");
+    " ", api ? "Open, review and merge times are real." : "Open and review times are missing, first-commit times are approximate, and PRs that left no trace in git are absent. Install and log in to gh or glab for accurate results.");
   if (META.warnings.length) box.append(h("ul", null, META.warnings.map((w) => h("li", null, w))));
   b.append(box);
 }

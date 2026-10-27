@@ -5,6 +5,9 @@ Reads a local git checkout (and, optionally, the GitHub or GitLab API) and write
 one self-contained HTML file with lines of code over time, PR/MR throughput, size,
 type, risk and cycle-time statistics, and DORA metrics.
 
+API data comes from the `gh` (GitHub) or `glab` (GitLab) CLI, which uses its own login.
+repo-stats never reads, stores or sends a credential, and only ever sends read requests.
+
 Python 3.8+, standard library only. Run `repo_stats.py --help` for usage.
 """
 from __future__ import annotations
@@ -15,25 +18,20 @@ import concurrent.futures
 import csv
 import datetime as dt
 import email.utils
-import http.client
 import http.server
-import ipaddress
 import json
 import os
 import re
+import shutil
 import subprocess
-import socket
 import sys
 import tempfile
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import webbrowser
-from email.message import Message
 from pathlib import Path
-from typing import IO, Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, TypedDict, cast
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, TypedDict, cast
 
 __version__ = "0.1.0"
 
@@ -217,6 +215,18 @@ def language_of(path: str) -> Tuple[str, str]:
 # Git access
 # ---------------------------------------------------------------------------
 
+# Names of variables that may hold an API credential. repo-stats never reads their values. It removes them
+# from git's environment, because git needs none of them, so hooks, filters and textconv drivers that git
+# runs inside the analysed repository cannot read them.
+CREDENTIAL_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GITLAB_TOKEN",
+                   "GITLAB_ACCESS_TOKEN", "GITLAB_PRIVATE_TOKEN", "OAUTH_TOKEN", "CI_JOB_TOKEN")
+
+
+def git_env() -> Dict[str, str]:
+    """Return os.environ without the credential variables, for git subprocesses."""
+    return {k: v for k, v in os.environ.items() if k not in CREDENTIAL_VARS}
+
+
 def git_cmd(repo: str, *args: str) -> List[str]:
     """Build a git argv for `repo` with stable, unquoted path output."""
     return ["git", "-C", repo, "-c", "core.quotepath=off", "-c", "log.showSignature=false", *args]
@@ -225,7 +235,7 @@ def git_cmd(repo: str, *args: str) -> List[str]:
 def run_git(repo: str, *args: str, check: bool = True) -> str:
     """Run git and return its stdout; with check, raise ToolError on a non-zero exit."""
     p = subprocess.run(git_cmd(repo, *args), capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
+                       encoding="utf-8", errors="replace", env=git_env())
     if check and p.returncode != 0:
         raise ToolError(f"git {' '.join(args[:3])} failed: {p.stderr.strip() or p.stdout.strip()}")
     return p.stdout
@@ -236,7 +246,7 @@ def stream_git(repo: str, *args: str) -> Iterator[str]:
     # stderr goes to a temp file: a PIPE nobody reads can fill up and deadlock git.
     with tempfile.TemporaryFile() as err:
         p = subprocess.Popen(git_cmd(repo, *args), stdout=subprocess.PIPE, stderr=err,
-                             text=True, encoding="utf-8", errors="replace")
+                             text=True, encoding="utf-8", errors="replace", env=git_env())
         assert p.stdout is not None
         with p.stdout:
             for line in p.stdout:
@@ -292,8 +302,8 @@ TRUSTED_HOSTS = {"github.com": "github", "gitlab.com": "gitlab"}
 def detect_provider(host: str) -> Optional[str]:
     """Return "github" or "gitlab" for the public hosts only, else None.
 
-    Anything else needs --provider and --api-url, so a crafted remote URL (github.evil.example) can never
-    receive a token.
+    Anything else needs --provider and --hostname, so a crafted remote URL (github.evil.example) can never
+    make gh or glab send a credential to its host.
     """
     return TRUSTED_HOSTS.get(host)
 
@@ -694,40 +704,48 @@ def infer_prs_from_git(first_parent: List[Commit], graph: Graph, default_branch:
 
 
 # ---------------------------------------------------------------------------
-# HTTP + API clients
+# GitHub and GitLab APIs, through the gh and glab CLIs
 # ---------------------------------------------------------------------------
+#
+# repo-stats never reads, holds or sends a credential. Every API request is a read-only `gh api` or
+# `glab api` call, and the CLI finds its own login: the OS keychain, GH_TOKEN / GITLAB_TOKEN, or the
+# GitLab CI job token. Two CLI behaviours shape this code: both send an environment token to whatever
+# --hostname they are given, and glab without --hostname follows the remote of the git repository in its
+# working directory. So the host always comes from the allowlist or an explicit flag, it is always passed
+# as --hostname, and the CLI always runs from an empty temporary directory.
 
 class ApiError(ToolError):
-    """A failed or unexpected GitHub/GitLab API call."""
+    """A failed or unexpected GitHub/GitLab API call. `status` is the HTTP status, when there was one."""
+
+    def __init__(self, msg: str, status: Optional[int] = None) -> None:
+        """Store the message and the HTTP status."""
+        super().__init__(msg)
+        self.status = status
 
 
-class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
-    """Never follow a redirect to another host or to plain http, so tokens cannot leak."""
-
-    def redirect_request(self, req: urllib.request.Request, fp: IO[bytes], code: int, msg: str,
-                         headers: http.client.HTTPMessage, newurl: str) -> Optional[urllib.request.Request]:
-        """Follow the redirect only if it stays on the same host and on https (or loopback http)."""
-        old, new = urllib.parse.urlparse(req.full_url), urllib.parse.urlparse(newurl)
-        if new.netloc != old.netloc:
-            raise ApiError(f"Refusing cross-host redirect to {new.netloc}")
-        loopback_http = old.scheme == "http" and _is_loopback(old.hostname or "")
-        if new.scheme != "https" and not (loopback_http and new.scheme == "http"):
-            raise ApiError(f"Refusing redirect to insecure URL {new.scheme}://{new.netloc}")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+class CliUnavailable(ApiError):
+    """gh or glab is not installed or not logged in: a reason to use git mode, not an API failure."""
 
 
-_OPENER = urllib.request.build_opener(_SameHostRedirect)
-_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _SameHostRedirect)
-
-
-def _is_loopback(host: str) -> bool:
-    """Return True for "localhost" or a loopback IP address."""
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
+CLI_FOR = {"github": "gh", "gitlab": "glab"}
+CLI_HELP = {  # tool -> (install page, what to set in CI)
+    "gh": ("https://cli.github.com", "GH_TOKEN"),
+    "glab": ("https://gitlab.com/gitlab-org/cli", "GLAB_ENABLE_CI_AUTOLOGIN=true or GITLAB_TOKEN"),
+}
+# Debug switches that make the CLIs dump requests to stderr, which repo-stats may quote in an error.
+CLI_DEBUG_VARS = ("GH_DEBUG", "DEBUG", "GLAB_DEBUG", "GLAB_DEBUG_HTTP")
+# No prompts, update checks, banners, pager or colour. glab's telemetry is off because it sends its own
+# request, with the credential, to the API host.
+CLI_QUIET_ENV = {"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",
+                 "GLAB_NO_PROMPT": "1", "GLAB_CHECK_UPDATE": "false", "GLAB_SHOW_WHATS_NEW": "false",
+                 "GLAB_SEND_TELEMETRY": "false", "NO_COLOR": "1", "CLICOLOR": "0", "GH_PAGER": "cat", "PAGER": "cat"}
+CLI_TIMEOUT = 120
+HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+# The read-only allowlist. A GraphQL query cannot change anything (only a mutation can), and the GitLab
+# endpoints are the three list endpoints repo-stats reads, always with GET.
+READ_ONLY_GRAPHQL = re.compile(r"^\s*query\b")
+WRITE_GRAPHQL = re.compile(r"\b(?:mutation|subscription)\b")
+GITLAB_READ_ENDPOINT = re.compile(r"^projects/[^/?#\s]+/merge_requests(?:/\d+/(?:commits|notes))?$")
 
 
 def _retry_after(value: Optional[str], default: int) -> int:
@@ -748,57 +766,137 @@ def _retry_after(value: Optional[str], default: int) -> int:
     return min(wait, 60) if wait > 0 else default
 
 
-def http_json(url: str, headers: Dict[str, str], body: Any = None, retries: int = 4) -> Tuple[Any, Message]:
-    """Send a GET (or a JSON POST when body is given) and return (parsed JSON, response headers).
+def parse_cli_response(out: bytes) -> Tuple[Optional[int], Dict[str, str], bytes]:
+    """Split `gh api --include` / `glab api --include` output into (status, headers, body).
 
-    Retries rate limits, 5xx and transient network errors with backoff; raises ApiError otherwise.
+    Header names are lower-cased. The status is None when the output has no HTTP status line, which means
+    the CLI never got a response (not logged in, DNS failure, refused connection).
     """
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != "https" and not _is_loopback(parsed.hostname or ""):
-        raise ApiError(f"Refusing to send credentials over insecure URL {parsed.scheme}://{parsed.netloc}")
-    data = json.dumps(body).encode() if body is not None else None
-    hdrs = dict(headers)
-    hdrs.setdefault("User-Agent", f"repo-stats/{__version__}")
-    if data is not None:
-        hdrs["Content-Type"] = "application/json"
-    delay = 2
-    for attempt in range(retries + 1):
-        req = urllib.request.Request(url, data=data, headers=hdrs)
-        try:
-            opener = _DIRECT_OPENER if _is_loopback(parsed.hostname or "") else _OPENER
-            with opener.open(req, timeout=60) as resp:
-                raw = resp.read()
-                hdrs_out = resp.headers
-        except urllib.error.HTTPError as e:
-            if e.code in (429, 500, 502, 503, 504) and attempt < retries:
-                time.sleep(_retry_after(e.headers.get("Retry-After") if e.headers else None, delay))
+    m = re.match(rb"HTTP/[0-9.]+ (\d{3})", out)
+    if not m:
+        return None, {}, out
+    sep = re.search(rb"\n\r?\n", out)
+    head, body = (out[:sep.start()], out[sep.end():]) if sep else (out, b"")
+    headers: dict[str, str] = {}
+    for line in head.decode("latin-1").splitlines()[1:]:
+        name, colon, value = line.partition(":")
+        if colon:
+            headers[name.strip().lower()] = value.strip()
+    return int(m.group(1)), headers, body
+
+
+class Cli:
+    """Read-only access to one GitHub or GitLab host through `gh api` or `glab api`.
+
+    Use as a context manager. Every request passes the read-only allowlist and --hostname, runs from an
+    empty temporary directory, and gets no debug or telemetry switches.
+    """
+
+    def __init__(self, tool: str, host: str, environ: Optional[Mapping[str, str]] = None, retries: int = 4) -> None:
+        """Find the CLI on PATH and prepare its environment.
+
+        Raises:
+            CliUnavailable: the CLI is not installed.
+            ApiError: the hostname is not a plain host name.
+        """
+        if tool not in CLI_HELP:
+            raise ApiError(f"Unknown CLI {tool!r}")
+        if not HOSTNAME_RE.match(host):
+            raise ApiError(f"Invalid hostname {host!r}")
+        env = dict(os.environ if environ is None else environ)
+        exe = shutil.which(tool, path=env.get("PATH", os.defpath))
+        if not exe:
+            raise CliUnavailable(f"{tool} is not installed. Install it from {CLI_HELP[tool][0]} for exact PR data.")
+        for name in CLI_DEBUG_VARS:
+            env.pop(name, None)
+        env.update(CLI_QUIET_ENV)
+        self.tool, self.host, self.exe, self.env, self.retries = tool, host, exe, env, retries
+        self._dir = tempfile.TemporaryDirectory(prefix="repo-stats-cli-")
+
+    def __enter__(self) -> Cli:
+        """Return self."""
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        """Remove the temporary working directory."""
+        self._dir.cleanup()
+
+    def graphql(self, query: str, variables: Mapping[str, Optional[str]]) -> Any:
+        """Send a read-only GraphQL query with string variables (None values are left out); return the JSON."""
+        if self.tool != "gh" or not READ_ONLY_GRAPHQL.match(query) or WRITE_GRAPHQL.search(query):
+            raise ApiError("Refusing to send a GraphQL request that is not a read-only query")
+        args = ["api", "graphql", "--hostname", self.host, "--include", "-f", f"query={query}"]
+        for name, value in variables.items():
+            if value is not None:
+                args += ["-f", f"{name}={value}"]
+        return self._run(args)[0]
+
+    def get(self, endpoint: str, params: Mapping[str, Any]) -> Tuple[Any, Dict[str, str]]:
+        """GET an allowlisted GitLab endpoint with query parameters; return (JSON, lower-cased headers)."""
+        if self.tool != "glab" or not GITLAB_READ_ENDPOINT.match(endpoint):
+            raise ApiError(f"Refusing a request outside the read-only allowlist: {endpoint}")
+        args = ["api", "--hostname", self.host, "--method", "GET", "--include", endpoint]
+        for name, value in params.items():
+            args += ["-f", f"{name}={value}"]
+        return self._run(args)
+
+    def _login_hint(self) -> str:
+        """How to give the CLI a login, locally and in CI."""
+        return f"Run `{self.tool} auth login --hostname {self.host}`, or in CI set {CLI_HELP[self.tool][1]}."
+
+    def _run(self, args: List[str]) -> Tuple[Any, Dict[str, str]]:
+        """Run the CLI, retrying rate limits, 5xx and timeouts with backoff; return (JSON, headers)."""
+        delay = 2
+        for attempt in range(self.retries + 1):
+            try:
+                p = subprocess.run([self.exe, *args], cwd=self._dir.name, env=self.env, stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=CLI_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                if attempt < self.retries:
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise ApiError(f"{self.tool} api timed out after {CLI_TIMEOUT}s")
+            except OSError as e:
+                raise CliUnavailable(f"Could not run {self.tool}: {e.strerror or e}")
+            status, headers, body = parse_cli_response(p.stdout)
+            err = next((ln.strip() for ln in p.stderr.decode("utf-8", "replace").splitlines() if ln.strip()), "")[:300]
+            if status is None:
+                if p.returncode == 4 or "auth login" in err:
+                    raise CliUnavailable(f"{self.tool} is not logged in to {self.host}. {self._login_hint()}")
+                # No HTTP response at all (DNS, refused connection, TLS): retrying will not fix it.
+                raise ApiError(f"Could not reach the API through {self.tool}: {err or f'exit status {p.returncode}'}")
+            if status in (429, 500, 502, 503, 504) and attempt < self.retries:
+                time.sleep(_retry_after(headers.get("retry-after"), delay))
                 delay *= 2
                 continue
-            if e.code == 401:
-                raise ApiError("API rejected the token (401). Check that it is valid and has read access.")
-            if e.code == 403:
-                raise ApiError("API returned 403: the token lacks access or the rate limit is exhausted.")
-            if e.code == 404:
-                raise ApiError("API returned 404: repository not found, or the token cannot see it.")
-            raise ApiError(f"API request failed with HTTP {e.code}")
-        except urllib.error.URLError as e:
-            # A refused connection or an unknown host will not fix itself: fail fast.
-            if attempt < retries and not isinstance(e.reason, (ConnectionRefusedError, socket.gaierror)):
-                time.sleep(delay)
-                delay *= 2
-                continue
-            raise ApiError(f"Could not reach the API: {e.reason}")
-        except (OSError, http.client.HTTPException) as e:  # timeouts, resets, truncated responses
-            if attempt < retries:
-                time.sleep(delay)
-                delay *= 2
-                continue
-            raise ApiError(f"Could not reach the API: {e.__class__.__name__}")
-        try:
-            return json.loads(raw.decode("utf-8")), hdrs_out
-        except ValueError:
-            raise ApiError("API returned a response that is not JSON (a proxy or login page?)")
-    raise ApiError("API request failed")
+            if status == 401:
+                raise ApiError(f"API returned 401: {self.tool}'s login was rejected. {self._login_hint()}", 401)
+            if status == 403:
+                raise ApiError(f"API returned 403: {self.tool}'s login lacks access, or the rate limit is exhausted.", 403)
+            if status == 404:
+                raise ApiError(f"API returned 404: repository not found, or {self.tool}'s login cannot see it.", 404)
+            if not 200 <= status < 300:
+                raise ApiError(f"API request failed with HTTP {status}", status)
+            try:
+                return json.loads(body.decode("utf-8")), headers
+            except ValueError:
+                raise ApiError("API returned a response that is not JSON (a proxy or login page?)", status)
+        raise ApiError("API request failed")
+
+
+def ci_server(environ: Mapping[str, str]) -> Optional[Tuple[str, str]]:
+    """Return (provider, host) of the CI server running this job, from variables the runner sets, or None.
+
+    Whoever can change these variables already controls the job, so a remote on this host is trusted.
+    """
+    if environ.get("GITLAB_CI") == "true" and environ.get("CI_SERVER_HOST"):
+        return "gitlab", environ["CI_SERVER_HOST"].lower()
+    if environ.get("GITHUB_ACTIONS") == "true" and environ.get("GITHUB_SERVER_URL"):
+        host = urllib.parse.urlparse(environ["GITHUB_SERVER_URL"]).hostname
+        if host:
+            return "github", host.lower()
+    return None
 
 
 def parse_iso(s: Optional[str]) -> Optional[int]:
@@ -831,23 +929,20 @@ query($owner:String!,$name:String!,$cursor:String){
 """
 
 
-def fetch_github(owner: str, name: str, token: str, api_url: str, since: Optional[int], base_branch: str,
+def fetch_github(cli: Cli, owner: str, name: str, since: Optional[int], base_branch: str,
                  all_bases: bool, max_prs: Optional[int], progress: Callable[[str], None] = log,
                  info: Optional[Dict[str, int]] = None) -> List[PR]:
-    """Fetch pull requests from the GitHub GraphQL API, newest-updated first.
+    """Fetch pull requests from the GitHub GraphQL API through `gh api`, newest-updated first.
 
     A PR merged after `since` was updated after it too, so paging stops at the first PR whose last
     activity is older than `since`; collect() then filters by merge (or open) time. `info`, if given,
     receives the number of PRs seen before the base-branch filter under "seen".
     """
-    endpoint = api_url.rstrip("/") + "/graphql"
-    headers = {"Authorization": f"Bearer {token}"}
     prs: list[PR] = []
     seen = 0
     cursor = None
     while True:
-        data, _ = http_json(endpoint, headers, {"query": GITHUB_QUERY,
-                                                "variables": {"owner": owner, "name": name, "cursor": cursor}})
+        data = cli.graphql(GITHUB_QUERY, {"owner": owner, "name": name, "cursor": cursor})
         if not isinstance(data, dict):
             raise ApiError("GitHub returned an unexpected response")
         if data.get("errors"):
@@ -855,7 +950,7 @@ def fetch_github(owner: str, name: str, token: str, api_url: str, since: Optiona
             raise ApiError(f"GitHub GraphQL error: {msg}")
         repo_node = (data.get("data") or {}).get("repository")
         if not repo_node:
-            raise ApiError("GitHub returned no repository: not found, or the token cannot see it.")
+            raise ApiError("GitHub returned no repository: not found, or gh's login cannot see it.")
         page = repo_node.get("pullRequests")
         if not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
             raise ApiError("GitHub returned an unexpected pullRequests shape")
@@ -925,16 +1020,18 @@ def github_pr(n: Dict[str, Any]) -> PR:
     }
 
 
-def fetch_gitlab(project_path: str, token: str, api_url: str, since: Optional[int], base_branch: str,
+def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch: str,
                  all_bases: bool, max_prs: Optional[int], want_reviews: bool,
                  progress: Callable[[str], None] = log, info: Optional[Dict[str, int]] = None) -> List[PR]:
-    """Fetch merge requests from the GitLab REST API, with per-MR commit and (optionally) review times.
+    """Fetch merge requests from the GitLab REST API through `glab api`, with per-MR commit and review times.
 
-    `info`, if given, receives the number of MRs fetched under "seen".
+    REST, not GraphQL, because a GitLab CI job token cannot call GraphQL. A job token can list MRs and
+    their notes but not their commits; when the commits endpoint is refused, commit lookups stop and the
+    PRs are marked "commits_refused" so build_records can use local merge commits instead.
+
+    `info`, if given, receives "seen" (MRs fetched), "detail_errors" and "commits_refused" (0 or 1).
     """
-    project = urllib.parse.quote(project_path, safe="")
-    base = f"{api_url.rstrip('/')}/projects/{project}"
-    headers = {"PRIVATE-TOKEN": token}
+    base = f"projects/{urllib.parse.quote(project_path, safe='')}/merge_requests"
     mrs: list[dict[str, Any]] = []
     page = 1
     while True:
@@ -944,12 +1041,12 @@ def fetch_gitlab(project_path: str, token: str, api_url: str, since: Optional[in
             q["updated_after"] = dt.datetime.fromtimestamp(since, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         if not all_bases:
             q["target_branch"] = base_branch
-        data, hdrs = http_json(f"{base}/merge_requests?{urllib.parse.urlencode(q)}", headers)
+        data, hdrs = cli.get(base, q)
         if not isinstance(data, list):
             raise ApiError("GitLab returned an unexpected response for merge_requests")
         mrs.extend(m for m in data if isinstance(m, dict))
         progress(f"  fetched {len(mrs)} merge requests")
-        nxt = hdrs.get("X-Next-Page")
+        nxt = hdrs.get("x-next-page")
         if not data or not nxt or (max_prs and len(mrs) >= max_prs):
             break
         page = int(nxt)
@@ -958,21 +1055,35 @@ def fetch_gitlab(project_path: str, token: str, api_url: str, since: Optional[in
     if info is not None:
         info["seen"] = len(mrs)
 
-    def pages(path: str) -> Iterator[Dict[str, Any]]:
+    def pages(endpoint: str, params: Optional[Mapping[str, str]] = None) -> Iterator[Dict[str, Any]]:
         """Yield every item of a paginated GitLab list endpoint, following X-Next-Page (at most 50 pages)."""
-        sep = "&" if "?" in path else "?"
         page = 1
         for _ in range(50):
-            data, hdrs = http_json(f"{base}{path}{sep}per_page=100&page={page}", headers)
+            data, hdrs = cli.get(endpoint, {**(params or {}), "per_page": 100, "page": page})
             if not isinstance(data, list):
-                raise ApiError(f"GitLab returned an unexpected response for {path.split('?')[0]}")
+                raise ApiError(f"GitLab returned an unexpected response for {endpoint.rsplit('/', 1)[-1]}")
             for item in data:
                 if isinstance(item, dict):
                     yield item
-            nxt = hdrs.get("X-Next-Page")
+            nxt = hdrs.get("x-next-page")
             if not data or not nxt:
                 return
             page = int(nxt)
+
+    def mr_commits(iid: Any) -> List[Dict[str, Any]]:
+        """Return every commit of one MR (GitLab lists them newest first, so all pages are needed)."""
+        return list(pages(f"{base}/{int(iid)}/commits"))
+
+    # One probe decides whether this login can read MR commits at all (a CI job token cannot).
+    commits_refused = False
+    probe: Optional[List[Dict[str, Any]]] = None
+    if mrs:
+        try:
+            probe = mr_commits(mrs[0]["iid"])
+        except ApiError as e:
+            commits_refused = e.status in (401, 403, 404)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            pass
 
     def details(mr: Dict[str, Any]) -> Dict[str, Any]:
         """Fetch first commit time, commit count and first review time for one MR.
@@ -982,20 +1093,20 @@ def fetch_gitlab(project_path: str, token: str, api_url: str, since: Optional[in
         """
         out: dict[str, Any] = {"first_commit": None, "commits": None, "first_review": None}
         iid = mr["iid"]
-        try:
-            # GitLab lists MR commits newest first, so every page is needed to find the first commit.
-            commits = list(pages(f"/merge_requests/{iid}/commits"))
-            times = [parse_iso(c.get("authored_date") or c.get("created_at")) for c in commits]
-            times = [t for t in times if t]
-            out["first_commit"] = min(times) if times else None
-            out["commits"] = len(commits)
-        except (ApiError, ValueError, KeyError, TypeError, AttributeError) as e:
-            out["commits_error"] = str(e)
+        if not commits_refused:
+            try:
+                commits = probe if (probe is not None and mr is mrs[0]) else mr_commits(iid)
+                times = [parse_iso(c.get("authored_date") or c.get("created_at")) for c in commits]
+                times = [t for t in times if t]
+                out["first_commit"] = min(times) if times else None
+                out["commits"] = len(commits)
+            except (ApiError, ValueError, KeyError, TypeError, AttributeError) as e:
+                out["commits_error"] = str(e)
         if want_reviews:
             try:
                 me = (mr.get("author") or {}).get("username")
                 merged_at = parse_iso(mr.get("merged_at"))
-                for note in pages(f"/merge_requests/{iid}/notes?sort=asc&order_by=created_at"):
+                for note in pages(f"{base}/{int(iid)}/notes", {"sort": "asc", "order_by": "created_at"}):
                     a = note.get("author") or {}
                     if note.get("system") or a.get("username") == me or _is_bot(a.get("username"), "Bot" if a.get("bot") else None):
                         continue
@@ -1012,6 +1123,7 @@ def fetch_gitlab(project_path: str, token: str, api_url: str, since: Optional[in
         extra = list(pool.map(details, mrs))
     if info is not None:
         info["detail_errors"] = sum(1 for ex in extra if "commits_error" in ex or "review_error" in ex)
+        info["commits_refused"] = int(commits_refused)
     result: list[PR] = []
     for mr, ex in zip(mrs, extra):
         review_known = want_reviews and "review_error" not in ex
@@ -1029,7 +1141,7 @@ def fetch_gitlab(project_path: str, token: str, api_url: str, since: Optional[in
             "labels": mr.get("labels") or [],
             "reviewed": (ex["first_review"] is not None) if (state == "merged" and review_known) else None,
             "source": "api", "inferred": ["ready"] + ([] if review_known else ["first_review"]),
-            "squash_sha": mr.get("squash_commit_sha"), "local": None,
+            "squash_sha": mr.get("squash_commit_sha"), "local": None, "commits_refused": commits_refused,
         })
     return result
 
@@ -1106,13 +1218,14 @@ def build_records(prs: List[PR], ctx: Dict[str, Any]) -> List[Record]:
 
     Args:
         prs: raw PRs; API PRs may be filled in (size, branch_shas) from the local commit.
-        ctx: failure_re, failure_title_start, bot_re, fp_by_sha, claimed, claims, redact and reverts,
-            as built by collect().
+        ctx: failure_re, failure_title_start, bot_re, fp_by_sha, claimed, claims, redact, reverts and
+            (optionally) graph, as built by collect().
     """
     failure_re = ctx["failure_re"]
     fp_by_sha = ctx["fp_by_sha"]
     claimed = ctx["claimed"]
     claims = ctx.get("claims") or {}
+    graph: Graph = ctx.get("graph") or {}
     records: list[Record] = []
     sha_to_pr: dict[str, Record] = {}
     for pr in prs:
@@ -1123,6 +1236,13 @@ def build_records(prs: List[PR], ctx: Dict[str, Any]) -> List[Record]:
             if len(c["parents"]) >= 2 and not pr.get("branch_shas"):
                 # merge-commit workflow: the branch commits (e.g. a revert) resolve time to restore
                 pr["branch_shas"] = claims.get(c["sha"], [])
+        local_first = False
+        if pr.get("commits_refused") and pr["first_commit"] is None and c is not None and len(c["parents"]) >= 2:
+            # The API login cannot read MR commits (a GitLab CI job token): use the merged branch's commits.
+            branch = [graph[s] for s in claims.get(c["sha"], []) if s in graph and len(graph[s][0]) < 2]
+            if branch:
+                pr["first_commit"], pr["commits"] = min(b[1] for b in branch), len(branch)
+                local_first = True
         t, scope, breaking, tsrc = classify_type(pr["title"] or "", pr.get("branch"), pr.get("labels"))
         kind = None
         if t == "revert" or REVERT_TITLE.match(pr["title"] or ""):
@@ -1171,14 +1291,16 @@ def build_records(prs: List[PR], ctx: Dict[str, Any]) -> List[Record]:
             if rec["review"] is not None:
                 rec["inferred"].append("review")
         rec["lead"] = span(pr["first_commit"], merged)
-        if rec["lead"] is not None and pr["source"] != "api":
+        if rec["lead"] is not None and (pr["source"] != "api" or local_first):
             rec["inferred"].append("lead")
+        if local_first and rec["coding"] is not None:
+            rec["inferred"].append("coding")
         deploy = claimed.get(pr.get("sha") or "")
         rec["deployed"] = deploy[0] if deploy and merged is not None else None
         rec["release"] = deploy[1] if deploy and merged is not None else None
         rec["deploy_wait"] = span(merged, rec["deployed"])
         rec["lead_to_deploy"] = span(pr["first_commit"], rec["deployed"])
-        if rec["lead_to_deploy"] is not None and pr["source"] != "api":
+        if rec["lead_to_deploy"] is not None and (pr["source"] != "api" or local_first):
             rec["inferred"].append("lead_to_deploy")  # built from the inferred first-commit time
         rec["restore"] = None
         rec["_sha"] = pr.get("sha")
@@ -1253,15 +1375,6 @@ def write_csv(path: str, records: Iterable[Record]) -> None:
             w.writerow(row)
 
 
-def resolve_token(env_names: Iterable[str], environ: Mapping[str, str]) -> Tuple[Optional[str], Optional[str]]:
-    """Return (token, variable name) from the first non-empty variable in `environ`, or (None, None)."""
-    for name in env_names:
-        v = environ.get(name)
-        if v:
-            return v.strip(), name
-    return None, None
-
-
 def parse_date(s: Optional[str]) -> Optional[int]:
     """Parse a YYYY-MM-DD date as UTC midnight in Unix seconds; empty gives None."""
     if not s:
@@ -1277,11 +1390,20 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
 
     Args:
         args: Parsed command line.
-        environ: Environment to read API tokens from; defaults to os.environ.
+        environ: Environment for the gh/glab subprocesses (PATH, their own login variables, CI variables);
+            defaults to os.environ. repo-stats never reads a credential from it.
 
     Returns:
         {"meta": ..., "prs": [record, ...], "loc": build_loc_series(...), "deploys": [...]}.
     """
+    if getattr(args, "api_url", None):
+        raise ToolError("--api-url was removed: repo-stats now calls the gh or glab CLI. For GitHub Enterprise or "
+                        "self-managed GitLab, pass --provider and --hostname HOST.")
+    if getattr(args, "token_env", None):
+        raise ToolError("--token-env was removed: gh and glab find their own login. Run `gh auth login` or "
+                        "`glab auth login`, or set GH_TOKEN / GITLAB_TOKEN for the run.")
+    if args.hostname is not None and not HOSTNAME_RE.match(args.hostname):
+        raise ToolError(f"Invalid --hostname {args.hostname!r}: give a host name such as ghe.example.com.")
     repo = os.path.abspath(args.repo)
     if run_git(repo, "rev-parse", "--is-inside-work-tree", check=False).strip() != "true" \
             and run_git(repo, "rev-parse", "--is-bare-repository", check=False).strip() != "true":
@@ -1324,60 +1446,69 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
     claims = claim_branch_commits(first_parent, graph)
 
     # Decide where PR data comes from.
+    env = os.environ if environ is None else environ
     remote = run_git(repo, "remote", "get-url", args.remote, check=False).strip()
     parsed = parse_remote(remote) if remote else None
     host_provider = detect_provider(parsed[0]) if parsed else None
-    provider = args.provider or host_provider
-    untrusted = None
-    if parsed and provider and provider != host_provider and not args.api_url:
-        # Never derive an API host from an arbitrary remote: a token would go to whoever controls it.
-        untrusted = (f"Remote host {parsed[0]} is not github.com or gitlab.com; pass --provider and --api-url "
-                     "to use its API.")
-    elif parsed and not provider and parsed[0] not in TRUSTED_HOSTS:
-        untrusted = (f"Remote host {parsed[0]} is not github.com or gitlab.com; pass --provider and --api-url "
-                     "to use its API.")
-    token_envs = [args.token_env] if args.token_env else (
-        ["GITHUB_TOKEN", "GH_TOKEN"] if provider == "github" else
-        ["GITLAB_TOKEN", "GITLAB_PRIVATE_TOKEN"] if provider == "gitlab" else [])
-    token, token_name = resolve_token(token_envs, os.environ if environ is None else environ)
+    ci = ci_server(env)
+    if parsed and not host_provider and ci and parsed[0] == ci[1]:
+        host_provider = ci[0]  # the CI server running this job, e.g. self-managed GitLab CI
+    hostname = args.hostname.lower() if args.hostname else None
+    provider = args.provider or (detect_provider(hostname) if hostname else None) or host_provider
+    api_host: Optional[str] = None
+    no_api = None
+    if hostname:
+        api_host = hostname  # chosen explicitly by the user
+        if not provider:
+            no_api = f"--hostname {hostname} needs --provider github or --provider gitlab."
+    elif parsed and provider and provider == host_provider:
+        api_host = parsed[0]
+    elif parsed and (provider or parsed[0] not in TRUSTED_HOSTS):
+        # Never take the API host from an arbitrary remote: gh and glab send environment tokens to any host.
+        no_api = (f"Remote host {parsed[0]} is not github.com or gitlab.com; pass --provider and --hostname "
+                  "to use its API.")
 
     source = args.source
     api_prs: Optional[List[PR]] = None
+    info: dict[str, int] = {}
     if source in ("auto", "api"):
-        if not parsed or not provider or untrusted:
-            msg = "No GitHub or GitLab remote was detected (use --remote, or --provider with --api-url)."
-            if untrusted:
-                msg += " " + untrusted
+        if not parsed or not provider or not api_host or no_api:
+            msg = "No GitHub or GitLab remote was detected (use --remote, or --provider with --hostname)."
+            if no_api:
+                msg += " " + no_api
             if source == "api":
                 raise ToolError(msg)
             warnings.append(msg + " PRs are inferred from git history.")
-        elif not token:
-            msg = (f"No API token found (looked for {', '.join(token_envs) or 'a token variable'}).")
-            if source == "api":
-                raise ToolError(msg)
-            warnings.append(msg + " Using PRs inferred from git history. Set a token for exact open, review and merge times.")
         else:
-            host, path = parsed
-            info: dict[str, int] = {}
+            tool = CLI_FOR[provider]
+            path = parsed[1]
             try:
-                log(f"Fetching pull requests from {provider} API (token from ${token_name}) ...")
-                if provider == "github":
-                    if "/" not in path:
-                        raise ApiError(f"Cannot read owner/name from the remote path '{path}'")
-                    owner, name = path.split("/", 1)
-                    api_url = args.api_url or "https://api.github.com"
-                    api_prs = fetch_github(owner, name, token, api_url, since, short_branch, args.all_bases, args.max_prs,
-                                           info=info)
-                else:
-                    api_url = args.api_url or "https://gitlab.com/api/v4"
-                    api_prs = fetch_gitlab(path, token, api_url, since, short_branch, args.all_bases, args.max_prs,
-                                           not args.no_reviews, info=info)
+                with Cli(tool, api_host, env) as cli:
+                    log(f"Fetching pull requests from {api_host} with `{tool} api` ...")
+                    if provider == "github":
+                        if "/" not in path:
+                            raise ApiError(f"Cannot read owner/name from the remote path '{path}'")
+                        owner, name = path.split("/", 1)
+                        api_prs = fetch_github(cli, owner, name, since, short_branch, args.all_bases, args.max_prs,
+                                               info=info)
+                    else:
+                        api_prs = fetch_gitlab(cli, path, since, short_branch, args.all_bases, args.max_prs,
+                                               not args.no_reviews, info=info)
+            except CliUnavailable as e:
+                if source == "api":
+                    raise
+                warnings.append(f"{e} PRs are inferred from git history.")
+                api_prs = None
             except (ApiError, ValueError, KeyError, TypeError, AttributeError, IndexError, OSError) as e:
                 detail = str(e) if isinstance(e, ApiError) else f"unexpected response or I/O error: {e.__class__.__name__}: {e}"
                 if source == "api":
                     raise ApiError(f"API fetch failed: {detail}")
                 warnings.append(f"API fetch failed ({detail}). Using PRs inferred from git history instead.")
                 api_prs = None
+            if info.get("commits_refused"):
+                warnings.append("The GitLab login cannot read merge request commits (a CI job token cannot). "
+                                "First-commit times come from local merge commits where there is one, and are "
+                                "empty for squash-merged MRs. Use a read_api token for exact values.")
             if info.get("detail_errors"):
                 warnings.append(f"{info['detail_errors']} merge request(s) had commit or review lookups fail. "
                                 "Their coding time, lead time and review status are left empty, not guessed.")
@@ -1398,8 +1529,8 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
         mode = "git"
         if not prs:
             warnings.append("No pull requests could be inferred from git history. This usually means rebase or "
-                            "fast-forward merges with no PR number in the commit message. Use the API (set a token) "
-                            "or --commits-as-prs.")
+                            "fast-forward merges with no PR number in the commit message. Use the API (install and "
+                            "log in to gh or glab) or --commits-as-prs.")
         if deploys == [] and args.deploy_source == "tags":
             warnings.append("No release tags matched, so deployment frequency and lead time to deploy are empty. "
                             "Adjust --tag-pattern or use --deploy-source merges.")
@@ -1414,7 +1545,7 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
     records = build_records(prs, {
         "failure_re": failure_re, "failure_title_start": args.failure_pattern is None,
         "bot_re": bot_re, "fp_by_sha": fp_by_sha, "claimed": claimed, "claims": claims,
-        "redact": args.no_titles, "reverts": load_reverts(repo, branch),
+        "redact": args.no_titles, "reverts": load_reverts(repo, branch), "graph": graph,
     })
     if args.exclude_bots:
         records = [r for r in records if not r["bot"]]
@@ -1472,8 +1603,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="repo_stats.py",
         description="Generate a self-contained HTML dashboard of code statistics for a git repository.",
-        epilog="Environment: GITHUB_TOKEN / GH_TOKEN or GITLAB_TOKEN / GITLAB_PRIVATE_TOKEN enable exact PR data. "
-               "Tokens are read from the environment only and are never written to the output.",
+        epilog="Exact PR data comes from the gh (GitHub) or glab (GitLab) CLI, using its own login "
+               "(gh auth login / glab auth login, or GH_TOKEN / GITLAB_TOKEN in CI). repo-stats never reads a "
+               "token and only sends read requests. Without the CLI, PRs are inferred from git history.",
     )
     p.add_argument("repo", nargs="?", default=".", help="path to a local git checkout (default: .)")
     p.add_argument("-o", "--out", default="repo-stats.html", help="output HTML file (default: repo-stats.html)")
@@ -1486,10 +1618,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--until", metavar="YYYY-MM-DD", help="only include PRs merged (or opened) on or before this UTC date (inclusive)")
     g = p.add_argument_group("PR data source")
     g.add_argument("--source", choices=["auto", "git", "api"], default="auto",
-                   help="auto uses the API when a token is available, otherwise infers PRs from git (default: auto)")
+                   help="auto uses the API through gh/glab when available, otherwise infers PRs from git (default: auto)")
     g.add_argument("--provider", choices=["github", "gitlab"], help="hosting provider (default: detected from the remote)")
-    g.add_argument("--api-url", help="API base URL for self-hosted servers, e.g. https://host/api/v4 (GitLab) or https://host/api (GitHub Enterprise)")
-    g.add_argument("--token-env", metavar="NAME", help="environment variable that holds the API token")
+    g.add_argument("--hostname", metavar="HOST", help="GitHub Enterprise or self-managed GitLab host to query with gh/glab "
+                   "(use with --provider). The default is github.com or gitlab.com, taken from the remote")
+    g.add_argument("--api-url", help=argparse.SUPPRESS)    # removed: explains --hostname
+    g.add_argument("--token-env", help=argparse.SUPPRESS)  # removed: gh/glab find their own login
     g.add_argument("--no-reviews", action="store_true", help="GitLab: skip per-MR review lookups (faster, fewer API calls)")
     g.add_argument("--all-bases", action="store_true", help="include PRs that target branches other than the analysed one")
     g.add_argument("--max-prs", type=positive_int, metavar="N", help="stop after N PRs (newest first)")

@@ -262,7 +262,7 @@ def build_api_data() -> dict[str, Any]:
         nodes.append(node)
     nodes.sort(key=lambda n: n["createdAt"], reverse=True)
     with ms.MockServer(ms.github_handler(nodes, page_size=40)) as srv:
-        data, _ = collect(work, "--api-url", srv.url, env={"GITHUB_TOKEN": FAKE})
+        data, _ = collect(work, "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
     return data
 
 

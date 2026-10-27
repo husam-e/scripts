@@ -20,32 +20,64 @@ import fixtures  # noqa: E402
 import repo_stats as rs  # noqa: E402
 
 SCRIPT = str(ROOT / "repo_stats.py")
-TOKEN_VARS = ("GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "GITLAB_PRIVATE_TOKEN")
 CACHE = Path(tempfile.gettempdir()) / "repostats-test-cache"
+# Fake gh and glab (see fake_cli/_fake.py). clean_env() puts them first on PATH, so no test can reach a
+# real CLI, a real login or the network.
+FAKE_CLI_DIR = HERE / "fake_cli"
+# Credentials, CI markers and fake-CLI settings from the developer's shell never leak into a test.
+STRIP_VARS = rs.CREDENTIAL_VARS + ("GITLAB_CI", "GITHUB_ACTIONS", "CI_SERVER_HOST", "GITHUB_SERVER_URL",
+                                   "GLAB_ENABLE_CI_AUTOLOGIN", "GH_HOST", "GITLAB_HOST", "GH_CONFIG_DIR",
+                                   "GLAB_CONFIG_DIR", "REPO_STATS_FAKE_URL", "REPO_STATS_FAKE_LOG")
+# Test-only pseudo-option for run_cli() and collect(): `--fake-api URL` is removed from the argv and points
+# the fake gh/glab at the mock server at URL.
+FAKE_API = "--fake-api"
 
 
 def clean_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Return a copy of os.environ without API tokens, plus `extra`."""
-    env = {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
+    """Return os.environ without credentials or CI markers, with the fake CLIs first on PATH, plus `extra`."""
+    env = {k: v for k, v in os.environ.items() if k not in STRIP_VARS}
+    env["PATH"] = os.pathsep.join([str(FAKE_CLI_DIR), env.get("PATH", os.defpath)])
     env.update(extra or {})
     return env
 
 
+def _split_fake_api(args: Iterable[object], env: Mapping[str, str] | None) -> tuple[list[str], dict[str, str]]:
+    """Remove `--fake-api URL` from args and return (args, env with REPO_STATS_FAKE_URL set)."""
+    out: list[str] = []
+    env = dict(env or {})
+    it = iter(map(str, args))
+    for a in it:
+        if a == FAKE_API:
+            env["REPO_STATS_FAKE_URL"] = next(it)
+        else:
+            out.append(a)
+    return out, env
+
+
 def run_cli(args: Iterable[object], env: Mapping[str, str] | None = None, timeout: float = 120,
             cwd: str | Path | None = None) -> subprocess.CompletedProcess[str]:
-    """Run the CLI as a subprocess with real tokens stripped. Returns CompletedProcess."""
-    return subprocess.run([sys.executable, SCRIPT, *map(str, args)], capture_output=True, text=True,
+    """Run the CLI as a subprocess with real credentials stripped. Returns CompletedProcess."""
+    argv, env = _split_fake_api(args, env)
+    return subprocess.run([sys.executable, SCRIPT, *argv], capture_output=True, text=True,
                           env=clean_env(env), timeout=timeout, cwd=cwd)
 
 
 def collect(repo: fixtures.Repo | str | Path, *extra: str, env: Mapping[str, str] | None = None) -> tuple[dict[str, Any], str]:
     """In-process collect() with stderr swallowed. Returns (data, stderr_text)."""
     path = getattr(repo, "path", repo)
-    args = rs.build_parser().parse_args([str(path), *extra])
+    argv, env = _split_fake_api(extra, env)
+    args = rs.build_parser().parse_args([str(path), *argv])
     buf = io.StringIO()
     with contextlib.redirect_stderr(buf):
         data = rs.collect(args, environ=clean_env(env))
     return data, buf.getvalue()
+
+
+def cli_calls(log: str | Path) -> list[dict[str, Any]]:
+    """Read the fake CLI call log written through REPO_STATS_FAKE_LOG."""
+    import json
+    p = Path(log)
+    return [json.loads(line) for line in p.read_text().splitlines()] if p.exists() else []
 
 
 def by_number(data: Mapping[str, Any]) -> dict[int, dict[str, Any]]:
