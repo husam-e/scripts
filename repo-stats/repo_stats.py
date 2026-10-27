@@ -13,6 +13,7 @@ Python 3.8+, standard library only. Run `repo_stats.py --help` for usage.
 from __future__ import annotations
 
 import argparse
+import calendar
 import collections
 import concurrent.futures
 import csv
@@ -1375,14 +1376,45 @@ def write_csv(path: str, records: Iterable[Record]) -> None:
             w.writerow(row)
 
 
-def parse_date(s: Optional[str]) -> Optional[int]:
-    """Parse a YYYY-MM-DD date as UTC midnight in Unix seconds; empty gives None."""
-    if not s:
+WHEN_DATE = re.compile(r"^\d{4}(?:-\d{2}(?:-\d{2})?)?$")
+WHEN_DURATION = re.compile(r"^([1-9]\d*)([dwmy])$")
+
+
+def add_months(t: dt.datetime, n: int) -> dt.datetime:
+    """Return t moved by n calendar months, clamping the day (Mar 31 - 1 month = Feb 28/29)."""
+    y, m = divmod(t.year * 12 + t.month - 1 + n, 12)
+    return t.replace(year=y, month=m + 1, day=min(t.day, calendar.monthrange(y, m + 1)[1]))
+
+
+def parse_when(value: Optional[str], flag: str, end: bool, now: Optional[dt.datetime] = None) -> Optional[int]:
+    """Parse a --since/--until value into Unix seconds; None or "" gives None.
+
+    YYYY-MM-DD, YYYY-MM and YYYY name a UTC day, month or year. The result is its first moment, or with
+    `end` the first moment after it, so `--until 2025-07` includes all of July. A duration (90d, 6w, 6m, 1y)
+    counts back from now.
+    """
+    if not value:
         return None
-    try:
-        return int(dt.datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc).timestamp())
-    except ValueError:
-        raise ToolError(f"Invalid date '{s}'. Use YYYY-MM-DD.")
+    v = value.strip().lower()
+    now = now or dt.datetime.now(dt.timezone.utc)
+    m = WHEN_DURATION.match(v)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        if unit in "dw":
+            return int((now - dt.timedelta(days=n * (7 if unit == "w" else 1))).timestamp())
+        return int(add_months(now, -n * (12 if unit == "y" else 1)).timestamp())
+    if WHEN_DATE.match(v):
+        fmt = {4: "%Y", 7: "%Y-%m", 10: "%Y-%m-%d"}[len(v)]
+        try:
+            t = dt.datetime.strptime(v, fmt).replace(tzinfo=dt.timezone.utc)
+        except ValueError:
+            pass
+        else:
+            if end:
+                t = t + dt.timedelta(days=1) if len(v) == 10 else add_months(t, 1 if len(v) == 7 else 12)
+            return int(t.timestamp())
+    raise ToolError(f"Invalid date '{value}' for {flag}. Use YYYY-MM-DD, YYYY-MM, YYYY (UTC), "
+                    "or a duration back from now such as 90d, 6w, 6m or 1y.")
 
 
 def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
@@ -1416,8 +1448,10 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
     if run_git(repo, "rev-parse", "--is-shallow-repository", check=False).strip() == "true":
         warnings.append("This is a shallow clone. History, lines of code over time and timings are incomplete. "
                         "Run `git fetch --unshallow` for full results.")
-    since = parse_date(args.since)
-    until = parse_date(args.until)
+    since = parse_when(args.since, "--since", end=False)
+    until = parse_when(args.until, "--until", end=True)  # exclusive: the first moment after the period
+    if since is not None and until is not None and since >= until:
+        raise ToolError(f"--since {args.since} is not before --until {args.until}.")
 
     excludes = [] if args.no_default_excludes else list(DEFAULT_EXCLUDES)
     excludes += args.exclude or []
@@ -1537,8 +1571,8 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
 
     if since:
         prs = [p for p in prs if (p["merged"] or p["created"] or 0) >= since]
-    if until:  # --until is inclusive of that whole UTC day
-        prs = [p for p in prs if (p["merged"] or p["created"] or 0) < until + 86400]
+    if until:
+        prs = [p for p in prs if (p["merged"] or p["created"] or 0) < until]
     if args.max_prs and mode == "git":
         prs = prs[-args.max_prs:]
 
@@ -1554,7 +1588,7 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
     if since:
         deploys = [d for d in deploys if d["t"] >= since]
     if until:
-        deploys = [d for d in deploys if d["t"] < until + 86400]
+        deploys = [d for d in deploys if d["t"] < until]
     # Mark deploy as failure-related when it contains a revert/hotfix PR.
     fail_releases = {r["release"] for r in records if r["kind"] and r["release"]}
     for d in deploys:
@@ -1614,8 +1648,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--title", help="name shown in the dashboard (default: repository name)")
     p.add_argument("--branch", help="branch to analyse (default: the remote's default branch)")
     p.add_argument("--remote", default="origin", help="remote used to find the hosting provider (default: origin)")
-    p.add_argument("--since", metavar="YYYY-MM-DD", help="only include PRs merged (or opened, if unmerged) on or after this UTC date")
-    p.add_argument("--until", metavar="YYYY-MM-DD", help="only include PRs merged (or opened) on or before this UTC date (inclusive)")
+    p.add_argument("--since", metavar="WHEN", help="only include PRs merged (or opened, if unmerged) from WHEN: a UTC date "
+                   "(2025-01-15), month (2025-01) or year (2025), or a duration back from now (90d, 6w, 6m, 1y)")
+    p.add_argument("--until", metavar="WHEN", help="only include PRs merged (or opened) up to the end of WHEN, same formats "
+                   "(--until 2025-07 includes all of July)")
     g = p.add_argument_group("PR data source")
     g.add_argument("--source", choices=["auto", "git", "api"], default="auto",
                    help="auto uses the API through gh/glab when available, otherwise infers PRs from git (default: auto)")

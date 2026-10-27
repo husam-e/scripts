@@ -33,6 +33,10 @@ python3 repo-stats/repo_stats.py /path/to/your/repo --serve     # builds the das
 # exact PR data: log in to gh or glab once (skip this if you already use them)
 gh auth login              # or: glab auth login
 python3 repo-stats/repo_stats.py /path/to/repo -o stats.html
+
+# a time window: January to July 2025, or the last year
+python3 repo-stats/repo_stats.py /path/to/repo --since 2025-01 --until 2025-07
+python3 repo-stats/repo_stats.py /path/to/repo --since 1y
 ----
 
 No tokens or environment variables are needed: repo-stats asks `gh` or `glab` for the data, and they use their own login.
@@ -236,7 +240,7 @@ The Elite, High, Medium and Low bands use rounded thresholds from published DORA
 [cols="1,3"]
 |===
 | `--branch REF` | Branch to analyse. The default is the remote's default branch.
-| `--since / --until YYYY-MM-DD` | Limit the PR window. Lines of code still use full history.
+| `--since / --until WHEN` | Limit the PR window. WHEN is a UTC date (`2025-01-15`), month (`2025-01`) or year (`2025`), or a duration back from now (`90d`, `6w`, `6m`, `1y`). `--until` includes the whole day, month or year it names. Lines of code still use full history.
 | `--exclude-bots` | Drop PRs from bots (Dependabot, Renovate, `[bot]` accounts).
 | `--no-titles` | Replace PR titles and scopes with numbers before sharing the file.
 | `--json FILE`, `--csv FILE` | Export the raw data.

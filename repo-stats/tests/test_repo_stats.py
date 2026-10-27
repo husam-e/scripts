@@ -544,6 +544,51 @@ class A11_Options(unittest.TestCase):
         d, _ = collect(r, "--until", "2022-01-06")
         self.assertEqual(len(d["prs"]), 1)
 
+    def test_month_and_year_windows(self) -> None:
+        """YYYY-MM and YYYY cover whole UTC months and years: --until includes the last second, not the next."""
+        r = Repo()
+        r.commit("chore: init", {"a.py": lines(2)})
+        for n, when in ((1, T0 + 30 * DAY + DAY - 1),   # 2022-01-31T23:59:59Z
+                        (2, T0 + 31 * DAY),             # 2022-02-01T00:00:00Z
+                        (3, T0 + 365 * DAY - 1),        # 2022-12-31T23:59:59Z
+                        (4, T0 + 365 * DAY)):           # 2023-01-01T00:00:00Z
+            r.clock = when
+            r.squash_pr(n, f"feat: pr {n}", {f"f{n}.py": lines(2)})
+        nums = lambda *a: [p["number"] for p in collect(r, *a)[0]["prs"]]  # noqa: E731
+        self.assertEqual(nums("--until", "2022-01"), [1])
+        self.assertEqual(nums("--since", "2022-02"), [2, 3, 4])
+        self.assertEqual(nums("--since", "2022-02", "--until", "2022-12"), [2, 3])
+        self.assertEqual(nums("--since", "2022", "--until", "2022"), [1, 2, 3])
+        self.assertEqual(nums("--since", "2023"), [4])
+        self.assertEqual(nums("--since", "2022-01-31", "--until", "2022-02-01"), [1, 2])
+
+    def test_durations_count_back_from_now(self) -> None:
+        """90d, 6w, 6m and 1y count back from now in UTC; months clamp to the month's last day."""
+        now = rs.dt.datetime(2025, 3, 31, 12, tzinfo=rs.dt.timezone.utc)
+        iso = lambda v: rs.dt.datetime.fromtimestamp(rs.parse_when(v, "--since", False, now), rs.dt.timezone.utc).isoformat()  # noqa: E731
+        self.assertEqual(iso("1y"), "2024-03-31T12:00:00+00:00")
+        self.assertEqual(iso("1m"), "2025-02-28T12:00:00+00:00")
+        self.assertEqual(iso("13m"), "2024-02-29T12:00:00+00:00")
+        self.assertEqual(iso("6w"), "2025-02-17T12:00:00+00:00")
+        self.assertEqual(iso("90d"), "2024-12-31T12:00:00+00:00")
+        self.assertEqual(iso("1Y"), iso("12m"))
+        self.assertEqual(rs.parse_when("2024-02", "--until", True, now), rs.parse_when("2024-03", "--since", False, now))
+
+    def test_relative_window_in_a_run(self) -> None:
+        """--since 1y drops PRs from 2022; a long enough duration keeps them all; --until 1d keeps them too."""
+        d, _ = collect(merge_repo(), "--since", "1y")
+        self.assertEqual(d["prs"], [])
+        self.assertEqual(d["deploys"], [])
+        d, _ = collect(merge_repo(), "--since", "100y", "--until", "1d")
+        self.assertEqual([p["number"] for p in d["prs"]], [1, 2, 3, 4, 5])
+
+    def test_since_must_be_before_until(self) -> None:
+        """An empty or reversed window is an error, not an empty dashboard."""
+        for since, until in (("2025-07", "2025-01"), ("2025-03-01", "2025-02-28"), ("2025-08", "2025-07")):
+            with self.assertRaises(rs.ToolError, msg=(since, until)):
+                collect(merge_repo(), "--since", since, "--until", until)
+        collect(merge_repo(), "--since", "2025-07", "--until", "2025-07")  # one whole month is fine
+
     def test_since_excludes_earlier_day(self) -> None:
         """--since drops PRs merged the day before."""
         r = Repo()
@@ -1894,7 +1939,7 @@ class E1_Cli(unittest.TestCase):
         """Invalid dates exit 1 with a clear error."""
         r = merge_repo().path
         for flag in ("--since", "--until"):
-            for bad in ("2022-13-45", "yesterday", "2022/01/01"):
+            for bad in ("2022-13-45", "yesterday", "2022/01/01", "2022-1-5", "0d", "1q", "22", "2022-02-30"):
                 p = run_cli([r, "-o", tmpdir() / "o.html", flag, bad])
                 self.assertEqual(p.returncode, 1, (flag, bad))
                 self.assertIn("Invalid date", p.stderr)
