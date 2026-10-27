@@ -6,7 +6,6 @@ forward to 127.0.0.1 mock servers, with fake tokens.
 """
 from __future__ import annotations
 
-import argparse
 import ast
 import contextlib
 import csv
@@ -1129,19 +1128,6 @@ class B1_GitHub(unittest.TestCase):
         self.assertEqual(len(self.srv.requests), n)
         self.assertEqual(d["meta"]["mode"], "git")
 
-    def test_removed_flags_explain_the_replacement(self) -> None:
-        """--api-url and --token-env fail with a message that names the replacement."""
-        with self.assertRaises(rs.ToolError) as cm:
-            collect(self.r, "--api-url", "https://api.github.com", env={"GITHUB_TOKEN": FAKE})
-        self.assertIn("--hostname", str(cm.exception))
-        with self.assertRaises(rs.ToolError) as cm:
-            collect(self.r, "--token-env", "MY_TOKEN", env={"MY_TOKEN": FAKE})
-        self.assertIn("gh auth login", str(cm.exception))
-        p = run_cli([self.r.path, "-o", tmpdir() / "o.html", "--api-url", "https://x.example/api"])
-        self.assertEqual(p.returncode, 1)
-        self.assertIn("--api-url was removed", p.stderr)
-        self.assertNotIn("Traceback", p.stderr)
-
 
 def gitlab_fixture(r: Repo) -> tuple[list[dict[str, Any]], dict[int, list[dict[str, Any]]],
                               dict[int, list[dict[str, Any]]]]:
@@ -1914,8 +1900,6 @@ class E1_Cli(unittest.TestCase):
         p = run_cli(["--help"])
         self.assertEqual(p.returncode, 0)
         for action in rs.build_parser()._actions:
-            if action.help == argparse.SUPPRESS:  # removed flags kept only to explain their replacement
-                continue
             for opt in action.option_strings:
                 self.assertIn(opt, p.stdout, opt)
 

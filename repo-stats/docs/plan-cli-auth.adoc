@@ -10,7 +10,7 @@ Status: implemented on this branch. The README's "Logging in" and "Security" sec
 * *GitLab paging still follows `X-Next-Page`*, read from the `--include` headers, instead of stopping on a short page. The per-MR commit and note paging added in `31a6c9e` is kept.
 * *The job-token check is one probe.* Before the per-MR lookups, one commits request decides whether the login can read MR commits. On 401/403/404, no more commits are requested, PRs are marked `commits_refused`, and `build_records` takes the first commit from the local merge commit's branch, marking `coding`, `lead` and `lead_to_deploy` as inferred.
 * *The fake CLIs forward to the existing mock servers.* `tests/fake_cli/gh` and `glab` turn each call into one HTTP request to the mock server, find tokens the way the real CLIs do, and reject any flag outside the allowlist. `helpers.clean_env()` always puts them first on `PATH`, so no test can reach a real CLI or login.
-* *`--api-url` and `--token-env` still parse* (hidden from `--help`) so that using them fails with a message naming the replacement.
+* *`--api-url` and `--token-env` are removed outright*, with no compatibility handling.
 * *`run.sh` was added* for read-only tokens kept in the OS keychain (see the README).
 * *The read-only allowlist and `--hostname` validation* are enforced in `Cli`, and the G1/G2/H1 tests pin them.
 
@@ -218,7 +218,6 @@ A fixed backoff replaces it.
 . Port `fetch_gitlab` to `run_cli`, including the job-token fallback for commits. Port the `B2_GitLab` tests.
 . Replace the host and token logic in `collect()` with the host-selection rules above, and add `--hostname`.
   Remove `--token-env` and `--api-url`.
-  Since the tool is at 0.1.0, make them hard errors that explain the new flag rather than keeping aliases.
 . Strip credential variables from git subprocess environments.
 . Replace `B3_Tokens` with tests that assert:
 ** every CLI call has `--hostname`, uses no `-F`, `--input`, `--form` or placeholder syntax, and runs from a cwd outside the repository.

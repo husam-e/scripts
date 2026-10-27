@@ -1428,12 +1428,6 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
     Returns:
         {"meta": ..., "prs": [record, ...], "loc": build_loc_series(...), "deploys": [...]}.
     """
-    if getattr(args, "api_url", None):
-        raise ToolError("--api-url was removed: repo-stats now calls the gh or glab CLI. For GitHub Enterprise or "
-                        "self-managed GitLab, pass --provider and --hostname HOST.")
-    if getattr(args, "token_env", None):
-        raise ToolError("--token-env was removed: gh and glab find their own login. Run `gh auth login` or "
-                        "`glab auth login`, or set GH_TOKEN / GITLAB_TOKEN for the run.")
     if args.hostname is not None and not HOSTNAME_RE.match(args.hostname):
         raise ToolError(f"Invalid --hostname {args.hostname!r}: give a host name such as ghe.example.com.")
     repo = os.path.abspath(args.repo)
@@ -1658,8 +1652,6 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--provider", choices=["github", "gitlab"], help="hosting provider (default: detected from the remote)")
     g.add_argument("--hostname", metavar="HOST", help="GitHub Enterprise or self-managed GitLab host to query with gh/glab "
                    "(use with --provider). The default is github.com or gitlab.com, taken from the remote")
-    g.add_argument("--api-url", help=argparse.SUPPRESS)    # removed: explains --hostname
-    g.add_argument("--token-env", help=argparse.SUPPRESS)  # removed: gh/glab find their own login
     g.add_argument("--no-reviews", action="store_true", help="GitLab: skip per-MR review lookups (faster, fewer API calls)")
     g.add_argument("--all-bases", action="store_true", help="include PRs that target branches other than the analysed one")
     g.add_argument("--max-prs", type=positive_int, metavar="N", help="stop after N PRs (newest first)")
