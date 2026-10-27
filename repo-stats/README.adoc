@@ -34,7 +34,7 @@ python3 repo-stats/repo_stats.py /path/to/your/repo --serve     # builds the das
 gh auth login              # or: glab auth login
 python3 repo-stats/repo_stats.py /path/to/repo -o stats.html
 
-# a time window: January to July 2025, or the last year
+# only PRs from January to July 2025, or from the last year (see "Time window")
 python3 repo-stats/repo_stats.py /path/to/repo --since 2025-01 --until 2025-07
 python3 repo-stats/repo_stats.py /path/to/repo --since 1y
 ----
@@ -63,29 +63,53 @@ Repositories that rebase-merge with no PR number in the message show few or no P
 Lines of code, churn and release data always come from the local clone.
 A shallow clone gives incomplete history, and the dashboard warns about it. Run `git fetch --unshallow` first.
 
+== Time window
+
+`--since` and `--until` limit the PRs (by merge time, or open time if unmerged) and the releases on the dashboard.
+Lines of code over time always use the full history.
+Both options are optional, and you can use either one alone.
+
+[cols="1,2,2"]
+|===
+| Value | Meaning for `--since` | Meaning for `--until`
+
+| `YYYY-MM-DD`, e.g. `2025-01-15` | from the start of that day | to the end of that day
+| `YYYY-MM`, e.g. `2025-07` | from the first day of that month | to the end of that month
+| `YYYY`, e.g. `2025` | from 1 January | to the end of 31 December
+| `Nd`, `Nw`, `Nm`, `Ny`, e.g. `90d`, `6w`, `6m`, `1y` | from N days, weeks, months or years ago | up to N days, weeks, months or years ago
+|===
+
+* Dates are in UTC. Write them in full, with leading zeros: `2025-01-05`, not `2025-1-5`.
+* `N` is a whole number of at least 1. Months and years are calendar months back from now: one month before 31 March is 28 (or 29) February.
+* `--since` must be before `--until`, otherwise the run stops with an error.
+
+[source,sh]
+----
+--since 2025-01 --until 2025-07        # 1 January to 31 July 2025
+--since 2025 --until 2025              # all of 2025
+--since 2025-03-15 --until 2025-03-31  # second half of March 2025
+--since 1y                             # the last 12 months
+--since 90d                            # the last 90 days
+--since 2y --until 1y                  # the year before last
+----
+
 == Logging in
 
 repo-stats never reads, stores or sends a token. `gh` and `glab` find their own login, in this order: an environment variable (`GH_TOKEN`, `GITLAB_TOKEN`), then the login saved by `gh auth login` or `glab auth login` (in the OS keychain where there is one).
 
 === On your machine
 
-`gh auth login` and `glab auth login` are the simplest choice.
-Their tokens can write to your repositories, though repo-stats only ever reads (see <<read-only>>).
-To give repo-stats a token that cannot write, keep a read-only token in the OS keychain with `run.sh`:
+Use the login you already have, or run `gh auth login` / `glab auth login` once. Nothing else is needed.
+If neither CLI is installed or logged in, repo-stats prints a warning and uses local git history instead.
+
+Those logins can write to your repositories, though repo-stats only ever reads (see <<read-only>>).
+To run with a read-only token instead (a GitHub fine-grained token with read-only Contents and Pull requests, or a GitLab token with only `read_api`), give it to the CLI for one run, for example from a password manager, so it never appears in shell history:
 
 [source,sh]
 ----
-repo-stats/run.sh --store github                         # opens GitHub's token page with read-only permissions filled in
-repo-stats/run.sh --store gitlab --project grp/proj      # glab creates a read_api project token, or opens the token page
-repo-stats/run.sh /path/to/repo --serve                  # every run: same options as repo_stats.py
-repo-stats/run.sh --forget github                        # delete the saved token
+GH_TOKEN="$(op read op://Private/gh-readonly/token)" python3 repo-stats/repo_stats.py /path/to/repo
 ----
 
-On GitHub, choose "Only select repositories" on the token page and pick the repositories to analyse.
-GitLab.com project tokens need Premium or Ultimate and the Maintainer role; otherwise `run.sh` opens the personal token page with only `read_api` selected.
-You paste the token at a hidden prompt. It is never shown, never passed as a command argument and never written to shell history or a file.
-Each run hands it to `gh` or `glab` for that run only, and repo-stats removes it from the environment of the git commands it runs.
-`run.sh` uses the macOS Keychain or, on Linux, the Secret Service (`secret-tool`, package `libsecret-tools`).
 Do not load a read-only token with `gh auth login --with-token`: gh keeps one keychain entry per host and account, so it would replace your normal login.
 
 === GitHub Actions
@@ -240,7 +264,7 @@ The Elite, High, Medium and Low bands use rounded thresholds from published DORA
 [cols="1,3"]
 |===
 | `--branch REF` | Branch to analyse. The default is the remote's default branch.
-| `--since / --until WHEN` | Limit the PR window. WHEN is a UTC date (`2025-01-15`), month (`2025-01`) or year (`2025`), or a duration back from now (`90d`, `6w`, `6m`, `1y`). `--until` includes the whole day, month or year it names. Lines of code still use full history.
+| `--since / --until WHEN` | Limit the PR window: a UTC date, month or year (`2025-01-15`, `2025-01`, `2025`) or a duration back from now (`90d`, `6w`, `6m`, `1y`). See <<Time window>>.
 | `--exclude-bots` | Drop PRs from bots (Dependabot, Renovate, `[bot]` accounts).
 | `--no-titles` | Replace PR titles and scopes with numbers before sharing the file.
 | `--json FILE`, `--csv FILE` | Export the raw data.

@@ -12,9 +12,6 @@ Credentials are found as the real CLIs find them: gh reads GH_TOKEN, then GITHUB
 and *.ghe.com, and GH_ENTERPRISE_TOKEN / GITHUB_ENTERPRISE_TOKEN for any other host; glab reads
 GITLAB_TOKEN, GITLAB_ACCESS_TOKEN or OAUTH_TOKEN, and with GLAB_ENABLE_CI_AUTOLOGIN=true in GitLab CI
 (GITLAB_CI=true) it sends CI_JOB_TOKEN as JOB-TOKEN.
-
-`glab token create ...` (used only by run.sh --store) prints REPO_STATS_FAKE_NEW_TOKEN and exits 0 when
-that variable is set, and fails like a GitLab.com Free project otherwise.
 """
 from __future__ import annotations
 
@@ -86,13 +83,6 @@ def _first(*names: str) -> Optional[str]:
 def main(tool: str, argv: List[str]) -> int:
     """Run one fake CLI call and return its exit status."""
     _log(tool, argv)
-    if tool == "glab" and argv[:2] == ["token", "create"]:
-        new = os.environ.get("REPO_STATS_FAKE_NEW_TOKEN")
-        if new:
-            print(new)
-            return 0
-        print("glab: 403 Forbidden (HTTP 403)", file=sys.stderr)
-        return 1
     try:
         endpoint, host, fields = _parse(tool, argv)
     except (Usage, StopIteration) as e:

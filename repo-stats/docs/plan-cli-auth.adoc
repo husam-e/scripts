@@ -11,8 +11,7 @@ Status: implemented on this branch. The README's "Logging in" and "Security" sec
 * *The job-token check is one probe.* Before the per-MR lookups, one commits request decides whether the login can read MR commits. On 401/403/404, no more commits are requested, PRs are marked `commits_refused`, and `build_records` takes the first commit from the local merge commit's branch, marking `coding`, `lead` and `lead_to_deploy` as inferred.
 * *The fake CLIs forward to the existing mock servers.* `tests/fake_cli/gh` and `glab` turn each call into one HTTP request to the mock server, find tokens the way the real CLIs do, and reject any flag outside the allowlist. `helpers.clean_env()` always puts them first on `PATH`, so no test can reach a real CLI or login.
 * *`--api-url` and `--token-env` are removed outright*, with no compatibility handling.
-* *`run.sh` was added* for read-only tokens kept in the OS keychain (see the README).
-* *The read-only allowlist and `--hostname` validation* are enforced in `Cli`, and the G1/G2/H1 tests pin them.
+* *The read-only allowlist and `--hostname` validation* are enforced in `Cli`, and the G1/G2 tests pin them.
 
 toc::[]
 
