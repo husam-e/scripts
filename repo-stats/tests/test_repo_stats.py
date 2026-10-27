@@ -1326,6 +1326,17 @@ class B3_CliLogin(unittest.TestCase):
         with self.assertRaises(rs.CliUnavailable):
             collect(r, "--source", "api", env={"PATH": str(empty)})
 
+    def test_missing_cli_warns_on_the_command_line(self) -> None:
+        """Without gh on PATH, the run prints a warning, uses local git history and says so."""
+        r = api_repo()
+        empty = tmpdir()
+        git_dir = Path(subprocess.run(["sh", "-c", "command -v git"], capture_output=True, text=True).stdout.strip()).parent
+        p = run_cli([r.path, "-o", tmpdir() / "o.html"], env={"PATH": os.pathsep.join([str(empty), str(git_dir)])})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("warning: gh is not installed", p.stderr)
+        self.assertIn("PRs are inferred from git history", p.stderr)
+        self.assertIn("source: git", p.stderr)
+
     def test_collect_passes_given_environ_to_the_cli(self) -> None:
         """collect() runs gh with its environ argument, not os.environ."""
         nodes = github_nodes(fixtures.merge_workflow_repo())
