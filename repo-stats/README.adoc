@@ -1,0 +1,148 @@
+= repo-stats
+
+Generate a self-contained HTML dashboard of code statistics for any git repository.
+
+* Lines of code over time, in total and by language, plus monthly churn.
+* Pull request (or merge request) volume per day, week and month.
+* PR size: lines, files and commits.
+* PR type, read from Conventional Commit titles.
+* A transparent risk score for each PR.
+* Time per PR: coding, pickup, review, open to merge, lead time and merge to release.
+* DORA metrics: deployment frequency, lead time for changes, change failure rate and time to restore.
+
+Every metric shows count, mean, median, p75, p90, p95, p99, min, max and standard deviation.
+Where a distribution matters, the dashboard adds a histogram and a cumulative frequency chart.
+
+.Overview in the default dark theme (synthetic example repository)
+image::docs/dashboard-dark.png[Dashboard overview in dark theme: KPIs, lines of code over time and monthly churn]
+
+.PR size section in the light theme
+image::docs/dashboard-light.png[PR size statistics, histogram, cumulative frequency and size buckets in light theme]
+
+The tool is one Python file plus one HTML template. It needs Python 3.8 or newer and git, and nothing else.
+The output is a single HTML file. It works offline, and you can mail it, attach it or host it anywhere.
+
+== Quick start
+
+[source,sh]
+----
+# from a clone of this repository
+python3 repo-stats/repo_stats.py /path/to/your/repo -o stats.html
+open stats.html            # or xdg-open on Linux
+
+# exact PR data from GitHub (recommended)
+GITHUB_TOKEN=$(gh auth token) python3 repo-stats/repo_stats.py /path/to/repo
+
+# exact MR data from GitLab
+GITLAB_TOKEN=glpat-... python3 repo-stats/repo_stats.py /path/to/repo
+
+# serve it locally and open a browser
+python3 repo-stats/repo_stats.py /path/to/repo --serve
+----
+
+Run `repo_stats.py --help` for every flag.
+
+== Where the data comes from
+
+Git has no record of pull requests. The tool has two sources and says on the dashboard which one it used.
+
+API (recommended)::
+With a token, the tool reads PRs from the GitHub GraphQL API or the GitLab REST API.
+Open, ready-for-review, first review and merge times are then exact.
+Tokens are read from the environment only (`GITHUB_TOKEN`, `GH_TOKEN`, `GITLAB_TOKEN`, `GITLAB_PRIVATE_TOKEN`, or the variable named by `--token-env`).
+They are never written to any output.
+A token is sent automatically only to `github.com` and `gitlab.com`.
+For GitHub Enterprise or self-hosted GitLab, pass `--provider` and `--api-url`.
+
+Git only (fallback)::
+Without a token, PRs are inferred from history.
+A PR is a merge commit on the branch, or a squash commit whose subject ends in `(#123)` or whose body names a merge request.
+GitHub, GitLab and Bitbucket message formats are recognised.
+Open and review times do not exist in git, so those metrics are empty.
+Coding and review time fall back to labelled proxies: first to last branch commit, and last commit to merge.
+Repositories that rebase-merge with no PR number in the message show few or no PRs. Use the API, or pass `--commits-as-prs`.
+
+Lines of code, churn and release data always come from the local clone.
+A shallow clone gives incomplete history, and the dashboard warns about it. Run `git fetch --unshallow` first.
+
+== Security
+
+Tokens are read from the environment only and are never written to any output.
+A token is sent automatically only to `github.com` and `gitlab.com`.
+API requests to `127.0.0.1`, `::1` or `localhost` never go through a proxy.
+`--serve` binds to 127.0.0.1, serves only the dashboard file, and rejects any request whose Host header is not `127.0.0.1` or `localhost` on the serving port.
+The dashboard carries a Content-Security-Policy that allows no network access, so it cannot send data anywhere even when opened from a mail attachment.
+Commit messages are read in a separate, NUL-delimited git call, so their text cannot change diff statistics.
+If a GitLab per-MR lookup fails, the review status and timings for that MR are left empty and the dashboard warns; they are never counted as "unreviewed".
+
+== Heuristics
+
+The dashboard has a Methodology section that prints the rules it used. The defaults are:
+
+Lines of code::
+Net lines added minus deleted along the first-parent history of the branch, for text files.
+Lockfiles, vendored, build output and minified files are excluded.
+Use `--exclude REGEX` to add paths, or `--no-default-excludes` to count everything.
+
+PR type::
+The Conventional Commit type in the PR title.
+If the title has none, the branch prefix is used (`feat/...`), then a label, then a keyword guess.
+The dashboard shows how many types came from each source, so you can judge how reliable the type data is.
+
+Risk score (0 to 100)::
+Points add up:
++
+* size: up to 40
+* files changed: up to 15
+* type: for example, feat 8, fix 6, docs 0
+* breaking change: +15
+* sensitive paths (migrations, auth, security, payments, infra, CI and container files): +10
+* 50+ lines of source changed with no test file touched: +8
+* merged with no review from someone other than the author (API only): +10
++
+Levels are low (< 20), medium (< 40), high (< 60) and critical.
+A rule that needs data the source lacks is skipped, never guessed.
+The score is a triage signal, not a prediction.
+
+Deployment::
+A release tag matching `--tag-pattern`.
+The default is any version number, semver or not, such as `v1`, `v1.2`, `1.2.3` or `2024.05.01`.
+Pre-releases (`-rc`, `-alpha`, `-beta`, `-dev`, `-pre`, `-preview`, `-next`, `-canary`, `-SNAPSHOT`, `-nightly`, and PEP 440 `1.0.0a1` or `1.0.0b2`) are excluded.
+Use `--deploy-source merges` to count every merge as a deployment.
+
+Change failure::
+A merged PR that is a revert (type `revert`, or a title starting with Revert, Reverts, Reverted or Reverting), or whose title, branch or labels match `--failure-pattern` (default: hotfix, rollback and emergency).
+The rate is failures divided by merged PRs.
+
+Time to restore::
+For reverts that name the commit they undo: the time from the reverted change's merge to the revert's merge.
+
+Performance bands::
+The Elite, High, Medium and Low bands use rounded thresholds from published DORA reports. Treat them as rough.
+
+== Useful flags
+
+[cols="1,3"]
+|===
+| `--branch REF` | Branch to analyse. The default is the remote's default branch.
+| `--since / --until YYYY-MM-DD` | Limit the PR window. Lines of code still use full history.
+| `--exclude-bots` | Drop PRs from bots (Dependabot, Renovate, `[bot]` accounts).
+| `--no-titles` | Replace PR titles and scopes with numbers before sharing the file.
+| `--json FILE`, `--csv FILE` | Export the raw data.
+| `--all-bases` | Include PRs that target other branches.
+| `--max-prs N` | Stop after N PRs. Useful on very large repositories.
+|===
+
+The dashboard filters by date range, PR type and bots, and switches between day, week and month.
+It opens in a dark theme and has a light theme toggle.
+Every chart has a Table view with the numbers behind it.
+
+== Tests
+
+[source,sh]
+----
+cd repo-stats && python3 -m unittest discover -s tests -v
+----
+
+The tests build synthetic repositories and run the API clients against local mock servers.
+The browser tests use Playwright with Chromium, and skip when either is missing.

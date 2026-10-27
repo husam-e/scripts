@@ -1,0 +1,1073 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Repository stats</title>
+<style>
+:root {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10); --hover: rgba(255,255,255,0.07);
+  --good-text: #0ca30c;
+  --c1: #3987e5; --c2: #d95926; --c3: #199e70; --c4: #c98500; --c5: #d55181; --c6: #008300; --c7: #9085e9; --c8: #e66767;
+  --other: #898781;
+  --st-good: #0ca30c; --st-warn: #fab219; --st-serious: #ec835a; --st-crit: #d03b3b;
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10); --hover: rgba(11,11,11,0.05);
+  --good-text: #006300;
+  --c1: #2a78d6; --c2: #eb6834; --c3: #1baf7a; --c4: #eda100; --c5: #e87ba4; --c6: #008300; --c7: #6250d6; --c8: #e34948;
+}
+* { box-sizing: border-box; }
+html { background: var(--page); }
+body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1240px; margin: 0 auto; padding: 0 16px 64px; }
+h1 { font-size: 22px; margin: 24px 0 2px; font-weight: 650; }
+h2 { font-size: 17px; margin: 36px 0 10px; font-weight: 650; scroll-margin-top: 72px; }
+h3 { font-size: 14px; margin: 0; font-weight: 650; }
+p { margin: 4px 0; }
+.sub { color: var(--ink2); }
+.muted { color: var(--muted); }
+header .sub { margin-top: 2px; }
+nav.toc { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 10px; font-size: 13px; }
+nav.toc a { color: var(--ink2); text-decoration: none; }
+nav.toc a:hover { color: var(--ink); text-decoration: underline; }
+
+.filters { position: sticky; top: 0; z-index: 20; background: var(--page); border-bottom: 1px solid var(--border);
+  padding: 10px 0; margin-top: 14px; display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+.filters label { color: var(--ink2); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+select, input[type=date], button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; }
+button { cursor: pointer; }
+button:hover, select:hover { background: var(--hover); }
+button[aria-pressed="true"] { border-color: var(--ink2); font-weight: 600; }
+:focus-visible { outline: 2px solid var(--c1); outline-offset: 1px; }
+.seg { display: inline-flex; }
+.seg button { border-radius: 0; margin-left: -1px; }
+.seg button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
+.seg button:last-child { border-radius: 0 6px 6px 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chips button { padding: 2px 8px; font-size: 12px; border-radius: 999px; }
+.chips button .dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; }
+.chips button[aria-pressed="false"] { opacity: .55; }
+
+.banner { border: 1px solid var(--border); border-left: 4px solid var(--st-warn); background: var(--surface); border-radius: 8px;
+  padding: 10px 14px; margin: 14px 0 0; }
+.banner.ok { border-left-color: var(--st-good); }
+.banner strong { font-weight: 650; }
+.banner ul { margin: 6px 0 0; padding-left: 18px; }
+
+.kpis { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; margin-top: 16px; }
+.kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+.kpi .label { color: var(--ink2); font-size: 12px; }
+.kpi .value { font-size: 26px; font-weight: 650; line-height: 1.2; margin-top: 2px; }
+.kpi .hint { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.band { display: inline-block; font-size: 11px; font-weight: 650; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); margin-left: 6px; vertical-align: middle; }
+
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 14px 10px; min-width: 0; }
+.card.wide { grid-column: 1 / -1; }
+.card-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+.card-head .grow { flex: 1; }
+.card-head button { font-size: 12px; padding: 1px 8px; }
+.note { color: var(--ink2); font-size: 12px; margin: 0 0 6px; }
+.badge { font-size: 11px; padding: 0 7px; border-radius: 999px; border: 1px solid var(--st-warn); color: var(--ink2); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 4px 0 2px; font-size: 12px; color: var(--ink2); }
+.legend span.key { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.legend span.line { display: inline-block; width: 14px; height: 0; border-top: 2px solid; margin-right: 5px; vertical-align: 3px; }
+.empty { color: var(--muted); padding: 28px 0; text-align: center; }
+.chart { position: relative; }
+svg text { fill: var(--muted); font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; }
+svg .grid-line { stroke: var(--grid); stroke-width: 1; }
+svg .axis-line { stroke: var(--axis); stroke-width: 1; }
+svg .mark-label { fill: var(--ink2); }
+svg .bar:hover { filter: brightness(1.12); }
+
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 12.5px; }
+th, td { padding: 4px 8px; text-align: right; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; white-space: normal; min-width: 150px; }
+th.title { text-align: left; }
+th { color: var(--ink2); font-weight: 600; }
+.tablewrap { overflow-x: auto; }
+td.title { text-align: left; white-space: normal; min-width: 170px; max-width: 420px; overflow-wrap: break-word; }
+
+#tip { position: fixed; z-index: 50; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--axis);
+  border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.18); display: none; max-width: 280px; }
+#tip .t { color: var(--ink2); margin-bottom: 4px; }
+#tip .r { display: flex; align-items: center; gap: 6px; line-height: 1.5; }
+#tip .r .k { width: 12px; height: 0; border-top: 2px solid; flex: none; }
+#tip .r b { font-weight: 650; margin-left: auto; padding-left: 14px; font-variant-numeric: tabular-nums; }
+#tip .r span.n { color: var(--ink2); }
+dl.method { margin: 0; display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; font-size: 13px; }
+dl.method dt { font-weight: 600; }
+dl.method dd { margin: 0; color: var(--ink2); min-width: 0; overflow-wrap: anywhere; }
+dl.method code { overflow-wrap: anywhere; word-break: break-word; white-space: normal; }
+svg .mark-label { paint-order: stroke; stroke: var(--surface); stroke-width: 3px; stroke-linejoin: round; }
+@media (max-width: 860px) { .grid { grid-template-columns: minmax(0, 1fr); } dl.method { grid-template-columns: minmax(0, 1fr); } dl.method dd { margin-bottom: 6px; } }
+@media (forced-colors: active) { svg .bar, svg path { forced-color-adjust: none; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="title">Repository stats</h1>
+    <div class="sub" id="subtitle"></div>
+    <nav class="toc" aria-label="Sections">
+      <a href="#overview">Overview</a><a href="#loc">Lines of code</a><a href="#throughput">PR volume</a><a href="#size">PR size</a>
+      <a href="#types">PR types</a><a href="#risk">Risk</a><a href="#time">Time</a><a href="#dora">DORA</a><a href="#method">Methodology</a>
+    </nav>
+  </header>
+  <div class="filters" id="filters" role="group" aria-label="Filters"></div>
+  <div id="banner"></div>
+  <div id="app"></div>
+</main>
+<div id="tip" role="status"></div>
+<script>
+"use strict";
+const DATA = /*__DATA__*/null;
+
+/* ------------------------------------------------------------------ helpers */
+const $ = (sel, root = document) => root.querySelector(sel);
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === false || v == null) continue;
+    if (k === "class") e.className = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat()) if (kid != null && kid !== false) e.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  return e;
+}
+const SVGNS = "http://www.w3.org/2000/svg";
+function s(tag, attrs, parent) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) if (v != null) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+const DAY = 86400;
+const nf = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
+const fmtInt = (v) => v == null ? "–" : Math.round(v).toLocaleString("en-US");
+const fmtNum = (v) => v == null || !isFinite(v) ? "–" : nf.format(v);
+const fmtPct = (v) => v == null || !isFinite(v) ? "–" : nf.format(v * 100) + "%";
+function fmtCompact(v) {
+  if (v == null) return "–";
+  const a = Math.abs(v);
+  if (a >= 1e6) return nf.format(v / 1e6) + "M";
+  if (a >= 1e4) return nf.format(v / 1e3) + "k";
+  return nf.format(v);
+}
+function fmtDur(sec) {
+  if (sec == null || !isFinite(sec)) return "–";
+  const a = Math.abs(sec);
+  if (a < 60) return Math.round(sec) + "s";
+  if (a < 3600) return nf.format(sec / 60) + "m";
+  if (a < DAY) return nf.format(sec / 3600) + "h";
+  if (a < 90 * DAY) return nf.format(sec / DAY) + "d";
+  return nf.format(sec / (30.44 * DAY)) + "mo";
+}
+const dateFmt = new Intl.DateTimeFormat("en-US", { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" });
+const fmtDate = (t) => dateFmt.format(new Date(t * 1000));
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const isoDate = (t) => new Date(t * 1000).toISOString().slice(0, 10);
+const sum = (a) => a.reduce((x, y) => x + y, 0);
+
+/* ------------------------------------------------------------------ stats */
+function percentile(sorted, p) {
+  if (!sorted.length) return null;
+  if (sorted.length === 1) return sorted[0];
+  const r = (p / 100) * (sorted.length - 1);
+  const lo = Math.floor(r), hi = Math.ceil(r);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (r - lo);
+}
+function stats(values) {
+  const v = values.filter((x) => x != null && isFinite(x)).sort((a, b) => a - b);
+  const n = v.length;
+  if (!n) return { n: 0 };
+  const total = sum(v), mean = total / n;
+  const sd = n > 1 ? Math.sqrt(sum(v.map((x) => (x - mean) ** 2)) / (n - 1)) : 0;
+  return { n, sum: total, mean, median: percentile(v, 50), p75: percentile(v, 75), p90: percentile(v, 90),
+    p95: percentile(v, 95), p99: percentile(v, 99), min: v[0], max: v[n - 1], sd, sorted: v };
+}
+const STAT_COLS = [["n", "n", fmtInt], ["mean", "mean"], ["median", "median"], ["p75", "p75"], ["p90", "p90"], ["p95", "p95"],
+  ["p99", "p99"], ["min", "min"], ["max", "max"], ["sd", "std dev"]];
+
+/* ------------------------------------------------------------------ periods */
+function bucketStart(t, kind) {
+  if (kind === "day") return t - (t % DAY);
+  if (kind === "week") { const d = Math.floor(t / DAY); return (d - ((d + 3) % 7)) * DAY; } // Monday
+  const d = new Date(t * 1000);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) / 1000;
+}
+function nextBucket(t, kind) {
+  if (kind === "day") return t + DAY;
+  if (kind === "week") return t + 7 * DAY;
+  const d = new Date(t * 1000);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) / 1000;
+}
+function bucketLabel(t, kind) {
+  const d = new Date(t * 1000);
+  if (kind === "month") return MONTHS[d.getUTCMonth()] + " " + d.getUTCFullYear();
+  return (kind === "week" ? "Week of " : "") + MONTHS[d.getUTCMonth()] + " " + d.getUTCDate() + ", " + d.getUTCFullYear();
+}
+/** Zero-filled counts per bucket between lo and hi. Returns [{t, v}] */
+function countBuckets(times, kind, lo, hi) {
+  const out = [];
+  const idx = new Map();
+  for (let t = bucketStart(lo, kind); t <= hi; t = nextBucket(t, kind)) { idx.set(t, out.length); out.push({ t, v: 0 }); }
+  for (const t of times) { const i = idx.get(bucketStart(t, kind)); if (i != null) out[i].v++; }
+  return out;
+}
+function groupBy(items, keyFn) {
+  const m = new Map();
+  for (const it of items) { const k = keyFn(it); if (!m.has(k)) m.set(k, []); m.get(k).push(it); }
+  return m;
+}
+
+/* ------------------------------------------------------------------ state */
+const PRS = DATA.prs, META = DATA.meta;
+// Every dated event, so a release tagged (or a PR closed) after the last merge still falls inside "All time".
+const allTimes = [].concat(PRS.map((p) => p.merged || p.created), PRS.map((p) => p.closed), DATA.loc.days.map((d) => d[0]), DATA.deploys.map((d) => d.t)).filter((t) => t != null);
+let DATA_LO = Infinity, DATA_HI = -Infinity;
+for (const t of allTimes) { if (t < DATA_LO) DATA_LO = t; if (t > DATA_HI) DATA_HI = t; } // no Math.min(...big array)
+if (!isFinite(DATA_LO)) { DATA_LO = DATA_HI = Math.floor(Date.now() / 1000); }
+const TYPE_GROUPS = ["feat", "fix", "refactor", "docs", "test", "chore", "perf", "other"];
+const GROUP_OF = { style: "chore", build: "chore", ci: "chore", revert: "other" };
+const groupOf = (t) => TYPE_GROUPS.includes(t) ? t : (GROUP_OF[t] || "other");
+const GROUP_NOTE = { chore: "chore (incl. build, ci, style)", other: "other (incl. revert, unclassified)" };
+try { const t = localStorage.getItem("repo-stats-theme"); document.documentElement.dataset.theme = t === "light" ? "light" : "dark"; } catch (e) { document.documentElement.dataset.theme = "dark"; }
+const state = { preset: "all", from: null, to: null, types: new Set(TYPE_GROUPS), bots: true, period: "week" };
+try { const saved = localStorage.getItem("repo-stats-period"); if (["day", "week", "month"].includes(saved)) state.period = saved; } catch (e) { /* storage may be blocked */ }
+
+function range() {
+  let hi = DATA_HI + DAY - 1, lo = DATA_LO;
+  const p = state.preset;
+  const months = { "12m": 12, "6m": 6, "3m": 3, "1m": 1 }[p];
+  if (months) {
+    // Clamp the day: one month before Mar 31 is Feb 28/29, not Mar 2/3.
+    const d = new Date(DATA_HI * 1000), y = d.getUTCFullYear(), m = d.getUTCMonth() - months;
+    const last = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+    lo = Date.UTC(y, m, Math.min(d.getUTCDate(), last)) / 1000;
+  }
+  if (p === "custom") { if (state.from != null) lo = state.from; if (state.to != null) hi = state.to + DAY - 1; }
+  return { lo: Math.max(lo, DATA_LO), hi: Math.min(hi, DATA_HI + DAY) };
+}
+function selection() {
+  const r = range();
+  const base = PRS.filter((p) => state.types.has(groupOf(p.type)) && (state.bots || !p.bot));
+  const merged = base.filter((p) => p.state === "merged" && p.merged >= r.lo && p.merged <= r.hi);
+  const opened = base.filter((p) => p.created != null && p.source === "api" && p.created >= r.lo && p.created <= r.hi);
+  const closed = base.filter((p) => p.state === "closed" && p.closed >= r.lo && p.closed <= r.hi);
+  const deploys = DATA.deploys.filter((d) => d.t >= r.lo && d.t <= r.hi);
+  return { r, merged, opened, closed, deploys };
+}
+
+/* ------------------------------------------------------------------ chart plumbing */
+const tip = $("#tip");
+function showTip(evt, title, rows) {
+  tip.replaceChildren();
+  if (title) tip.append(h("div", { class: "t" }, title));
+  for (const row of rows) {
+    const r = h("div", { class: "r" });
+    if (row.color) r.append(h("span", { class: "k", style: "border-color:" + row.color }));
+    r.append(h("span", { class: "n" }, row.name), h("b", null, row.value));
+    tip.append(r);
+  }
+  tip.style.display = "block";
+  const pad = 14, w = tip.offsetWidth, hh = tip.offsetHeight;
+  let x = evt.clientX + pad, y = evt.clientY + pad;
+  if (x + w > innerWidth - 8) x = evt.clientX - w - pad;
+  if (y + hh > innerHeight - 8) y = evt.clientY - hh - pad;
+  tip.style.left = Math.max(8, x) + "px";
+  tip.style.top = Math.max(8, y) + "px";
+}
+const hideTip = () => { tip.style.display = "none"; };
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const SERIES = () => [1, 2, 3, 4, 5, 6, 7, 8].map((i) => css("--c" + i));
+
+function niceStep(span, count) {
+  const raw = span / Math.max(1, count), mag = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / mag;
+  return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * mag;
+}
+function linTicks(lo, hi, count) {
+  const step = niceStep(hi - lo || 1, count), out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) out.push(+v.toPrecision(12));
+  return out;
+}
+function coverTicks(lo, hi, count, int) {
+  let step = niceStep(hi - lo || 1, count);
+  if (int) step = Math.max(1, Math.ceil(step));
+  const out = [];
+  for (let v = Math.floor(lo / step) * step; ; v += step) { out.push(+v.toPrecision(12)); if (v >= hi - 1e-9) break; }
+  return out;
+}
+const DUR_TICKS = [60, 300, 900, 1800, 3600, 7200, 14400, 28800, 43200].concat([1, 2, 3, 5, 7, 14, 21, 30, 60, 90, 180, 365, 730].map((d) => d * DAY));
+const durTicks = (lo, hi) => DUR_TICKS.filter((v) => v >= lo * 0.999 && v <= hi * 1.001);
+function durLinTicks(max) {
+  const unit = max >= 2 * DAY ? DAY : max >= 2 * 3600 ? 3600 : 60;
+  return coverTicks(0, max / unit, 5, false).map((t) => t * unit);
+}
+function logTicks(lo, hi) {
+  const out = [];
+  for (let e = Math.floor(Math.log10(lo)); e <= Math.ceil(Math.log10(hi)); e++)
+    for (const m of [1, 2, 5]) { const v = m * Math.pow(10, e); if (v >= lo * 0.999 && v <= hi * 1.001) out.push(v); }
+  return out;
+}
+function timeTicks(lo, hi, maxTicks) {
+  const spanDays = (hi - lo) / DAY, out = [];
+  const monthSteps = [1, 2, 3, 6, 12, 24, 60, 120];
+  if (spanDays > 150) {
+    for (const step of monthSteps) {
+      const d0 = new Date(lo * 1000);
+      let y = d0.getUTCFullYear(), m = Math.floor(d0.getUTCMonth() / step) * step;
+      out.length = 0;
+      for (;;) {
+        const t = Date.UTC(y, m, 1) / 1000;
+        if (t > hi) break;
+        if (t >= lo) out.push({ t, label: step >= 12 || m === 0 ? String(new Date(t * 1000).getUTCFullYear()) : MONTHS[m % 12] + " " + String(y).slice(2) });
+        m += step; y += Math.floor(m / 12); m %= 12;
+      }
+      if (out.length <= maxTicks) break;
+    }
+  } else {
+    const steps = [1, 2, 7, 14, 30];
+    for (const step of steps) {
+      out.length = 0;
+      for (let t = Math.ceil(lo / DAY / step) * step * DAY; t <= hi; t += step * DAY) {
+        const d = new Date(t * 1000);
+        out.push({ t, label: MONTHS[d.getUTCMonth()] + " " + d.getUTCDate() });
+      }
+      if (out.length <= maxTicks) break;
+    }
+  }
+  return out;
+}
+
+/** Create an SVG plot with axes. cfg: {h, x:{type,domain,fmt,ticks}, y:{domain,fmt,type}, label} */
+function plot(host, cfg) {
+  const width = Math.max(300, host.clientWidth || 640), height = cfg.h || 260;
+  const m = { l: cfg.ml || 48, r: 14, t: 12, b: 26 };
+  const iw = width - m.l - m.r, ih = height - m.t - m.b;
+  const svg = s("svg", { viewBox: `0 0 ${width} ${height}`, width: "100%", height, role: "img", "aria-label": cfg.label || "chart" }, host);
+  const g = s("g", { transform: `translate(${m.l},${m.t})` }, svg);
+  const [x0, x1] = cfg.x.domain, [y0, y1] = cfg.y.domain;
+  const xlog = cfg.x.type === "log", ylog = cfg.y.type === "log";
+  const sx = xlog ? (v) => iw * (Math.log(Math.max(v, x0)) - Math.log(x0)) / (Math.log(x1) - Math.log(x0) || 1)
+                  : (v) => iw * (v - x0) / (x1 - x0 || 1);
+  const sy = ylog ? (v) => ih - ih * (Math.log(Math.max(v, y0)) - Math.log(y0)) / (Math.log(y1) - Math.log(y0) || 1)
+                  : (v) => ih - ih * (v - y0) / (y1 - y0 || 1);
+  const yt = cfg.y.ticks || linTicks(y0, y1, Math.max(3, Math.floor(ih / 44)));
+  for (const t of yt) {
+    s("line", { class: "grid-line", x1: 0, x2: iw, y1: sy(t), y2: sy(t) }, g);
+    s("text", { x: -8, y: sy(t) + 4, "text-anchor": "end" }, g).textContent = cfg.y.fmt(t);
+  }
+  s("line", { class: "axis-line", x1: 0, x2: iw, y1: ih, y2: ih }, g);
+  const maxT = Math.max(2, Math.floor(iw / 90));
+  const xt = cfg.x.ticks || (cfg.x.type === "time" ? timeTicks(x0, x1, maxT) : xlog ? logTicks(x0, x1) : linTicks(x0, x1, maxT).map((t) => ({ t, label: cfg.x.fmt(t) })));
+  let lastRight = -1e9;
+  for (const t of xt) {
+    const tv = typeof t === "object" ? t : { t, label: cfg.x.fmt(t) };
+    const px = sx(tv.t);
+    if (px < -1 || px > iw + 1 || px - lastRight < 52) continue;
+    lastRight = px;
+    s("line", { class: "axis-line", x1: px, x2: px, y1: ih, y2: ih + 4 }, g);
+    s("text", { x: px, y: ih + 17, "text-anchor": px > iw - 22 ? "end" : "middle" }, g).textContent = tv.label;
+  }
+  return { svg, g, sx, sy, iw, ih, m, width, height };
+}
+function line(g, pts, color, o = {}) {
+  let d = "";
+  pts.forEach(([x, y], i) => {
+    if (o.step && i) d += `L${x},${pts[i - 1][1]}`;
+    d += (i ? "L" : "M") + x + "," + y;
+  });
+  return s("path", { d, fill: "none", stroke: color, "stroke-width": o.width || 2, "stroke-linejoin": "round", "stroke-linecap": "round", "stroke-dasharray": o.dash }, g);
+}
+function legend(host, items, before) {
+  if (items.length < 2) return;
+  const el = h("div", { class: "legend" }, items.map((it) => h("span", null,
+    h("span", { class: it.line ? "line" : "key", style: (it.line ? "border-color:" : "background:") + it.color }), it.name)));
+  host.insertBefore(el, before);
+}
+function nearestIndex(xs, v) {
+  let lo = 0, hi = xs.length - 1;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (xs[mid] <= v) lo = mid; else hi = mid; }
+  return Math.abs(xs[hi] - v) < Math.abs(xs[lo] - v) ? hi : lo;
+}
+
+/** Time-series lines or stacked areas sharing x values. */
+function lineChart(host, o) {
+  const { xs, series } = o;
+  if (!xs.length) { host.append(h("div", { class: "empty" }, "No data in this range.")); return; }
+  const stacked = !!o.stacked;
+  const cum = stacked ? series.map((_, i) => xs.map((_, j) => sum(series.slice(0, i + 1).map((sr) => sr.ys[j])))) : null;
+  const ymax = Math.max(1e-9, ...(stacked ? cum[cum.length - 1] : series.flatMap((sr) => sr.ys)));
+  const lo = xs[0], hi = xs[xs.length - 1] === lo ? lo + DAY : xs[xs.length - 1];
+  const allInt = series.every((sr) => sr.ys.every((v) => Number.isInteger(v)));
+  const yticks = o.dur ? durLinTicks(ymax) : coverTicks(0, ymax, 5, allInt);
+  const P = plot(host, { h: o.h || 270, x: { type: "time", domain: [lo, hi] }, y: { domain: [0, yticks[yticks.length - 1]], fmt: o.yFmt || fmtCompact, ticks: yticks }, label: o.label, ml: o.ml });
+  legend(host, (stacked ? series.slice().reverse() : series).map((sr) => ({ name: sr.name, color: sr.color, line: !stacked })), P.svg);
+  series.forEach((sr, i) => {
+    if (stacked) {
+      const top = xs.map((x, j) => [P.sx(x), P.sy(cum[i][j])]);
+      const bot = xs.map((x, j) => [P.sx(x), P.sy(i ? cum[i - 1][j] : 0)]).reverse();
+      s("path", { d: "M" + top.concat(bot).map((p) => p.join(",")).join("L") + "Z", fill: sr.color, stroke: css("--surface"), "stroke-width": 1, "fill-opacity": 0.95 }, P.g);
+    } else {
+      line(P.g, xs.map((x, j) => [P.sx(x), P.sy(sr.ys[j])]), sr.color, { step: o.step });
+    }
+  });
+  const cross = s("line", { y1: 0, y2: P.ih, stroke: css("--ink2"), "stroke-width": 1, "stroke-dasharray": "3 3", visibility: "hidden" }, P.g);
+  const dots = series.map((sr) => s("circle", { r: 4, fill: sr.color, stroke: css("--surface"), "stroke-width": 2, visibility: "hidden" }, P.g));
+  // Pointer-only hit area; keyboard and screen-reader users get the same values from the Table toggle.
+  const hit = s("rect", { width: P.iw, height: P.ih, fill: "transparent" }, P.g);
+  const move = (evt) => {
+    const box = P.svg.getBoundingClientRect(), px = (evt.clientX - box.left) * (P.width / box.width) - P.m.l;
+    const t = lo + (px / P.iw) * (hi - lo), j = nearestIndex(xs, t), x = P.sx(xs[j]);
+    cross.setAttribute("x1", x); cross.setAttribute("x2", x); cross.setAttribute("visibility", "visible");
+    series.forEach((sr, i) => { dots[i].setAttribute("cx", x); dots[i].setAttribute("cy", P.sy(stacked ? cum[i][j] : sr.ys[j])); dots[i].setAttribute("visibility", "visible"); });
+    const rows = series.map((sr) => ({ name: sr.name, color: sr.color, value: (o.tipFmt || o.yFmt || fmtInt)(sr.ys[j]), v: sr.ys[j] }));
+    if (stacked) { rows.sort((a, b) => b.v - a.v); rows.unshift({ name: "Total", value: (o.tipFmt || fmtInt)(sum(series.map((sr) => sr.ys[j]))) }); }
+    showTip(evt, o.xTip ? o.xTip(xs[j]) : fmtDate(xs[j]), rows);
+  };
+  hit.addEventListener("pointermove", move);
+  hit.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); dots.forEach((d) => d.setAttribute("visibility", "hidden")); hideTip(); });
+  o.table && o.table(xs.map((x, j) => [o.xTip ? o.xTip(x) : isoDate(x), ...series.map((sr) => sr.ys[j])]), ["Date", ...series.map((sr) => sr.name)]);
+}
+
+/** Category bars; series stacked or grouped. cats: labels. */
+function barChart(host, o) {
+  const { cats, series } = o;
+  if (!cats.length || !series.length) { host.append(h("div", { class: "empty" }, "No data in this range.")); return; }
+  const stacked = !!o.stacked;
+  const tot = cats.map((_, i) => stacked ? sum(series.map((sr) => sr.vals[i])) : Math.max(...series.map((sr) => sr.vals[i])));
+  const ymax = Math.max(1, ...tot);
+  const yticks = coverTicks(0, ymax, 5, tot.every((v) => Number.isInteger(v)));
+  const P = plot(host, { h: o.h || 250, x: { domain: [0, cats.length], ticks: [] }, y: { domain: [0, yticks[yticks.length - 1]], fmt: o.yFmt || fmtCompact, ticks: yticks }, label: o.label });
+  legend(host, series.map((sr) => ({ name: sr.name, color: sr.color })), P.svg);
+  const band = P.iw / cats.length, gap = Math.min(2, band * 0.15), inner = Math.max(1, band - gap * 2);
+  const every = Math.ceil(52 / band);
+  cats.forEach((c, i) => {
+    const x0 = i * band + gap, n = series.length, w = stacked ? inner : inner / n;
+    let acc = 0;
+    series.forEach((sr, k) => {
+      const v = sr.vals[i], y1 = P.sy(stacked ? acc + v : v), y0 = P.sy(stacked ? acc : 0);
+      acc += v;
+      if (v <= 0) return;
+      const rh = Math.max(1, y0 - y1 - (stacked && k ? 1 : 0));
+      const r = s("rect", { class: "bar", x: stacked ? x0 : x0 + k * w, y: y1, width: Math.max(1, w - (stacked ? 0 : 1)), height: rh, rx: Math.min(4, w / 2), fill: sr.color }, P.g);
+      void r;
+    });
+    if (i % every === 0 && o.labels !== false) {
+      const lt = s("text", { x: i * band + band / 2, y: P.ih + 17, "text-anchor": "middle" }, P.g);
+      lt.textContent = c.short || c;
+      let w = 0;
+      try { w = lt.getComputedTextLength(); } catch (e) { w = 0; }
+      if (i * band + band / 2 + w / 2 > P.iw + P.m.r) lt.setAttribute("x", P.iw + P.m.r - w / 2 - 1); // keep the last label inside
+    }
+    const hit = s("rect", { x: i * band, y: 0, width: band, height: P.ih, fill: "transparent" }, P.g);
+    hit.addEventListener("pointermove", (evt) => showTip(evt, c.long || c.short || c, series.map((sr) => ({ name: sr.name, color: sr.color, value: (o.tipFmt || fmtInt)(sr.vals[i]) }))));
+    hit.addEventListener("pointerleave", hideTip);
+  });
+  o.table && o.table(cats.map((c, i) => [c.long || c, ...series.map((sr) => sr.vals[i])]), [o.catName || "Category", ...series.map((sr) => sr.name)]);
+}
+
+function logBins(values, nb = 28, floor = 1) {
+  const v = values.filter((x) => x != null);
+  if (!v.length) return [];
+  let vmin = Infinity, vmax = -Infinity;
+  for (const x of v) { if (x < vmin) vmin = x; if (x > vmax) vmax = x; }
+  const lo = Math.max(floor, vmin), hi = Math.max(lo * 1.01, vmax + 1);
+  const useLog = hi / lo > 8;
+  const edges = [];
+  for (let i = 0; i <= nb; i++) edges.push(useLog ? lo * Math.pow(hi / lo, i / nb) : lo + (hi - lo) * i / nb);
+  const bins = edges.slice(0, -1).map((e, i) => ({ lo: e, hi: edges[i + 1], n: 0 }));
+  for (const x of v) {
+    const xv = Math.max(x, lo);
+    let i = bins.findIndex((b) => xv < b.hi);
+    if (i < 0) i = bins.length - 1;
+    bins[i].n++;
+  }
+  return bins;
+}
+/** Fixed-width bins over [lo, hi]; the last bin includes hi. */
+function linearBins(values, lo, hi, width) {
+  const v = values.filter((x) => x != null);
+  if (!v.length) return [];
+  const n = Math.ceil((hi - lo) / width);
+  const bins = Array.from({ length: n }, (_, i) => ({ lo: lo + i * width, hi: Math.min(hi, lo + (i + 1) * width), n: 0 }));
+  for (const x of v) bins[Math.max(0, Math.min(n - 1, Math.floor((x - lo) / width)))].n++;
+  return bins;
+}
+function histChart(host, o) {
+  const bins = o.linear ? linearBins(o.values, o.linear.lo, o.linear.hi, o.linear.width) : logBins(o.values, 28, o.floor || 1);
+  if (!bins.length) { host.append(h("div", { class: "empty" }, "No data in this range.")); return; }
+  const lo = bins[0].lo, hi = bins[bins.length - 1].hi, useLog = !o.linear && hi / lo > 8;
+  let ymax = 0;
+  for (const b of bins) if (b.n > ymax) ymax = b.n;
+  const yt = coverTicks(0, ymax, 4, true);
+  const xticks = o.linear ? o.linear.ticks : o.durations && useLog ? durTicks(lo, hi) : null;
+  const P = plot(host, { h: o.h || 230, x: { type: useLog ? "log" : "linear", domain: [lo, hi], fmt: o.xFmt, ticks: xticks }, y: { domain: [0, yt[yt.length - 1]], fmt: fmtCompact, ticks: yt }, label: o.label });
+  const color = o.color || css("--c1");
+  bins.forEach((b) => {
+    if (!b.n) return;
+    const x0 = P.sx(b.lo) + 0.5, x1 = P.sx(b.hi) - 0.5, y = P.sy(b.n);
+    const r = s("rect", { class: "bar", x: x0, y, width: Math.max(1, x1 - x0), height: P.ih - y, rx: 2, fill: color }, P.g);
+    r.addEventListener("pointermove", (evt) => showTip(evt, `${o.xFmt(b.lo)} – ${o.xFmt(b.hi)}`, [{ name: "PRs", value: fmtInt(b.n) }, { name: "Share", value: fmtPct(b.n / o.values.length) }]));
+    r.addEventListener("pointerleave", hideTip);
+  });
+  markers(P, o.marks, o.xFmt, false);
+  o.table && o.table(bins.map((b) => [`${o.xFmt(b.lo)} – ${o.xFmt(b.hi)}`, b.n]), ["Range", "PRs"]);
+}
+/** Dashed percentile lines. Labels sit in their own row near the top (14px apart, so they never overlap
+ *  each other), with a halo for legibility. `block` right-aligns them all left of the first line, which for
+ *  a CDF is always empty space (the curve is below p50 there). */
+function markers(P, marks, fmt, block) {
+  const list = (marks || []).filter((mk) => mk.v != null);
+  const ROW = 14;
+  list.forEach((mk) => {
+    const x = P.sx(mk.v);
+    s("line", { x1: x, x2: x, y1: 0, y2: P.ih, stroke: css("--ink2"), "stroke-width": 1, "stroke-dasharray": "4 3" }, P.g);
+  });
+  const xs = list.map((mk) => Math.max(0, Math.min(P.iw, P.sx(mk.v))));
+  const texts = list.map((mk, i) => {
+    const y = 11 + i * ROW;
+    const t = s("text", { class: "mark-label", x: xs[i] + 4, y, "text-anchor": "start" }, P.g);
+    t.textContent = `${mk.label} ${fmt(mk.v)}`;
+    let w = 0;
+    try { w = t.getComputedTextLength(); } catch (e) { w = t.textContent.length * 6; }
+    return { t, w };
+  });
+  if (!block && texts.every(({ w }, i) => xs[i] + 4 + w <= P.iw)) return;  // each label right of its own line
+  // Otherwise right-align every label left of the first line, so no label crosses another dashed line.
+  const x0 = Math.min(...xs) - 4, wmax = Math.max(...texts.map((x) => x.w));
+  texts.forEach(({ t, w }, i) => {
+    if (x0 - wmax >= 0) { t.setAttribute("x", x0); t.setAttribute("text-anchor", "end"); }
+    else if (xs[i] + 4 + w > P.iw) { t.setAttribute("x", Math.max(w, xs[i] - 4)); t.setAttribute("text-anchor", "end"); }
+  });
+}
+function cdfChart(host, o) {
+  const v = o.sorted;
+  if (!v.length) { host.append(h("div", { class: "empty" }, "No data in this range.")); return; }
+  const lo = Math.max(o.floor || 1, v[0]), hi = Math.max(lo * 1.01, v[v.length - 1]);
+  const useLog = hi / lo > 8;
+  const P = plot(host, { h: o.h || 230, x: { type: useLog ? "log" : "linear", domain: [lo, hi], fmt: o.xFmt, ticks: o.durations && useLog ? durTicks(lo, hi) : null }, y: { domain: [0, 1], fmt: (t) => Math.round(t * 100) + "%", ticks: [0, 0.25, 0.5, 0.75, 1] }, label: o.label });
+  const pts = [];
+  v.forEach((x, i) => { if (i === v.length - 1 || v[i + 1] !== x) pts.push([Math.max(x, lo), (i + 1) / v.length]); });
+  const path = [[P.sx(lo), P.sy(0)]];
+  pts.forEach(([x, p], i) => { path.push([P.sx(x), i ? P.sy(pts[i - 1][1]) : P.sy(0)], [P.sx(x), P.sy(p)]); });
+  line(P.g, path, o.color || css("--c1"));
+  markers(P, o.marks, o.xFmt, true);
+  const cross = s("line", { y1: 0, y2: P.ih, stroke: css("--ink2"), "stroke-dasharray": "3 3", visibility: "hidden" }, P.g);
+  const hit = s("rect", { width: P.iw, height: P.ih, fill: "transparent" }, P.g);
+  hit.addEventListener("pointermove", (evt) => {
+    const box = P.svg.getBoundingClientRect(), px = (evt.clientX - box.left) * (P.width / box.width) - P.m.l;
+    const x = useLog ? lo * Math.pow(hi / lo, px / P.iw) : lo + (hi - lo) * px / P.iw;
+    let n = 0; while (n < v.length && v[n] <= x) n++;
+    cross.setAttribute("x1", px); cross.setAttribute("x2", px); cross.setAttribute("visibility", "visible");
+    showTip(evt, `≤ ${o.xFmt(x)}`, [{ name: "Cumulative share", value: fmtPct(n / v.length) }, { name: "PRs", value: fmtInt(n) }]);
+  });
+  hit.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); hideTip(); });
+  const tbl = [0.5, 0.75, 0.9, 0.95, 0.99, 1].map((p) => [`p${Math.round(p * 100)}`, percentile(v, p * 100)]);
+  o.table && o.table(tbl.map(([a, b]) => [a, o.xFmt(b)]), ["Percentile", "Value"]);
+}
+
+/* ------------------------------------------------------------------ cards */
+const tableState = new Map();
+function card(parent, title, opts = {}) {
+  const head = h("div", { class: "card-head" }, h("h3", null, title));
+  const body = h("div", { class: "chart" });
+  const tableHost = h("div", { class: "tablewrap", hidden: true });
+  const c = h("section", { class: "card" + (opts.wide ? " wide" : "") }, head);
+  if (opts.note) c.append(h("p", { class: "note" }, opts.note));
+  c.append(body, tableHost);
+  let tableData = null;
+  const toggle = h("button", { type: "button", "aria-pressed": "false", title: "Show the values behind this chart as a table" }, "Table");
+  const apply = () => {
+    const on = !!tableState.get(title);
+    toggle.setAttribute("aria-pressed", on);
+    body.hidden = on && !!tableData;
+    tableHost.hidden = !(on && tableData);
+  };
+  toggle.addEventListener("click", () => { tableState.set(title, !tableState.get(title)); apply(); });
+  head.append(h("span", { class: "grow" }));
+  if (opts.controls) head.append(opts.controls);
+  const api = {
+    root: c, body, head,
+    badge(text) { head.insertBefore(h("span", { class: "badge", title: "Derived from git history, not from the hosting API" }, text), head.children[1]); },
+    table(rows, cols) {
+      tableData = { rows, cols };
+      tableHost.replaceChildren(simpleTable(cols, rows));
+      if (!toggle.isConnected) head.append(toggle);
+      apply();
+    },
+    done() { apply(); },
+  };
+  parent.append(c);
+  return api;
+}
+function simpleTable(cols, rows) {
+  return h("table", null, h("thead", null, h("tr", null, cols.map((c) => h("th", null, c)))),
+    h("tbody", null, rows.slice(0, 2000).map((r) => h("tr", null, r.map((v, i) => h("td", null, typeof v === "number" ? fmtNum(v) : v))))));
+}
+/** rows: [{label, st, fmt}] */
+function statsTable(rows, extraCols = []) {
+  return h("div", { class: "tablewrap" }, h("table", null,
+    h("thead", null, h("tr", null, h("th", null, "Metric"), STAT_COLS.map((c) => h("th", null, c[1])), extraCols.map((c) => h("th", null, c.name)))),
+    h("tbody", null, rows.map((r) => h("tr", null, h("td", null, r.label),
+      STAT_COLS.map(([k, , f]) => h("td", null, r.st.n ? (f || r.fmt)(r.st[k]) : "–")),
+      extraCols.map((c) => h("td", null, c.value(r))))))));
+}
+function sectionHead(app, id, title, sub) {
+  app.append(h("h2", { id }, title));
+  if (sub) app.append(h("p", { class: "sub" }, sub));
+}
+function inferredShare(prs, key) {
+  const have = prs.filter((p) => p[key] != null);
+  if (!have.length) return null;
+  return have.filter((p) => p.inferred.includes(key)).length / have.length;
+}
+
+/* ------------------------------------------------------------------ bands (heuristic) */
+function band(kind, value) {
+  if (value == null || !isFinite(value)) return null;
+  const tiers = {
+    freq: [[1, "Elite"], [1 / 7, "High"], [1 / 30, "Medium"]],            // deploys per day
+    lead: [[DAY, "Elite"], [7 * DAY, "High"], [30 * DAY, "Medium"]],       // seconds, lower is better
+    cfr: [[0.05, "Elite"], [0.10, "High"], [0.15, "Medium"]],
+    restore: [[3600, "Elite"], [DAY, "High"], [7 * DAY, "Medium"]],
+  }[kind];
+  if (kind === "freq") { for (const [t, n] of tiers) if (value >= t) return n; return "Low"; }
+  for (const [t, n] of tiers) if (value <= t) return n;
+  return "Low";
+}
+const bandEl = (b) => b ? h("span", { class: "band", title: "Approximate DORA performance band (see Methodology)" }, b) : null;
+
+/** One lead-time definition everywhere (KPI, DORA card, by-type table): to release when any merged PR in
+ *  the selection has a release, else to merge. In release mode PRs not yet released are left out. */
+function leadMode(prs) {
+  const release = prs.some((p) => p.lead_to_deploy != null);
+  return { release, key: release ? "lead_to_deploy" : "lead", label: release ? "first commit to release" : "first commit to merge" };
+}
+
+/* ------------------------------------------------------------------ sections */
+const METRICS = [
+  ["coding", "Coding time", "First commit to PR ready"],
+  ["pickup", "Pickup time", "PR ready to first review"],
+  ["review", "Review time", "First review to merge"],
+  ["open_to_merge", "Open to merge", "PR opened to merged"],
+  ["lead", "Lead time", "First commit to merged"],
+  ["deploy_wait", "Merge to release", "Merged to first release tag"],
+  ["lead_to_deploy", "Lead time to release", "First commit to first release tag"],
+];
+const TAG_DESC = () => META.tag_default ? "a version number (v1, v1.2, 1.2.3; pre-releases such as -rc, -beta, -preview or -SNAPSHOT are not counted)" : META.tag_pattern;
+
+function renderKpis(app, sel) {
+  const { merged, deploys, r } = sel;
+  const lm = leadMode(merged);
+  const lead = stats(merged.map((p) => p[lm.key]));
+  const size = stats(merged.map((p) => p.lines));
+  const days = Math.max(1, (r.hi - r.lo) / DAY);
+  const fails = merged.filter((p) => p.kind).length;
+  const cfr = merged.length ? fails / merged.length : null;
+  const hiRisk = merged.length ? merged.filter((p) => p.risk_level === "high" || p.risk_level === "critical").length / merged.length : null;
+  const locEnd = DATA.loc.days.filter((d) => d[0] <= r.hi).slice(-1)[0];
+  const kpi = (label, value, hint, b) => h("div", { class: "kpi" }, h("div", { class: "label" }, label), h("div", { class: "value" }, value, bandEl(b)), h("div", { class: "hint" }, hint));
+  const freq = deploys.length / days;
+  app.append(h("div", { class: "kpis", id: "overview" },
+    kpi("Merged PRs", fmtInt(merged.length), `${fmtNum(merged.length / days * 7)} per week`),
+    kpi("Median PR size", merged.length ? fmtInt(size.median) : "–", `lines changed · p90 ${fmtInt(size.p90)}`),
+    kpi("Median lead time", fmtDur(lead.median), `${lm.label} · p90 ${fmtDur(lead.p90)}`, band("lead", lead.median)),
+    kpi("Releases", fmtInt(deploys.length), deploys.length ? `${fmtNum(freq * 7)} per week` : "no release tags matched", deploys.length ? band("freq", freq) : null),
+    kpi("Change failure rate", fmtPct(cfr), `${fails} revert/hotfix PRs`, band("cfr", cfr)),
+    kpi("High or critical risk", fmtPct(hiRisk), "share of merged PRs"),
+    kpi("Lines of code", locEnd ? fmtCompact(locEnd[1]) : "–", locEnd ? "at end of range" : ""),
+  ));
+}
+
+function renderLoc(app, sel) {
+  sectionHead(app, "loc", "Lines of code over time", "Cumulative net lines (added minus deleted) on the first-parent history of the analysed branch, per day.");
+  const grid = h("div", { class: "grid" });
+  app.append(grid);
+  const mode = { view: "total", code: false };
+  const ctl = h("span", null);
+  const c = card(grid, "Lines of code", { wide: true, controls: ctl, note: "Text files only; lockfiles, vendored and generated paths are excluded (see Methodology)." });
+  const { days, langs, kinds } = DATA.loc;
+  const draw = () => {
+    c.body.replaceChildren();
+    const idx = days.map((d, i) => i).filter((i) => days[i][0] >= sel.r.lo - DAY && days[i][0] <= sel.r.hi);
+    const names = Object.keys(langs).filter((l) => !mode.code || kinds[l] === "code");
+    const xs = idx.map((i) => days[i][0]);
+    const total = idx.map((i) => mode.code ? sum(names.map((l) => langs[l][i])) : days[i][1]);
+    if (mode.view === "total") {
+      lineChart(c.body, { xs, series: [{ name: mode.code ? "Code lines" : "All text lines", color: css("--c1"), ys: total }], step: true, label: "Lines of code over time", table: c.table });
+    } else {
+      const ranked = names.slice().sort((a, b) => Math.max(...langs[b]) - Math.max(...langs[a]));
+      const pal = SERIES();
+      const keep = ranked.slice(0, 7), rest = ranked.slice(7);
+      const sers = keep.map((l, k) => ({ name: l, color: pal[k], ys: idx.map((i) => langs[l][i]) }));
+      if (rest.length) sers.push({ name: "Other", color: css("--other"), ys: idx.map((i) => sum(rest.map((l) => langs[l][i]))) });
+      lineChart(c.body, { xs, series: sers.reverse(), stacked: true, label: "Lines of code by language", table: c.table });
+    }
+  };
+  const seg = h("span", { class: "seg" }, [["total", "Total"], ["lang", "By language"]].map(([k, label]) =>
+    h("button", { type: "button", "aria-pressed": String(mode.view === k), onclick: (e) => { mode.view = k; seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === e.currentTarget))); draw(); } }, label)));
+  const codeBtn = h("button", { type: "button", "aria-pressed": "false", title: "Count only source code languages, not docs, data or config", onclick: (e) => { mode.code = !mode.code; e.currentTarget.setAttribute("aria-pressed", String(mode.code)); draw(); } }, "Code only");
+  ctl.append(seg, " ", codeBtn);
+  draw();
+
+  const churn = card(grid, "Lines added and deleted per month", { wide: true, note: "Churn from all commits on the first-parent line. A merge counts when it lands." });
+  const byMonth = new Map();
+  for (const d of days) {
+    if (d[0] < sel.r.lo - DAY || d[0] > sel.r.hi) continue;
+    const m = bucketStart(d[0], "month"), e = byMonth.get(m) || [0, 0];
+    e[0] += d[2]; e[1] += d[3]; byMonth.set(m, e);
+  }
+  const ms = [...byMonth.keys()].sort((a, b) => a - b);
+  barChart(churn.body, { cats: ms.map((t) => ({ short: bucketLabel(t, "month"), long: bucketLabel(t, "month") })),
+    series: [{ name: "Added", color: css("--c1"), vals: ms.map((t) => byMonth.get(t)[0]) }, { name: "Deleted", color: css("--c2"), vals: ms.map((t) => byMonth.get(t)[1]) }],
+    label: "Lines added and deleted per month", catName: "Month", table: churn.table, tipFmt: fmtInt });
+}
+
+function renderThroughput(app, sel) {
+  sectionHead(app, "throughput", "Pull request volume", META.mode === "api" ? "Counts come from the hosting API." : "Merged PRs are inferred from merge commits and squash commits that carry a PR number.");
+  const grid = h("div", { class: "grid" });
+  app.append(grid);
+  const { r, merged, opened, closed } = sel;
+  const lo = r.lo, hi = r.hi;
+  const c = card(grid, `PRs per ${state.period}`, { wide: true, note: "Zero-filled. The first and last periods can be partial." });
+  const kind = state.period;
+  const m = countBuckets(merged.map((p) => p.merged), kind, lo, hi);
+  const sers = [{ name: "Merged", color: css("--c1"), vals: m.map((b) => b.v) }];
+  if (META.mode === "api") {
+    sers.push({ name: "Opened", color: css("--c2"), vals: countBuckets(opened.map((p) => p.created), kind, lo, hi).map((b) => b.v) });
+    sers.push({ name: "Closed unmerged", color: css("--c4"), vals: countBuckets(closed.map((p) => p.closed), kind, lo, hi).map((b) => b.v) });
+  }
+  if (m.length > 200) {
+    lineChart(c.body, { xs: m.map((b) => b.t), series: sers.map((sr) => ({ name: sr.name, color: sr.color, ys: sr.vals })), yFmt: fmtInt, xTip: (t) => bucketLabel(t, kind), label: `PRs per ${kind}`, table: c.table });
+  } else {
+    barChart(c.body, { cats: m.map((b) => ({ short: kind === "month" ? bucketLabel(b.t, kind) : MONTHS[new Date(b.t * 1000).getUTCMonth()] + " " + new Date(b.t * 1000).getUTCDate(), long: bucketLabel(b.t, kind) })), series: sers, label: `PRs per ${kind}`, catName: "Period", table: c.table, yFmt: fmtInt });
+  }
+
+  const sc = card(grid, "Merged PRs per period: statistics", { wide: true, note: "Complete periods only (partial first and last periods are dropped). Periods with no merges count as zero." });
+  const rows = ["day", "week", "month"].map((k) => {
+    let b = countBuckets(merged.map((p) => p.merged), k, lo, hi);
+    if (k !== "day" && b.length > 2) {
+      if (b[0].t < lo) b = b.slice(1);
+      if (b.length && nextBucket(b[b.length - 1].t, k) - 1 > hi) b = b.slice(0, -1);
+    }
+    return { label: `per ${k}`, st: stats(b.map((x) => x.v)), fmt: fmtNum };
+  });
+  sc.body.append(statsTable(rows));
+  if (META.mode !== "api") sc.body.append(h("p", { class: "note" }, `Direct commits to the branch that reference no PR are not counted here: ${fmtInt(META.direct_commits)} in the whole history.`));
+}
+
+function sizeRows(prs) {
+  return [["lines", "Lines changed (added + deleted)"], ["additions", "Lines added"], ["deletions", "Lines deleted"], ["files", "Files changed"], ["commits", "Commits per PR"]]
+    .map(([k, label]) => ({ key: k, label, st: stats(prs.map((p) => p[k])), fmt: fmtNum }));
+}
+function renderSize(app, sel) {
+  sectionHead(app, "size", "Pull request size", "Size of merged PRs. Lockfiles and generated files are excluded where size is measured from git.");
+  const grid = h("div", { class: "grid" });
+  app.append(grid);
+  const prs = sel.merged;
+  const t = card(grid, "Size statistics", { wide: true });
+  t.body.append(statsTable(sizeRows(prs)));
+  if (prs.some((p) => p.commits == null)) t.body.append(h("p", { class: "note" }, "Commits per PR is unavailable for squash-merged PRs when inferred from git, since the branch history is gone."));
+  const lines = prs.map((p) => p.lines).filter((v) => v != null);
+  const st = stats(lines);
+  const marks = [{ v: st.median, label: "p50" }, { v: st.p90, label: "p90" }, { v: st.p99, label: "p99" }];
+  const hc = card(grid, "Distribution of lines changed", { note: "Log-spaced bins. Dashed lines mark percentiles." });
+  histChart(hc.body, { values: lines, xFmt: fmtCompact, marks, label: "Histogram of lines changed", table: hc.table });
+  const cc = card(grid, "Cumulative frequency of lines changed", { note: "Share of PRs at or below a given size." });
+  cdfChart(cc.body, { sorted: st.sorted || [], xFmt: fmtCompact, marks, label: "Cumulative distribution of lines changed", table: cc.table });
+
+  const SB = META.heuristics.size_buckets;
+  const bc = card(grid, "PRs by size bucket", { note: SB.map(([lim, n], i) => lim == null ? `${n} > ${SB[i - 1][0]}` : `${n} ≤ ${lim}`).join(", ") + " lines changed." });
+  const names = META.heuristics.size_buckets.map((b) => b[1]);
+  const bucketOf = (v) => META.heuristics.size_buckets.find((b) => b[0] == null || v <= b[0])[1];
+  const counts = names.map((n) => lines.filter((v) => bucketOf(v) === n).length);
+  barChart(bc.body, { cats: names, series: [{ name: "PRs", color: css("--c1"), vals: counts }], label: "PRs by size bucket", table: bc.table, catName: "Bucket" });
+  const mc = card(grid, "Median and p90 size by month");
+  const byM = groupBy(prs.filter((p) => p.lines != null), (p) => bucketStart(p.merged, "month"));
+  const mk = [...byM.keys()].sort((a, b) => a - b);
+  lineChart(mc.body, { xs: mk, series: [{ name: "Median", color: css("--c1"), ys: mk.map((k) => stats(byM.get(k).map((p) => p.lines)).median) }, { name: "p90", color: css("--c2"), ys: mk.map((k) => stats(byM.get(k).map((p) => p.lines)).p90) }], yFmt: fmtCompact, tipFmt: fmtInt, xTip: (x) => bucketLabel(x, "month"), label: "PR size by month", table: mc.table });
+}
+
+function groupColor(g) { return SERIES()[TYPE_GROUPS.indexOf(g)]; }
+function renderTypes(app, sel) {
+  sectionHead(app, "types", "Pull request types", "Type follows Conventional Commits in the PR title; otherwise the branch name prefix, then a type label, then a keyword guess.");
+  const grid = h("div", { class: "grid" });
+  app.append(grid);
+  const prs = sel.merged;
+  const counts = TYPE_GROUPS.map((g) => prs.filter((p) => groupOf(p.type) === g).length);
+  const cc = card(grid, "PRs by type", { note: "Colors are fixed per type. Types beyond eight fold into chore and other." });
+  barChart(cc.body, { cats: TYPE_GROUPS.map((g) => ({ short: g, long: GROUP_NOTE[g] || g })), series: [{ name: "PRs", color: css("--c1"), vals: counts }], label: "PRs by type", table: cc.table, catName: "Type" });
+  // recolor bars per type
+  [...cc.body.querySelectorAll("rect.bar")].forEach((r, i) => { r.setAttribute("fill", groupColor(TYPE_GROUPS.filter((g, k) => counts[k] > 0)[i])); });
+
+  const mc = card(grid, "Type mix by month", { note: "Stacked monthly counts." });
+  const months = countBuckets([], "month", sel.r.lo, sel.r.hi).map((b) => b.t);
+  const sers = TYPE_GROUPS.map((g) => ({ name: g, color: groupColor(g), vals: months.map((m) => prs.filter((p) => groupOf(p.type) === g && bucketStart(p.merged, "month") === m).length) })).filter((x) => sum(x.vals));
+  barChart(mc.body, { cats: months.map((t) => ({ short: bucketLabel(t, "month"), long: bucketLabel(t, "month") })), series: sers, stacked: true, label: "Type mix by month", table: mc.table, catName: "Month" });
+
+  const tc = card(grid, "Statistics by type", { wide: true });
+  const lm = leadMode(prs);
+  const types = [...new Set(prs.map((p) => p.type))].sort((a, b) => prs.filter((p) => p.type === b).length - prs.filter((p) => p.type === a).length);
+  tc.body.append(h("div", { class: "tablewrap" }, h("table", null,
+    h("thead", null, h("tr", null, ["Type", "PRs", "Share", "Median lines", "p90 lines", "Median files", lm.release ? "Median lead (to release)" : "Median lead (to merge)", "Mean risk", "Breaking"].map((c) => h("th", null, c)))),
+    h("tbody", null, types.map((t) => {
+      const sub = prs.filter((p) => p.type === t);
+      return h("tr", null, h("td", null, t), h("td", null, fmtInt(sub.length)), h("td", null, fmtPct(sub.length / prs.length)),
+        h("td", null, fmtInt(stats(sub.map((p) => p.lines)).median)), h("td", null, fmtInt(stats(sub.map((p) => p.lines)).p90)),
+        h("td", null, fmtInt(stats(sub.map((p) => p.files)).median)), h("td", null, fmtDur(stats(sub.map((p) => p[lm.key])).median)),
+        h("td", null, fmtNum(stats(sub.map((p) => p.risk)).mean)), h("td", null, fmtInt(sub.filter((p) => p.breaking).length)));
+    })))));
+  const src = groupBy(prs, (p) => p.type_source);
+  const order = ["title", "branch", "label", "keyword", "none"];
+  if (prs.length) tc.body.append(h("p", { class: "note" }, "How the type was determined: " + order.filter((k) => src.has(k)).map((k) => `${k} ${fmtPct(src.get(k).length / prs.length)}`).join(" · ") + ". Only title is real Conventional Commit data; branch and label are conventions, keyword is a guess and none means no signal."));
+}
+
+const RISK_COLOR = { low: "--st-good", medium: "--st-warn", high: "--st-serious", critical: "--st-crit" };
+function renderRisk(app, sel) {
+  const R = META.heuristics.risk;
+  sectionHead(app, "risk", "Risk and impact", "A transparent additive score from 0 to 100. It is a triage signal, not a prediction. Every rule is listed under Methodology.");
+  const grid = h("div", { class: "grid" });
+  app.append(grid);
+  const prs = sel.merged;
+  const levels = R.levels.map((l) => l[1]);
+  const lc = card(grid, "PRs by risk level", { note: levels.map((l, i) => `${l} ${i ? "≥ " + R.levels[i - 1][0] : "< " + R.levels[0][0]}`).join(" · ") });
+  const counts = levels.map((l) => prs.filter((p) => p.risk_level === l).length);
+  barChart(lc.body, { cats: levels, series: [{ name: "PRs", color: css("--c1"), vals: counts }], label: "PRs by risk level", table: lc.table, catName: "Level" });
+  const visible = levels.filter((l, i) => counts[i] > 0);
+  [...lc.body.querySelectorAll("rect.bar")].forEach((rc, i) => rc.setAttribute("fill", css(RISK_COLOR[visible[i]])));
+
+  const hc = card(grid, "Distribution of risk scores");
+  const hc2 = R.cap || 100;
+  histChart(hc.body, { values: prs.map((p) => p.risk), xFmt: (v) => String(Math.round(v)), label: "Histogram of risk scores", table: hc.table,
+    linear: { lo: 0, hi: hc2, width: 5, ticks: [0, 20, 40, 60, 80, 100].filter((t) => t <= hc2) } });
+
+  const tc = card(grid, "Risk over time", { note: "Mean risk score and the percentage of PRs rated high or critical, by month. Both read on a 0–100 scale." });
+  const byM = groupBy(prs, (p) => bucketStart(p.merged, "month"));
+  const mk = [...byM.keys()].sort((a, b) => a - b);
+  lineChart(tc.body, { xs: mk, series: [{ name: "Mean score", color: css("--c1"), ys: mk.map((k) => stats(byM.get(k).map((p) => p.risk)).mean) },
+    { name: "% high or critical", color: css("--c2"), ys: mk.map((k) => 100 * byM.get(k).filter((p) => p.risk_level === "high" || p.risk_level === "critical").length / byM.get(k).length) }],
+    yFmt: (v) => String(Math.round(v)), tipFmt: fmtNum, xTip: (x) => bucketLabel(x, "month"), label: "Risk over time", table: tc.table });
+
+  const fc = card(grid, "What drives the score", { note: "Share of PRs each rule applied to, and the mean points it added when it did." });
+  const fac = new Map();
+  prs.forEach((p) => p.risk_factors.forEach(([n, pts]) => { const e = fac.get(n) || [0, 0]; e[0]++; e[1] += pts; fac.set(n, e); }));
+  fc.body.append(simpleTable(["Rule", "PRs", "Share", "Mean points"], [...fac.entries()].sort((a, b) => b[1][0] - a[1][0]).map(([n, [c, p]]) => [n, fmtInt(c), fmtPct(c / prs.length), fmtNum(p / c)])));
+
+  const sc = card(grid, "Risk score statistics", { wide: true });
+  sc.body.append(statsTable([{ label: "Risk score", st: stats(prs.map((p) => p.risk)), fmt: fmtNum }]));
+  const top = prs.slice().sort((a, b) => b.risk - a.risk || (b.lines || 0) - (a.lines || 0)).slice(0, 10);
+  const tp = card(grid, "Ten highest-risk PRs", { wide: true });
+  tp.body.append(h("div", { class: "tablewrap" }, h("table", null,
+    h("thead", null, h("tr", null, ["PR", "Type", "Lines", "Files", "Score", "Why"].map((c) => h("th", { class: c === "Why" || c === "PR" ? "title" : null }, c)))),
+    h("tbody", null, top.map((p) => h("tr", null, h("td", { class: "title" }, (p.number != null ? "#" + p.number + " " : "") + p.title), h("td", null, p.type), h("td", null, fmtInt(p.lines)), h("td", null, fmtInt(p.files)),
+      h("td", null, String(p.risk) + " " + p.risk_level), h("td", { class: "title" }, p.risk_factors.map(([n, v]) => `${n} +${v}`).join(", "))))))));
+}
+
+function renderTime(app, sel) {
+  sectionHead(app, "time", "Time per pull request", "Durations for merged PRs. Metrics that need review or open timestamps are empty unless the API was used.");
+  const grid = h("div", { class: "grid" });
+  app.append(grid);
+  const prs = sel.merged;
+  const t = card(grid, "Duration statistics", { wide: true });
+  const rows = METRICS.map(([k, label, hint]) => ({ key: k, label: `${label}`, hint, st: stats(prs.map((p) => p[k])), fmt: fmtDur }));
+  t.body.append(statsTable(rows, [{ name: "Source", value: (r) => {
+    if (!r.st.n) return META.mode === "git" && ["pickup", "open_to_merge"].includes(r.key) ? "needs API" : "n/a";
+    const share = inferredShare(prs, r.key);
+    return share ? (share === 1 ? "inferred" : fmtPct(share) + " inferred") : "exact";
+  } }]));
+  t.body.append(h("p", { class: "note" }, METRICS.map(([, l, hint]) => `${l}: ${hint}.`).join(" ") + (META.mode === "git" ? " From git alone, coding time is the span between first and last commit on the branch, and review time is last commit to merge. These are proxies." : "")));
+
+  const avail = METRICS.filter(([k]) => prs.some((p) => p[k] != null));
+  const pick = { key: (avail.find((a) => a[0] === "lead") || avail[0] || [])[0] };
+  const ctl = h("select", { "aria-label": "Duration metric" }, avail.map(([k, l]) => h("option", { value: k, selected: k === pick.key }, l)));
+  const hc = card(grid, "Distribution", { controls: ctl, note: "Log-spaced bins." });
+  const cc = card(grid, "Cumulative frequency", { note: "Share of PRs finished within a given time." });
+  const tc = card(grid, "Median and p90 over time", { wide: true });
+  const draw = () => {
+    for (const c of [hc, cc, tc]) c.body.replaceChildren();
+    const k = pick.key;
+    if (!k) { for (const c of [hc, cc, tc]) c.body.append(h("div", { class: "empty" }, "No duration data in this range.")); return; }
+    const vals = prs.map((p) => p[k]).filter((v) => v != null);
+    const st = stats(vals);
+    const marks = [{ v: st.median, label: "p50" }, { v: st.p90, label: "p90" }, { v: st.p99, label: "p99" }];
+    histChart(hc.body, { values: vals, xFmt: fmtDur, marks, durations: true, floor: 60, label: "Histogram of " + k, table: hc.table });
+    cdfChart(cc.body, { sorted: st.sorted, xFmt: fmtDur, marks, durations: true, floor: 60, label: "Cumulative distribution of " + k, table: cc.table });
+    const byM = groupBy(prs.filter((p) => p[k] != null), (p) => bucketStart(p.merged, "month"));
+    const mk = [...byM.keys()].sort((a, b) => a - b);
+    lineChart(tc.body, { xs: mk, series: [{ name: "Median", color: css("--c1"), ys: mk.map((m) => stats(byM.get(m).map((p) => p[k])).median) }, { name: "p90", color: css("--c2"), ys: mk.map((m) => stats(byM.get(m).map((p) => p[k])).p90) }], yFmt: fmtDur, tipFmt: fmtDur, dur: true, xTip: (x) => bucketLabel(x, "month"), label: "Duration over time", table: tc.table });
+  };
+  ctl.addEventListener("change", () => { pick.key = ctl.value; draw(); });
+  draw();
+}
+
+function renderDora(app, sel) {
+  sectionHead(app, "dora", "DORA metrics", "Deployment frequency, lead time for changes, change failure rate and time to restore. Definitions are approximations; see Methodology.");
+  const grid = h("div", { class: "grid" });
+  app.append(grid);
+  const { r, merged, deploys } = sel;
+  const kind = state.period;
+  const dc = card(grid, `Deployments per ${kind}`, { wide: true, note: META.deploy_source === "tags" ? `A deployment is a release tag matching ${TAG_DESC()}. Highlighted periods contain a release that shipped a revert or hotfix.` : "A deployment is any merge to the branch." });
+  const times = (META.deploy_source === "tags" ? deploys.map((d) => d.t) : merged.map((p) => p.merged));
+  const b = countBuckets(times, kind, r.lo, r.hi);
+  const fix = countBuckets(deploys.filter((d) => d.fix).map((d) => d.t), kind, r.lo, r.hi);
+  if (!times.length) dc.body.append(h("div", { class: "empty" }, "No deployments found. Adjust --tag-pattern or use --deploy-source merges."));
+  else barChart(dc.body, { cats: b.map((x) => ({ short: kind === "month" ? bucketLabel(x.t, kind) : MONTHS[new Date(x.t * 1000).getUTCMonth()] + " " + new Date(x.t * 1000).getUTCDate(), long: bucketLabel(x.t, kind) })),
+    series: [{ name: "Deployments", color: css("--c1"), vals: b.map((x, i) => x.v - fix[i].v) }, ...(sum(fix.map((x) => x.v)) ? [{ name: "Revert or hotfix releases", color: css("--c8"), vals: fix.map((x) => x.v) }] : [])], stacked: true, label: "Deployments per period", catName: "Period", table: dc.table });
+
+  const fc = card(grid, "Deployment frequency statistics", { wide: true });
+  const rows = ["day", "week", "month"].map((k) => {
+    let x = countBuckets(times, k, r.lo, r.hi);
+    if (k !== "day" && x.length > 2) { if (x[0].t < r.lo) x = x.slice(1); if (x.length && nextBucket(x[x.length - 1].t, k) - 1 > r.hi) x = x.slice(0, -1); }
+    return { label: `per ${k}`, st: stats(x.map((v) => v.v)), fmt: fmtNum };
+  });
+  fc.body.append(statsTable(rows));
+  const perDay = times.length / Math.max(1, (r.hi - r.lo) / DAY);
+  fc.body.append(h("p", { class: "note" }, `Average ${fmtNum(perDay * 7)} per week.`, bandEl(times.length ? band("freq", perDay) : null)));
+
+  const lc = card(grid, "Lead time for changes", { wide: true });
+  const lm = leadMode(merged);
+  const lt = stats(merged.map((p) => p[lm.key]));
+  lc.body.append(statsTable([{ label: lm.release ? "First commit to release" : "First commit to merge", st: lt, fmt: fmtDur }]));
+  const unreleased = lm.release ? merged.filter((p) => p.lead_to_deploy == null).length : 0;
+  lc.body.append(h("p", { class: "note" }, lm.release ? `Measured to the first release tag that contains the change${unreleased ? `; ${unreleased} merged PR(s) not yet released are left out` : ""}. The overview card and the by-type table use the same definition.` : "No merged PR in this range has a release, so this stops at merge time.", bandEl(band("lead", lt.median))));
+
+  const cf = card(grid, "Change failure rate", { wide: true, note: "Revert or hotfix PRs as a share of merged PRs, by month." });
+  const byM = groupBy(merged, (p) => bucketStart(p.merged, "month"));
+  const mk = [...byM.keys()].sort((a, b) => a - b);
+  const fails = merged.filter((p) => p.kind);
+  lineChart(cf.body, { xs: mk, series: [{ name: "Failure rate", color: css("--c8"), ys: mk.map((m) => 100 * byM.get(m).filter((p) => p.kind).length / byM.get(m).length) }], yFmt: (v) => Math.round(v) + "%", tipFmt: (v) => nf.format(v) + "%", xTip: (x) => bucketLabel(x, "month"), label: "Change failure rate by month", table: cf.table, h: 200 });
+  cf.body.append(h("p", { class: "note" }, `${fails.length} of ${merged.length} merged PRs (${fmtPct(merged.length ? fails.length / merged.length : null)}): ${fails.filter((p) => p.kind === "revert").length} reverts, ${fails.filter((p) => p.kind === "hotfix").length} hotfixes.` + (deploys.length ? ` ${deploys.filter((d) => d.fix).length} of ${deploys.length} releases contain one.` : ""), bandEl(merged.length ? band("cfr", fails.length / merged.length) : null)));
+
+  const rc = card(grid, "Time to restore", { wide: true });
+  const rs = stats(merged.map((p) => p.restore));
+  if (rs.n) {
+    rc.body.append(statsTable([{ label: "Revert merged after the change it reverts", st: rs, fmt: fmtDur }]));
+    rc.body.append(h("p", { class: "note" }, `Based on ${rs.n} revert commits that name the change they undo. Hotfixes cannot be matched to a failure from git, so they are not included.`, bandEl(band("restore", rs.median))));
+  } else rc.body.append(h("div", { class: "empty" }, "No reverts that reference the commit they undo were found."));
+}
+
+function renderMethod(app) {
+  const R = META.heuristics.risk;
+  app.append(h("h2", { id: "method" }, "Methodology and data quality"));
+  const grid = h("div", { class: "grid" });
+  app.append(grid);
+  const src = card(grid, "Where the data comes from", { wide: true });
+  src.body.append(h("dl", { class: "method" },
+    h("dt", null, "PR data"), h("dd", null, META.mode === "api" ? `The ${META.provider} API. Open, review and merge times are exact.` : "Inferred from git history. A PR is a merge commit on the branch, or a squash commit whose subject ends in (#123) or whose body names a merge request. Open and review times do not exist in git."),
+    h("dt", null, "Lines of code"), h("dd", null, `Net lines added minus deleted along the first-parent history of ${META.branch}, text files only. Paths matching these patterns are ignored: `, META.excludes.length ? META.excludes.map((e) => h("code", { style: "display:block" }, e)) : "none"),
+    h("dt", null, "Direct commits"), h("dd", null, META.mode === "git" ? `${fmtInt(META.direct_commits)} commit(s) landed on the branch with no PR reference and are not counted as PRs.` : "Not applicable when PR data comes from the API."),
+    h("dt", null, "Statistics"), h("dd", null, "Percentiles use linear interpolation between ranks. Standard deviation is the sample deviation. Bins in distributions are log-spaced when values span more than one order of magnitude."),
+    h("dt", null, "Time zone"), h("dd", null, "Days, weeks (Monday start) and months are UTC.")));
+
+  const dora = card(grid, "DORA definitions used", { wide: true });
+  dora.body.append(h("dl", { class: "method" },
+    h("dt", null, "Deployment"), h("dd", null, META.deploy_source === "tags" ? `A tag whose name matches ${TAG_DESC()}, dated by tag creation.` + (META.tag_default ? ` Pattern: ${META.tag_pattern}` : "") : "Every merge to the branch."),
+    h("dt", null, "Lead time for changes"), h("dd", null, "First commit of the PR to the first release tag containing the merge. When no merged PR in the selected range has a release, it is measured to merge time instead; the same rule is used on every card. First commit time is the author date of the PR's first commit (the earliest branch commit when inferred from git), which a rebase can distort."),
+    h("dt", null, "Change failure"), h("dd", null, `A merged PR that is a revert (title starts with Revert, or type revert) or matches the hotfix pattern /${META.failure_pattern}/i in its branch or labels, or ${META.failure_default ? "at the start of its title (after any type prefix)" : "in its title"}. The rate is failures divided by merged PRs.`),
+    h("dt", null, "Time to restore"), h("dd", null, "For reverts whose message says \"This reverts commit <sha>\": time from the reverted change's merge to the revert's merge."),
+    h("dt", null, "Performance bands"), h("dd", null, "Elite, High, Medium and Low use rounded thresholds from published DORA reports: frequency ≥ daily / ≥ weekly / ≥ monthly; lead time < 1 day / < 1 week / < 1 month; failure rate ≤ 5% / 10% / 15%; restore < 1 hour / < 1 day / < 1 week. DORA revises its definitions, so treat bands as rough.")));
+
+  const rk = card(grid, "Risk score rules", { wide: true, note: "Points add up and are capped at " + R.cap + ". Rules that need data the source lacks are skipped, never guessed." });
+  const tiers = (arr, unit) => arr.map(([lim, pts], i) => `${i ? "> " + arr[i - 1][0] : "≤ " + lim}${lim != null && i ? " to " + lim : ""} ${unit}: ${pts}`).join("; ");
+  rk.body.append(h("dl", { class: "method" },
+    h("dt", null, "Size"), h("dd", null, "Lines changed. " + tiers(R.size_lines, "lines")),
+    h("dt", null, "Files"), h("dd", null, "Files changed. " + tiers(R.files, "files")),
+    h("dt", null, "Type"), h("dd", null, Object.entries(R.type).map(([k, v]) => `${k} ${v}`).join(", ")),
+    h("dt", null, "Breaking change"), h("dd", null, `+${R.breaking} when the title has ! after the type or says BREAKING CHANGE.`),
+    h("dt", null, "Sensitive paths"), h("dd", null, `+${R.sensitive_paths} when any changed path looks like migrations, auth, security, payments, infra, CI or container files. Needs the merge commit locally. `, h("details", null, h("summary", null, "Show the pattern"), h("code", null, "/" + META.heuristics.sensitive + "/i"))),
+    h("dt", null, "No tests"), h("dd", null, `+${R.no_tests} when ${R.no_tests_min_code_lines}+ lines of non-test, non-doc source changed and no test file did.`),
+    h("dt", null, "Unreviewed"), h("dd", null, `+${R.unreviewed} when merged with no review from anyone other than the author. API data only.`),
+    h("dt", null, "Levels"), h("dd", null, R.levels.map(([lim, n], i) => `${n} ${lim == null ? "≥ " + R.levels[i - 1][0] : "< " + lim}`).join(", "))));
+}
+
+/* ------------------------------------------------------------------ page */
+function renderFilters() {
+  const f = $("#filters");
+  f.replaceChildren();
+  const preset = h("select", { id: "preset", "aria-label": "Date range" }, [["all", "All time"], ["12m", "Last 12 months"], ["6m", "Last 6 months"], ["3m", "Last 3 months"], ["1m", "Last month"], ["custom", "Custom range"]]
+    .map(([v, l]) => h("option", { value: v, selected: v === state.preset }, l)));
+  preset.addEventListener("change", () => { state.preset = preset.value; if (state.preset === "custom" && state.from == null) { state.from = DATA_LO; state.to = DATA_HI; } renderAll(); });
+  f.append(h("label", null, "Range", preset));
+  if (state.preset === "custom") {
+    const mkDate = (key) => { const i = h("input", { type: "date", value: isoDate(state[key]), "aria-label": key }); i.addEventListener("change", () => { const t = Date.parse(i.value) / 1000; if (!isNaN(t)) { state[key] = t; renderAll(); } }); return i; };
+    f.append(h("label", null, "From", mkDate("from")), h("label", null, "To", mkDate("to")));
+  }
+  const chips = h("div", { class: "chips", role: "group", "aria-label": "Types" });
+  const present = new Set(PRS.map((p) => groupOf(p.type)));
+  TYPE_GROUPS.filter((g) => present.has(g)).forEach((g) => {
+    const b = h("button", { type: "button", "aria-pressed": String(state.types.has(g)), title: GROUP_NOTE[g] || g }, h("span", { class: "dot", style: "background:" + groupColor(g) }), g);
+    b.addEventListener("click", () => { state.types.has(g) ? state.types.delete(g) : state.types.add(g); renderAll(); });
+    chips.append(b);
+  });
+  f.append(h("label", null, "Types", chips));
+  if (PRS.some((p) => p.bot)) {
+    const cb = h("input", { type: "checkbox", checked: state.bots });
+    cb.addEventListener("change", () => { state.bots = cb.checked; renderAll(); });
+    f.append(h("label", null, cb, "Include bot PRs"));
+  }
+  const seg = h("span", { class: "seg", role: "group", "aria-label": "Period" }, ["day", "week", "month"].map((k) => {
+    const b = h("button", { type: "button", "aria-pressed": String(state.period === k) }, k[0].toUpperCase() + k.slice(1));
+    b.addEventListener("click", () => { state.period = k; try { localStorage.setItem("repo-stats-period", k); } catch (e) { /* ignore */ } renderAll(); });
+    return b;
+  }));
+  f.append(h("label", null, "Period", seg));
+  const isDark = document.documentElement.dataset.theme !== "light";
+  const theme = h("button", { type: "button", "aria-pressed": String(isDark), title: "Switch between dark and light theme" }, isDark ? "Dark theme" : "Light theme");
+  theme.addEventListener("click", () => {
+    const next = isDark ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem("repo-stats-theme", next); } catch (e) { /* storage may be blocked */ }
+    renderAll();
+  });
+  f.append(theme);
+}
+function renderBanner() {
+  const b = $("#banner");
+  b.replaceChildren();
+  const api = META.mode === "api";
+  const box = h("div", { class: "banner" + (api ? " ok" : "") },
+    h("strong", null, api ? `Exact PR data from the ${META.provider} API.` : "PR data is inferred from git history."),
+    " ", api ? "Open, review and merge times are real." : "Open and review times are missing, first-commit times are approximate, and PRs that left no trace in git are absent. Run with an API token for accurate results.");
+  if (META.warnings.length) box.append(h("ul", null, META.warnings.map((w) => h("li", null, w))));
+  b.append(box);
+}
+function renderAll() {
+  hideTip();
+  const y = scrollY;
+  renderFilters();
+  const app = $("#app");
+  app.replaceChildren();
+  const sel = selection();
+  if (!sel.merged.length && !PRS.length) app.append(h("div", { class: "banner" }, "No pull requests were found. Lines of code still render below."));
+  renderKpis(app, sel);
+  renderLoc(app, sel);
+  renderThroughput(app, sel);
+  renderSize(app, sel);
+  renderTypes(app, sel);
+  renderRisk(app, sel);
+  renderTime(app, sel);
+  renderDora(app, sel);
+  renderMethod(app);
+  scrollTo(0, y);
+}
+document.title = "Repo stats – " + META.name;
+$("#title").textContent = META.name;
+$("#subtitle").textContent = `Branch ${META.branch} · ${fmtInt(META.commits)} commits · ${fmtDate(DATA_LO)} to ${fmtDate(DATA_HI)} · generated ${fmtDate(META.generated)}`;
+renderBanner();
+renderAll();
+let resizeTimer;
+addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderAll, 200); });
+window.__repoStats = { stats, percentile, bucketStart, countBuckets, band };
+</script>
+</body>
+</html>
