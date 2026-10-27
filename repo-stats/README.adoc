@@ -19,7 +19,8 @@ image::docs/dashboard-dark.png[Dashboard overview in dark theme: KPIs, lines of 
 .PR size section in the light theme
 image::docs/dashboard-light.png[PR size statistics, histogram, cumulative frequency and size buckets in light theme]
 
-The tool is one Python file plus one HTML template. It needs Python 3.8 or newer and git, and nothing else.
+The tool is one Python file plus one HTML template. It needs Python 3.8 or newer and git.
+For exact PR data it also uses the GitHub CLI (`gh`) or the GitLab CLI (`glab`), with the login you already have.
 The output is a single HTML file. It works offline, and you can mail it, attach it or host it anywhere.
 
 == Quick start
@@ -27,19 +28,14 @@ The output is a single HTML file. It works offline, and you can mail it, attach 
 [source,sh]
 ----
 # from a clone of this repository
-python3 repo-stats/repo_stats.py /path/to/your/repo -o stats.html
-open stats.html            # or xdg-open on Linux
+python3 repo-stats/repo_stats.py /path/to/your/repo --serve     # builds the dashboard and opens it
 
-# exact PR data from GitHub (recommended)
-GITHUB_TOKEN=$(gh auth token) python3 repo-stats/repo_stats.py /path/to/repo
-
-# exact MR data from GitLab
-GITLAB_TOKEN=glpat-... python3 repo-stats/repo_stats.py /path/to/repo
-
-# serve it locally and open a browser
-python3 repo-stats/repo_stats.py /path/to/repo --serve
+# exact PR data: log in to gh or glab once (skip this if you already use them)
+gh auth login              # or: glab auth login
+python3 repo-stats/repo_stats.py /path/to/repo -o stats.html
 ----
 
+No tokens or environment variables are needed: repo-stats asks `gh` or `glab` for the data, and they use their own login.
 Run `repo_stats.py --help` for every flag.
 
 == Where the data comes from
@@ -47,15 +43,13 @@ Run `repo_stats.py --help` for every flag.
 Git has no record of pull requests. The tool has two sources and says on the dashboard which one it used.
 
 API (recommended)::
-With a token, the tool reads PRs from the GitHub GraphQL API or the GitLab REST API.
+When the remote is on `github.com` or `gitlab.com` and `gh` or `glab` is installed and logged in, the tool reads PRs from the GitHub GraphQL API or the GitLab REST API through `gh api` or `glab api`.
 Open, ready-for-review, first review and merge times are then exact.
-Tokens are read from the environment only (`GITHUB_TOKEN`, `GH_TOKEN`, `GITLAB_TOKEN`, `GITLAB_PRIVATE_TOKEN`, or the variable named by `--token-env`).
-They are never written to any output.
-A token is sent automatically only to `github.com` and `gitlab.com`.
-For GitHub Enterprise or self-hosted GitLab, pass `--provider` and `--api-url`.
+For GitHub Enterprise or self-managed GitLab, pass `--provider` and `--hostname HOST`.
+If the CLI is missing or not logged in, the tool says how to fix it and uses git instead (or exits, with `--source api`).
 
 Git only (fallback)::
-Without a token, PRs are inferred from history.
+Without the API, PRs are inferred from history.
 A PR is a merge commit on the branch, or a squash commit whose subject ends in `(#123)` or whose body names a merge request.
 GitHub, GitLab and Bitbucket message formats are recognised.
 Open and review times do not exist in git, so those metrics are empty.
@@ -65,15 +59,132 @@ Repositories that rebase-merge with no PR number in the message show few or no P
 Lines of code, churn and release data always come from the local clone.
 A shallow clone gives incomplete history, and the dashboard warns about it. Run `git fetch --unshallow` first.
 
+== Logging in
+
+repo-stats never reads, stores or sends a token. `gh` and `glab` find their own login, in this order: an environment variable (`GH_TOKEN`, `GITLAB_TOKEN`), then the login saved by `gh auth login` or `glab auth login` (in the OS keychain where there is one).
+
+=== On your machine
+
+`gh auth login` and `glab auth login` are the simplest choice.
+Their tokens can write to your repositories, though repo-stats only ever reads (see <<read-only>>).
+To give repo-stats a token that cannot write, keep a read-only token in the OS keychain with `run.sh`:
+
+[source,sh]
+----
+repo-stats/run.sh --store github                         # opens GitHub's token page with read-only permissions filled in
+repo-stats/run.sh --store gitlab --project grp/proj      # glab creates a read_api project token, or opens the token page
+repo-stats/run.sh /path/to/repo --serve                  # every run: same options as repo_stats.py
+repo-stats/run.sh --forget github                        # delete the saved token
+----
+
+On GitHub, choose "Only select repositories" on the token page and pick the repositories to analyse.
+GitLab.com project tokens need Premium or Ultimate and the Maintainer role; otherwise `run.sh` opens the personal token page with only `read_api` selected.
+You paste the token at a hidden prompt. It is never shown, never passed as a command argument and never written to shell history or a file.
+Each run hands it to `gh` or `glab` for that run only, and repo-stats removes it from the environment of the git commands it runs.
+`run.sh` uses the macOS Keychain or, on Linux, the Secret Service (`secret-tool`, package `libsecret-tools`).
+Do not load a read-only token with `gh auth login --with-token`: gh keeps one keychain entry per host and account, so it would replace your normal login.
+
+=== GitHub Actions
+
+`gh` is installed on GitHub-hosted runners. Give the step the job's own token, limited to read access:
+
+[source,yaml]
+----
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  stats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                          # full history and tags
+      - uses: actions/checkout@v4
+        with:
+          repository: husam-e/scripts
+          path: tools
+      - run: python3 tools/repo-stats/repo_stats.py . -o repo-stats.html
+        env:
+          GH_TOKEN: ${{ github.token }}           # read by gh only; expires when the job ends
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repo-stats
+          path: repo-stats.html
+----
+
+Set `GH_TOKEN` on this step only, so other steps never see it.
+To analyse another private repository, use a GitHub App installation token (for example from `actions/create-github-app-token`), not a personal token.
+
+=== GitLab CI
+
+[source,yaml]
+----
+repo-stats:
+  image: registry.gitlab.com/gitlab-org/cli:v1.124.0    # glab and git; pin a version
+  variables:
+    GIT_DEPTH: 0                                        # full history
+    GLAB_ENABLE_CI_AUTOLOGIN: "true"                    # glab signs in with the job's CI_JOB_TOKEN
+  script:
+    - apk add --no-cache python3
+    - git clone --depth 1 https://github.com/husam-e/scripts.git /tmp/tools
+    - python3 /tmp/tools/repo-stats/repo_stats.py . -o repo-stats.html
+  artifacts:
+    paths: [repo-stats.html]
+----
+
+The job token expires when the job ends. It can list merge requests and read their comments, but not their commits.
+repo-stats then takes first-commit times from local merge commits and says so on the dashboard; squash-merged MRs have no coding time.
+For full data, add a project access token with only the `read_api` scope and a short expiry as a masked, protected CI/CD variable named `GITLAB_TOKEN`.
+The job token is not strictly read-only (GitLab also lets it create releases and deployments), so prefer a `read_api` token where that matters.
+On self-managed GitLab, a remote on the job's own server (`CI_SERVER_HOST`) is used without `--hostname`.
+
+=== Scheduled or remote jobs
+
+Give the token to the run only, from your secret store, and prefer short-lived, read-only tokens: a GitHub App installation token, or a fine-grained token with read-only Contents and Pull requests; on GitLab, a `read_api` project or group token with an expiry.
+
+[source,sh]
+----
+# systemd: LoadCredential=gh-token:/etc/creds/gh-token, then in the service's script:
+GH_TOKEN="$(cat "$CREDENTIALS_DIRECTORY/gh-token")" python3 repo_stats.py /srv/repo -o /srv/out/stats.html
+# Jenkins: withCredentials([string(credentialsId: 'gh-read', variable: 'GH_TOKEN')]) { sh '...' }
+# Kubernetes: mount the secret as an environment variable of the container
+----
+
+Avoid `gh auth login` and `glab auth login` on servers: with no keychain, they save the token in a plain-text file.
+
+[[read-only]]
 == Security
 
-Tokens are read from the environment only and are never written to any output.
-A token is sent automatically only to `github.com` and `gitlab.com`.
-API requests to `127.0.0.1`, `::1` or `localhost` never go through a proxy.
-`--serve` binds to 127.0.0.1, serves only the dashboard file, and rejects any request whose Host header is not `127.0.0.1` or `localhost` on the serving port.
-The dashboard carries a Content-Security-Policy that allows no network access, so it cannot send data anywhere even when opened from a mail attachment.
-Commit messages are read in a separate, NUL-delimited git call, so their text cannot change diff statistics.
-If a GitLab per-MR lookup fails, the review status and timings for that MR are left empty and the dashboard warns; they are never counted as "unreviewed".
+repo-stats only reads:
+
+* API requests go through `gh api` and `glab api` and pass a fixed allowlist: GraphQL queries only (never a mutation) for GitHub, and `GET` on the merge request list, commits and notes endpoints for GitLab. Anything else is refused before a process starts.
+* git is run only with read commands (`log`, `rev-parse`, `for-each-ref`, `symbolic-ref`, `remote get-url`).
+* The tests enforce both rules.
+
+Only a read-only token makes this a guarantee: with a `gh auth login` or `glab auth login` token, the rules protect against bugs, not against a modified copy of the script.
+
+repo-stats never handles a credential:
+
+* It never reads a token variable. `gh` and `glab` read their own.
+* The API host is `github.com` or `gitlab.com` from the remote, or the `--hostname` you pass. It is never taken from any other remote, because `gh` and `glab` send environment tokens to whatever host they are given. A lookalike remote such as `github.evil.example` starts no CLI at all.
+* The CLI always gets `--hostname` and runs from an empty temporary directory, so `glab` cannot pick up a host from the analysed repository. glab telemetry, update checks, prompts and the CLIs' request-logging debug switches are turned off for these calls.
+* git runs without the credential variables (`GH_TOKEN`, `GITLAB_TOKEN`, `CI_JOB_TOKEN` and the like), so hooks or filters in the analysed repository cannot read them.
+* No token is written to any output.
+
+Other protections:
+
+* `--serve` binds to 127.0.0.1, serves only the dashboard file, and rejects any request whose Host header is not `127.0.0.1` or `localhost` on the serving port.
+* The dashboard carries a Content-Security-Policy that allows no network access, so it cannot send data anywhere even when opened from a mail attachment.
+* Commit messages are read in a separate, NUL-delimited git call, so their text cannot change diff statistics.
+* If a GitLab per-MR lookup fails, the review status and timings for that MR are left empty and the dashboard warns; they are never counted as "unreviewed".
+
+What remains:
+
+* Any program running as you can ask `gh` or `glab` for its token. Read-only, short-lived tokens limit what a leaked or misused token can do.
+* A wrong `--hostname` is trusted: an environment token for that CLI goes to it.
+* In CI, the token is readable by every process in the step that sets it.
+* Analysing a repository you do not trust still runs git on it.
 
 == Heuristics
 
@@ -131,6 +242,8 @@ The Elite, High, Medium and Low bands use rounded thresholds from published DORA
 | `--json FILE`, `--csv FILE` | Export the raw data.
 | `--all-bases` | Include PRs that target other branches.
 | `--max-prs N` | Stop after N PRs. Useful on very large repositories.
+| `--provider`, `--hostname HOST` | Use GitHub Enterprise or self-managed GitLab.
+| `--source git` | Never call the API.
 |===
 
 The dashboard filters by date range, PR type and bots, and switches between day, week and month.
@@ -144,5 +257,5 @@ Every chart has a Table view with the numbers behind it.
 cd repo-stats && python3 -m unittest discover -s tests -v
 ----
 
-The tests build synthetic repositories and run the API clients against local mock servers.
+The tests build synthetic repositories and run the API code through fake `gh` and `glab` commands (`tests/fake_cli`) that answer from local mock servers. No test reaches the network or a real login.
 The browser tests use Playwright with Chromium, and skip when either is missing.

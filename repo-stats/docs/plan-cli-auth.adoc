@@ -1,8 +1,18 @@
 = Plan: replace API tokens with the `gh` and `glab` CLIs
 :toc: macro
 
-Base branch: `claude/zealous-johnson-rfqa12` (commit `6c2e7a1`).
-Status: proposal. No code is changed on this branch yet.
+Base branch: `claude/zealous-johnson-rfqa12` (rebased on commit `e0fb5b5`).
+Status: implemented on this branch. The README's "Logging in" and "Security" sections are the user-facing description.
+
+== As implemented: differences from this plan
+
+* *Errors come from the HTTP status, not from stderr.* Every call passes `--include`, so the CLI prints the status line and headers before the body. That gives the status code, `Retry-After` (so `_retry_after` stayed) and GitLab's `X-Next-Page`.
+* *GitLab paging still follows `X-Next-Page`*, read from the `--include` headers, instead of stopping on a short page. The per-MR commit and note paging added in `31a6c9e` is kept.
+* *The job-token check is one probe.* Before the per-MR lookups, one commits request decides whether the login can read MR commits. On 401/403/404, no more commits are requested, PRs are marked `commits_refused`, and `build_records` takes the first commit from the local merge commit's branch, marking `coding`, `lead` and `lead_to_deploy` as inferred.
+* *The fake CLIs forward to the existing mock servers.* `tests/fake_cli/gh` and `glab` turn each call into one HTTP request to the mock server, find tokens the way the real CLIs do, and reject any flag outside the allowlist. `helpers.clean_env()` always puts them first on `PATH`, so no test can reach a real CLI or login.
+* *`--api-url` and `--token-env` still parse* (hidden from `--help`) so that using them fails with a message naming the replacement.
+* *`run.sh` was added* for read-only tokens kept in the OS keychain (see the README).
+* *The read-only allowlist and `--hostname` validation* are enforced in `Cli`, and the G1/G2/H1 tests pin them.
 
 toc::[]
 
