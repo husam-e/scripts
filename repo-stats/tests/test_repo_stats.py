@@ -2602,5 +2602,137 @@ class G2_GitLabJobToken(unittest.TestCase):
         self.assertEqual(set(seen), {"job-tok-123"})
 
 
+FAKE_SECRET_TOOL = r'''#!/bin/sh
+# Fake secret-tool: one file per host in $FAKE_KEYRING; logs its arguments to argv.log.
+printf '%s\n' "$*" >> "$FAKE_KEYRING/argv.log"
+cmd=$1; shift
+host=''
+while [ $# -gt 0 ]; do
+  case $1 in host) host=$2; shift 2 ;; *) shift ;; esac
+done
+case $cmd in
+  store) cat > "$FAKE_KEYRING/$host" ;;
+  lookup) if [ -f "$FAKE_KEYRING/$host" ]; then cat "$FAKE_KEYRING/$host"; fi ;;
+  clear) rm -f "$FAKE_KEYRING/$host" ;;
+esac
+'''
+
+
+@unittest.skipIf(sys.platform == "darwin", "run.sh would use the real macOS Keychain")
+class H1_RunScript(unittest.TestCase):
+    """run.sh keeps a read-only token in the keychain and hands it to gh/glab for one run only."""
+
+    def setUp(self) -> None:
+        """A fake secret-tool on PATH, backed by a temporary directory."""
+        self.ring = tmpdir()
+        bin_dir = tmpdir()
+        tool = bin_dir / "secret-tool"
+        tool.write_text(FAKE_SECRET_TOOL)
+        tool.chmod(0o755)
+        self.env = helpers.clean_env({"FAKE_KEYRING": str(self.ring)})
+        self.env["PATH"] = os.pathsep.join([str(bin_dir), self.env["PATH"]])
+
+    def sh(self, args: Sequence[object], stdin: str = "", cwd: str | Path | None = None,
+           extra: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        """Run run.sh with the fake keychain and fake CLIs."""
+        return subprocess.run(["sh", str(ROOT / "run.sh"), *map(str, args)], input=stdin, capture_output=True,
+                              text=True, cwd=cwd, env={**self.env, **(extra or {})}, timeout=120)
+
+    def argv_log(self) -> str:
+        """Everything passed to secret-tool as arguments."""
+        p = self.ring / "argv.log"
+        return p.read_text() if p.exists() else ""
+
+    def test_store_github_reads_stdin_and_never_puts_the_token_in_argv(self) -> None:
+        """--store github prints a read-only token link for the remote's owner and saves the pasted token."""
+        r = api_repo()
+        p = self.sh(["--store", "github"], stdin=FAKE + "\n", cwd=r.path)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual((self.ring / "github.com").read_text(), FAKE)
+        self.assertNotIn(FAKE, self.argv_log())
+        self.assertNotIn(FAKE, p.stdout + p.stderr)
+        url = next(w for w in p.stderr.split() if w.startswith("https://github.com/settings/personal-access-tokens/new?"))
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        self.assertEqual((q["contents"], q["pull_requests"], q["target_name"], q["expires_in"]),
+                         (["read"], ["read"], ["acme"], ["30"]))
+        self.assertNotIn("write", url)
+
+    def test_store_rejects_text_that_is_not_a_token(self) -> None:
+        """Pasting something with spaces or quotes saves nothing."""
+        p = self.sh(["--store", "github"], stdin='not "a" token\n')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertFalse((self.ring / "github.com").exists())
+
+    def test_run_hands_the_saved_token_to_gh_for_one_run(self) -> None:
+        """A saved github.com token reaches gh as GH_TOKEN; it is in no output and not in git's environment."""
+        r = api_repo()
+        (self.ring / "github.com").write_text(FAKE)
+        out = tmpdir()
+        log = tmpdir() / "cli.log"
+        with ms.MockServer(ms.github_handler(desc_nodes(github_nodes(r)), page_size=50, expect_token=FAKE)) as srv:
+            p = self.sh([r.path, "-o", out / "o.html", "--json", out / "o.json"],
+                        extra={"REPO_STATS_FAKE_URL": srv.url, "REPO_STATS_FAKE_LOG": str(log)})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("Using the read-only github.com token from the keychain", p.stderr)
+        self.assertEqual(json.loads((out / "o.json").read_text())["meta"]["mode"], "api")
+        self.assertNotIn(FAKE, (out / "o.html").read_text() + (out / "o.json").read_text() + p.stdout + p.stderr)
+        self.assertEqual({c["env"].get("GH_TOKEN") for c in helpers.cli_calls(log)}, {FAKE})
+
+    def test_enterprise_host_gets_the_enterprise_variable(self) -> None:
+        """For --hostname ghe.example.com the token goes to gh as GH_ENTERPRISE_TOKEN, for that host only."""
+        r = api_repo("git@ghe.example.com:acme/widgets.git")
+        (self.ring / "ghe.example.com").write_text(FAKE)
+        (self.ring / "github.com").write_text("other-token-should-not-be-used")
+        log = tmpdir() / "cli.log"
+        with ms.MockServer(ms.github_handler(desc_nodes(github_nodes(r)), page_size=50, expect_token=FAKE)) as srv:
+            p = self.sh([r.path, "-o", tmpdir() / "o.html", "--provider", "github", "--hostname", "GHE.example.com",
+                         "--source", "api"], extra={"REPO_STATS_FAKE_URL": srv.url, "REPO_STATS_FAKE_LOG": str(log)})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        calls = helpers.cli_calls(log)
+        self.assertTrue(calls)
+        for c in calls:
+            self.assertEqual(c["env"].get("GH_ENTERPRISE_TOKEN"), FAKE)
+            self.assertNotIn("GH_TOKEN", c["env"])
+            self.assertEqual(c["argv"][c["argv"].index("--hostname") + 1], "ghe.example.com")
+
+    def test_without_a_saved_token_the_cli_login_is_used(self) -> None:
+        """With nothing saved, run.sh sets no token and gh uses its own login."""
+        r = api_repo()
+        with ms.MockServer(ms.github_handler(desc_nodes(github_nodes(r)), page_size=50, expect_token="own-login")) as srv:
+            p = self.sh([r.path, "-o", tmpdir() / "o.html", "--source", "api"],
+                        extra={"REPO_STATS_FAKE_URL": srv.url, "GH_TOKEN": "own-login"})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("from the keychain", p.stderr)
+
+    def test_forget(self) -> None:
+        """--forget deletes the saved token."""
+        (self.ring / "gitlab.com").write_text(FAKE)
+        p = self.sh(["--forget", "gitlab"])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse((self.ring / "gitlab.com").exists())
+
+    def test_store_gitlab_creates_a_read_api_project_token_with_glab(self) -> None:
+        """--store gitlab --project asks glab for a read_api Reporter token and saves it without echoing it."""
+        log = tmpdir() / "cli.log"
+        p = self.sh(["--store", "gitlab", "--project", "grp/proj"],
+                    extra={"REPO_STATS_FAKE_NEW_TOKEN": "glpat-New_Token.01", "REPO_STATS_FAKE_LOG": str(log)})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual((self.ring / "gitlab.com").read_text(), "glpat-New_Token.01")
+        self.assertNotIn("glpat-New_Token.01", self.argv_log() + p.stdout + p.stderr)
+        argv = helpers.cli_calls(log)[0]["argv"]
+        self.assertEqual(argv[:2], ["token", "create"])
+        for flag, value in (("--scope", "read_api"), ("--access-level", "reporter"), ("--duration", "30d"),
+                            ("--repo", "https://gitlab.com/grp/proj")):
+            self.assertEqual(argv[argv.index(flag) + 1], value, flag)
+
+    def test_store_gitlab_falls_back_to_the_token_page(self) -> None:
+        """When glab cannot create a project token, the read_api token page is offered instead."""
+        p = self.sh(["--store", "gitlab", "--project", "grp/proj"], stdin="glpat-pasted\n")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("could not create a project access token", p.stderr)
+        self.assertIn("personal_access_tokens?name=repo-stats+read-only&scopes=read_api", p.stderr)
+        self.assertEqual((self.ring / "gitlab.com").read_text(), "glpat-pasted")
+
+
 if __name__ == "__main__":
     unittest.main()
