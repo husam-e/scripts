@@ -234,6 +234,7 @@ def build_api_data() -> dict[str, Any]:
     git_data, _ = collect(work)
     subprocess.run(["git", "-C", str(work), "remote", "add", "origin", "https://github.com/acme/widgets.git"], check=True)
     rnd = random.Random(11)
+    crnd = random.Random(12)  # review cycles; separate, so the seeded data above stays the same
     nodes = []
     for i, p in enumerate(git_data["prs"]):
         n = p["number"]
@@ -245,9 +246,14 @@ def build_api_data() -> dict[str, Any]:
         author, atype = "alice", "User"
         if i % 10 == 3:
             author, atype = "dependabot[bot]", "Bot"
-        reviews = []
+        reviews: list[tuple[Any, ...]] = []
         if rnd.random() < 0.85:
-            reviews = [("bob", "User", "APPROVED", min(merged - 60, max(ready + 60, ready + int(rnd.expovariate(1 / 20000)))))]
+            approved = min(merged - 60, max(ready + 60, ready + int(rnd.expovariate(1 / 20000))))
+            # 0-5 earlier rounds of changes requested on older commits, spread between ready and the approval.
+            rounds = crnd.choice([0, 0, 0, 1, 1, 2, 3, 5])
+            gap = max(1, (approved - ready - 60) // (rounds + 1))
+            reviews = [("carol", "User", "CHANGES_REQUESTED", approved - gap * (rounds - k), f"v{k}") for k in range(rounds)]
+            reviews.append(("bob", "User", "APPROVED", approved, f"v{rounds}"))
         title = p["title"]
         if i == 7:
             title = "feat!: " + EVIL
@@ -665,6 +671,34 @@ class UiTests(unittest.TestCase):
         median_cell = dora[3]  # Metric, n, mean, median
         kpi_clean = re.sub(r"(Elite|High|Medium|Low)$", "", kpi).strip()
         self.assertEqual(kpi_clean, median_cell, "KPI uses lead_to_deploy ?? lead per PR, DORA card uses one metric for all PRs")
+
+    # ------------------------------------------------------------------ review cycles
+    def test_review_cycle_kpis_and_table_match_python(self) -> None:
+        """Review cycle KPIs and statistics, with and without unreviewed PRs, match Python's numbers."""
+        merged = [p for p in self.sets["api"]["data"]["prs"] if p["state"] == "merged"]
+        known = [p["review_cycles"] for p in merged if p["review_cycles"] is not None]
+        reviewed = [c for c in known if c > 0]
+        self.assertTrue(reviewed and len(reviewed) < len(known) and max(reviewed) > 1, "dataset needs a mix of cycles")
+        snap = self.R["stats"]["api"]["snap"]
+        k = snap["kpis"]
+        self.assertAlmostEqual(cast(float, parse_num(k["Median review cycles"]["value"])), cast(float, percentile(reviewed, 50)), delta=0.051)
+        self.assertEqual(int(k["Merged without review"]["value"]), len(known) - len(reviewed))
+        rows = {r[0]: r for r in snap["cycles"]}
+        for label, vals in (("Review cycles, reviewed PRs only", reviewed), ("Review cycles, unreviewed PRs counted as 0", known)):
+            want = cast(dict, stat_row(vals))
+            for i, col in enumerate(COLS):
+                with self.subTest(label, col=col):
+                    self.assertAlmostEqual(cast(float, parse_num(rows[label][i + 1])), want[col], delta=0.051)
+        self.assertEqual(sum(int(r[1]) for r in snap["cyclesBySize"]), len(known))
+        self.assertEqual(int(snap["mostCycles"][0][3]), max(reviewed))
+
+    def test_review_cycles_need_api_in_git_mode(self) -> None:
+        """In git mode the review cycle KPIs are empty and the section says it needs the API."""
+        snap = self.R["stats"]["merge"]["snap"]
+        self.assertEqual(snap["kpis"]["Median review cycles"]["value"], "–")
+        self.assertEqual(snap["kpis"]["Merged without review"]["hint"], "needs API review data")
+        self.assertIsNone(snap["cycles"])
+        self.assertTrue(any("Review cycles need review data" in e for e in snap["empties"]))
 
     # ------------------------------------------------------------------ D6
     def test_d6_tooltips(self) -> None:

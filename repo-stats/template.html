@@ -118,7 +118,7 @@ svg .mark-label { paint-order: stroke; stroke: var(--surface); stroke-width: 3px
     <div class="sub" id="subtitle"></div>
     <nav class="toc" aria-label="Sections">
       <a href="#overview">Overview</a><a href="#loc">Lines of code</a><a href="#throughput">PR volume</a><a href="#size">PR size</a>
-      <a href="#types">PR types</a><a href="#risk">Risk</a><a href="#time">Time</a><a href="#dora">DORA</a><a href="#method">Methodology</a>
+      <a href="#types">PR types</a><a href="#risk">Risk</a><a href="#time">Time</a><a href="#reviews">Reviews</a><a href="#dora">DORA</a><a href="#method">Methodology</a>
     </nav>
   </header>
   <div class="filters" id="filters" role="group" aria-label="Filters"></div>
@@ -654,6 +654,15 @@ function leadMode(prs) {
   return { release, key: release ? "lead_to_deploy" : "lead", label: release ? "first commit to release" : "first commit to merge" };
 }
 
+/** Review cycles for PRs: known (cycle count available), reviewed (1+ cycles), unreviewed (0 cycles), with
+ *  statistics that leave unreviewed PRs out (stReviewed) and that count them as 0 (stAll). */
+function cycleSplit(prs) {
+  const known = prs.filter((p) => p.review_cycles != null);
+  const reviewed = known.filter((p) => p.review_cycles > 0);
+  const unreviewed = known.filter((p) => p.review_cycles === 0);
+  return { known, reviewed, unreviewed, stReviewed: stats(reviewed.map((p) => p.review_cycles)), stAll: stats(known.map((p) => p.review_cycles)) };
+}
+
 /* ------------------------------------------------------------------ sections */
 const METRICS = [
   ["coding", "Coding time", "First commit to PR ready"],
@@ -678,10 +687,14 @@ function renderKpis(app, sel) {
   const locEnd = DATA.loc.days.filter((d) => d[0] <= r.hi).slice(-1)[0];
   const kpi = (label, value, hint, b) => h("div", { class: "kpi" }, h("div", { class: "label" }, label), h("div", { class: "value" }, value, bandEl(b)), h("div", { class: "hint" }, hint));
   const freq = deploys.length / days;
+  const cyc = cycleSplit(merged);
+  const noCyc = META.mode === "git" ? "needs API review data" : "no review data";
   app.append(h("div", { class: "kpis", id: "overview" },
     kpi("Merged PRs", fmtInt(merged.length), `${fmtNum(merged.length / days * 7)} per week`),
     kpi("Median PR size", merged.length ? fmtInt(size.median) : "–", `lines changed · p90 ${fmtInt(size.p90)}`),
     kpi("Median lead time", fmtDur(lead.median), `${lm.label} · p90 ${fmtDur(lead.p90)}`, band("lead", lead.median)),
+    kpi("Median review cycles", cyc.reviewed.length ? fmtNum(cyc.stReviewed.median) : "–", cyc.known.length ? `reviewed PRs · p90 ${fmtNum(cyc.stReviewed.p90)} · ${fmtNum(cyc.stAll.median)} incl. unreviewed` : noCyc),
+    kpi("Merged without review", cyc.known.length ? fmtInt(cyc.unreviewed.length) : "–", cyc.known.length ? `${fmtPct(cyc.unreviewed.length / cyc.known.length)} of merged PRs` : noCyc),
     kpi("Releases", fmtInt(deploys.length), deploys.length ? `${fmtNum(freq * 7)} per week` : "no release tags matched", deploys.length ? band("freq", freq) : null),
     kpi("Change failure rate", fmtPct(cfr), `${fails} revert/hotfix PRs`, band("cfr", cfr)),
     kpi("High or critical risk", fmtPct(hiRisk), "share of merged PRs"),
@@ -819,12 +832,13 @@ function renderTypes(app, sel) {
   const lm = leadMode(prs);
   const types = [...new Set(prs.map((p) => p.type))].sort((a, b) => prs.filter((p) => p.type === b).length - prs.filter((p) => p.type === a).length);
   tc.body.append(h("div", { class: "tablewrap" }, h("table", null,
-    h("thead", null, h("tr", null, ["Type", "PRs", "Share", "Median lines", "p90 lines", "Median files", lm.release ? "Median lead (to release)" : "Median lead (to merge)", "Mean risk", "Breaking"].map((c) => h("th", null, c)))),
+    h("thead", null, h("tr", null, ["Type", "PRs", "Share", "Median lines", "p90 lines", "Median files", lm.release ? "Median lead (to release)" : "Median lead (to merge)", "Median review cycles", "Mean risk", "Breaking"].map((c) => h("th", null, c)))),
     h("tbody", null, types.map((t) => {
       const sub = prs.filter((p) => p.type === t);
       return h("tr", null, h("td", null, t), h("td", null, fmtInt(sub.length)), h("td", null, fmtPct(sub.length / prs.length)),
         h("td", null, fmtInt(stats(sub.map((p) => p.lines)).median)), h("td", null, fmtInt(stats(sub.map((p) => p.lines)).p90)),
         h("td", null, fmtInt(stats(sub.map((p) => p.files)).median)), h("td", null, fmtDur(stats(sub.map((p) => p[lm.key])).median)),
+        h("td", null, fmtNum(cycleSplit(sub).stReviewed.median)),
         h("td", null, fmtNum(stats(sub.map((p) => p.risk)).mean)), h("td", null, fmtInt(sub.filter((p) => p.breaking).length)));
     })))));
   const src = groupBy(prs, (p) => p.type_source);
@@ -910,6 +924,78 @@ function renderTime(app, sel) {
   draw();
 }
 
+function renderReviews(app, sel) {
+  sectionHead(app, "reviews", "Review cycles", "How many rounds of review each merged PR went through. A cycle starts when someone other than the author reviews a version of the code that no earlier review covered.");
+  const grid = h("div", { class: "grid" });
+  app.append(grid);
+  const cyc = cycleSplit(sel.merged);
+  const prs = cyc.known;
+  if (!prs.length) {
+    const c = card(grid, "Review cycles", { wide: true });
+    c.body.append(h("div", { class: "empty" }, META.mode === "git" ? "Review cycles need review data from the hosting API. Install and log in to gh or glab."
+      : sel.merged.length ? "No review data for the merged PRs in this range (GitLab with --no-reviews, or the review lookups failed)." : "No merged PRs in this range."));
+    return;
+  }
+  const lowerBound = inferredShare(prs, "review_cycles");
+  const t = card(grid, "Review cycle statistics", { wide: true });
+  const rows = [
+    { key: "review_cycles", label: "Review cycles, reviewed PRs only", st: cyc.stReviewed, fmt: fmtNum },
+    { key: "review_cycles", label: "Review cycles, unreviewed PRs counted as 0", st: cyc.stAll, fmt: fmtNum },
+    { key: "changes_requested", label: "Changes-requested reviews per PR", st: stats(prs.map((p) => p.changes_requested)), fmt: fmtNum },
+    { key: "reviewers", label: "Reviewers per PR", st: stats(prs.map((p) => p.reviewers)), fmt: fmtNum },
+  ];
+  t.body.append(statsTable(rows, [{ name: "Source", value: (r) => {
+    if (!r.st.n) return r.key === "changes_requested" ? "GitHub only" : "n/a";
+    return r.key === "review_cycles" && lowerBound ? fmtPct(lowerBound) + " lower bound" : "exact";
+  } }]));
+  const missing = sel.merged.length - prs.length;
+  t.body.append(h("p", { class: "note" }, `${fmtInt(cyc.unreviewed.length)} of ${fmtInt(prs.length)} merged PRs (${fmtPct(cyc.unreviewed.length / prs.length)}) were merged with no review from anyone but the author.`
+    + (missing ? ` ${fmtInt(missing)} merged PR(s) have no review data and are left out.` : "")
+    + (lowerBound ? " A lower bound means the PR had more reviews than one API page returns, or reached the counting cap." : "")));
+
+  const B = META.heuristics.review_cycle_buckets, top = B[B.length - 1];
+  const bucketOf = (v) => Math.min(v, top);
+  const bc = card(grid, "PRs by number of review cycles", { note: `The last bar is ${top} or more cycles. 0 means merged with no review.` });
+  barChart(bc.body, { cats: B.map((b) => ({ short: b === top ? b + "+" : String(b), long: (b === top ? b + " or more" : String(b)) + (b === 1 ? " cycle" : " cycles") })),
+    series: [{ name: "Unreviewed", color: css("--st-crit"), vals: B.map((b) => b === 0 ? cyc.unreviewed.length : 0) },
+      { name: "Reviewed", color: css("--c1"), vals: B.map((b) => b === 0 ? 0 : cyc.reviewed.filter((p) => bucketOf(p.review_cycles) === b).length) }],
+    stacked: true, label: "PRs by number of review cycles", table: bc.table, catName: "Review cycles" });
+
+  const uc = card(grid, "Reviewed and unreviewed PRs by month", { note: "Merged PRs with review data, stacked." });
+  const months = countBuckets([], "month", sel.r.lo, sel.r.hi).map((b) => b.t);
+  barChart(uc.body, { cats: months.map((m) => ({ short: bucketLabel(m, "month"), long: bucketLabel(m, "month") })),
+    series: [{ name: "Reviewed", color: css("--c1"), vals: months.map((m) => cyc.reviewed.filter((p) => bucketStart(p.merged, "month") === m).length) },
+      { name: "Unreviewed", color: css("--st-crit"), vals: months.map((m) => cyc.unreviewed.filter((p) => bucketStart(p.merged, "month") === m).length) }],
+    stacked: true, label: "Reviewed and unreviewed PRs by month", table: uc.table, catName: "Month" });
+
+  const tc = card(grid, "Review cycles over time", { wide: true, note: "Median and p90 of reviewed PRs, and the mean with unreviewed PRs counted as 0, by month. Months with no reviewed PR are skipped." });
+  const byM = groupBy(prs, (p) => bucketStart(p.merged, "month"));
+  const mk = [...byM.keys()].filter((m) => byM.get(m).some((p) => p.review_cycles > 0)).sort((a, b) => a - b);
+  const monthStats = (m) => cycleSplit(byM.get(m));
+  lineChart(tc.body, { xs: mk, series: [{ name: "Median (reviewed)", color: css("--c1"), ys: mk.map((m) => monthStats(m).stReviewed.median) },
+    { name: "p90 (reviewed)", color: css("--c2"), ys: mk.map((m) => monthStats(m).stReviewed.p90) },
+    { name: "Mean (incl. unreviewed)", color: css("--c3"), ys: mk.map((m) => monthStats(m).stAll.mean) }],
+    yFmt: fmtNum, tipFmt: fmtNum, xTip: (x) => bucketLabel(x, "month"), label: "Review cycles over time", table: tc.table });
+
+  const SB = META.heuristics.size_buckets;
+  const sc = card(grid, "Review cycles by PR size", { wide: true, note: SB.map(([lim, n], i) => lim == null ? `${n} > ${SB[i - 1][0]}` : `${n} ≤ ${lim}`).join(", ") + " lines changed." });
+  const sizeOf = (v) => SB.find((b) => b[0] == null || v <= b[0])[1];
+  const sized = groupBy(prs.filter((p) => p.lines != null), (p) => sizeOf(p.lines));
+  sc.body.append(h("div", { class: "tablewrap" }, simpleTable(["Size", "PRs", "Median cycles (reviewed)", "p90 cycles (reviewed)", "Mean cycles (incl. unreviewed)", "Unreviewed", "Unreviewed share"],
+    SB.map((b) => b[1]).filter((n) => sized.has(n)).map((n) => {
+      const s2 = cycleSplit(sized.get(n));
+      return [n, fmtInt(s2.known.length), fmtNum(s2.stReviewed.median), fmtNum(s2.stReviewed.p90), fmtNum(s2.stAll.mean), fmtInt(s2.unreviewed.length), fmtPct(s2.unreviewed.length / s2.known.length)];
+    }))));
+
+  const most = cyc.reviewed.slice().sort((a, b) => b.review_cycles - a.review_cycles || (b.changes_requested || 0) - (a.changes_requested || 0) || (b.lines || 0) - (a.lines || 0)).slice(0, 10);
+  const mc = card(grid, "Ten PRs with the most review cycles", { wide: true });
+  if (!most.length) mc.body.append(h("div", { class: "empty" }, "No reviewed PRs in this range."));
+  else mc.body.append(h("div", { class: "tablewrap" }, h("table", null,
+    h("thead", null, h("tr", null, ["PR", "Type", "Lines", "Review cycles", "Changes requested", "Reviewers"].map((c) => h("th", { class: c === "PR" ? "title" : null }, c)))),
+    h("tbody", null, most.map((p) => h("tr", null, h("td", { class: "title" }, (p.number != null ? "#" + p.number + " " : "") + p.title), h("td", null, p.type), h("td", null, fmtInt(p.lines)),
+      h("td", null, fmtInt(p.review_cycles) + (p.inferred.includes("review_cycles") ? "+" : "")), h("td", null, fmtInt(p.changes_requested)), h("td", null, fmtInt(p.reviewers))))))));
+}
+
 function renderDora(app, sel) {
   sectionHead(app, "dora", "DORA metrics", "Deployment frequency, lead time for changes, change failure rate and time to restore. Definitions are approximations; see Methodology.");
   const grid = h("div", { class: "grid" });
@@ -976,6 +1062,14 @@ function renderMethod(app) {
     h("dt", null, "Change failure"), h("dd", null, `A merged PR that is a revert (title starts with Revert, or type revert) or matches the hotfix pattern /${META.failure_pattern}/i in its branch or labels, or ${META.failure_default ? "at the start of its title (after any type prefix)" : "in its title"}. The rate is failures divided by merged PRs.`),
     h("dt", null, "Time to restore"), h("dd", null, "For reverts whose message says \"This reverts commit <sha>\": time from the reverted change's merge to the revert's merge."),
     h("dt", null, "Performance bands"), h("dd", null, "Elite, High, Medium and Low use rounded thresholds from published DORA reports: frequency ≥ daily / ≥ weekly / ≥ monthly; lead time < 1 day / < 1 week / < 1 month; failure rate ≤ 5% / 10% / 15%; restore < 1 hour / < 1 day / < 1 week. DORA revises its definitions, so treat bands as rough.")));
+
+  const rv = card(grid, "Review cycles", { wide: true, note: "API data only. Reviews by the author, by bots, still pending, or submitted after the merge are ignored." });
+  rv.body.append(h("dl", { class: "method" },
+    h("dt", null, "Cycle"), h("dd", null, "One round of review on one version of the PR. A PR approved on first look has 1 cycle; changes requested, a fix pushed and an approval make 2. Several reviewers on the same version are one cycle, and a push nobody reviewed before the merge adds none."),
+    h("dt", null, "GitHub"), h("dd", null, "Each review names the head commit it was made against. The first review of a commit no earlier review covered starts a new cycle, so force-pushes and rebases count correctly, and replies to an older review thread (filed against the older commit) do not add cycles."),
+    h("dt", null, "GitLab"), h("dd", null, "From the merge request's notes: comments and approvals by other people are reviews, and \"added N commits\" system notes are pushes. A cycle is the reviews between two pushes. GitLab gives no changes-requested count."),
+    h("dt", null, "Unreviewed"), h("dd", null, "Merged PRs with 0 cycles. Statistics are shown both without them (reviewed PRs only) and with them counted as 0, and their number is shown on its own."),
+    h("dt", null, "Limits"), h("dd", null, `Counting stops at ${META.heuristics.review_cycle_cap} cycles, and GitHub returns at most 100 reviews per PR; such values are lower bounds.`)));
 
   const rk = card(grid, "Risk score rules", { wide: true, note: "Points add up and are capped at " + R.cap + ". Rules that need data the source lacks are skipped, never guessed." });
   const tiers = (arr, unit) => arr.map(([lim, pts], i) => `${i ? "> " + arr[i - 1][0] : "≤ " + lim}${lim != null && i ? " to " + lim : ""} ${unit}: ${pts}`).join("; ");
@@ -1056,6 +1150,7 @@ function renderAll() {
   renderTypes(app, sel);
   renderRisk(app, sel);
   renderTime(app, sel);
+  renderReviews(app, sel);
   renderDora(app, sel);
   renderMethod(app);
   scrollTo(0, y);
@@ -1067,7 +1162,7 @@ renderBanner();
 renderAll();
 let resizeTimer;
 addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderAll, 200); });
-window.__repoStats = { stats, percentile, bucketStart, countBuckets, band };
+window.__repoStats = { stats, percentile, bucketStart, countBuckets, band, cycleSplit };
 </script>
 </body>
 </html>
