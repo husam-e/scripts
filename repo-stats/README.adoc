@@ -196,7 +196,7 @@ repo-stats never handles a credential:
 
 * It never reads a token variable. `gh` and `glab` read their own.
 * The API host is `github.com` or `gitlab.com` from the remote, or the `--hostname` you pass. It is never taken from any other remote, because `gh` and `glab` send environment tokens to whatever host they are given. A lookalike remote such as `github.evil.example` starts no CLI at all.
-* The CLI always gets `--hostname` and runs from an empty temporary directory, so `glab` cannot pick up a host from the analysed repository. glab telemetry, update checks, prompts and the CLIs' request-logging debug switches are turned off for these calls.
+* The CLI always gets `--hostname` and runs from the system temp directory, never the analysed repository, so `glab` cannot pick up a host from the repository's remote. glab telemetry (which sends its own request with the credential) and the CLIs' request-logging debug switches are turned off for these calls.
 * git runs without the credential variables (`GH_TOKEN`, `GITLAB_TOKEN`, `CI_JOB_TOKEN` and the like), so hooks or filters in the analysed repository cannot read them.
 * No token is written to any output.
 

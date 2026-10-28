@@ -2277,8 +2277,8 @@ class F2_GitLabDetailErrors(unittest.TestCase):
         """Run fetch_gitlab against `handler` and return (raw PRs, info)."""
         info: dict[str, int] = {}
         env = helpers.clean_env({"GITLAB_TOKEN": FAKE})
-        with mock.patch.object(rs.time, "sleep", lambda s: None), ms.MockServer(handler) as srv, \
-                rs.Cli("glab", "gitlab.com", {**env, "REPO_STATS_FAKE_URL": srv.url}) as cli:
+        with mock.patch.object(rs.time, "sleep", lambda s: None), ms.MockServer(handler) as srv:
+            cli = rs.Cli("glab", "gitlab.com", {**env, "REPO_STATS_FAKE_URL": srv.url})
             prs = rs.fetch_gitlab(cli, "g/p", None, "main", False, None, True, progress=lambda m: None, info=info)
         return prs, info
 
@@ -2444,27 +2444,26 @@ class G1_ReadOnlyCli(unittest.TestCase):
     def test_graphql_refuses_mutations(self) -> None:
         """Mutations, subscriptions and anything that is not a query are refused before gh runs."""
         log = tmpdir() / "cli.log"
-        with self._cli("gh", REPO_STATS_FAKE_LOG=str(log)) as cli:
-            for q in ("mutation { addStar(input:{starrableId:\"x\"}) { clientMutationId } }",
-                      "query { a } mutation { b }", "subscription { x }", "{ viewer { login } }", ""):
-                with self.assertRaises(rs.ApiError, msg=q):
-                    cli.graphql(q, {})
+        cli = self._cli("gh", REPO_STATS_FAKE_LOG=str(log))
+        for q in ("mutation { addStar(input:{starrableId:\"x\"}) { clientMutationId } }",
+                  "query { a } mutation { b }", "subscription { x }", "{ viewer { login } }", ""):
+            with self.assertRaises(rs.ApiError, msg=q):
+                cli.graphql(q, {})
         self.assertEqual(helpers.cli_calls(log), [], "no gh process may start for a refused request")
 
     def test_gitlab_refuses_endpoints_outside_the_allowlist(self) -> None:
         """Only the three merge request list endpoints can be requested, and only with GET."""
         log = tmpdir() / "cli.log"
-        with self._cli("glab", REPO_STATS_FAKE_LOG=str(log)) as cli:
-            for ep in ("projects/g%2Fp/merge_requests/1/approve", "projects/g%2Fp/merge_requests/1/merge",
-                       "projects/g%2Fp", "user", "projects/g/p/merge_requests", "projects/g%2Fp/merge_requests/1",
-                       "projects/g%2Fp/merge_requests?x=1", "graphql", "/projects/g%2Fp/merge_requests"):
-                with self.assertRaises(rs.ApiError, msg=ep):
-                    cli.get(ep, {})
-            with self.assertRaises(rs.ApiError):  # gh cannot be used for GitLab requests, nor glab for GraphQL
-                cli.graphql(rs.GITHUB_QUERY, {})
-        with self._cli("gh") as cli:
-            with self.assertRaises(rs.ApiError):
-                cli.get("projects/g%2Fp/merge_requests", {})
+        cli = self._cli("glab", REPO_STATS_FAKE_LOG=str(log))
+        for ep in ("projects/g%2Fp/merge_requests/1/approve", "projects/g%2Fp/merge_requests/1/merge",
+                   "projects/g%2Fp", "user", "projects/g/p/merge_requests", "projects/g%2Fp/merge_requests/1",
+                   "projects/g%2Fp/merge_requests?x=1", "graphql", "/projects/g%2Fp/merge_requests"):
+            with self.assertRaises(rs.ApiError, msg=ep):
+                cli.get(ep, {})
+        with self.assertRaises(rs.ApiError):  # glab cannot send GraphQL, nor gh GitLab requests
+            cli.graphql(rs.GITHUB_QUERY, {})
+        with self.assertRaises(rs.ApiError):
+            self._cli("gh").get("projects/g%2Fp/merge_requests", {})
         self.assertEqual(helpers.cli_calls(log), [])
 
     def test_source_has_no_write_requests(self) -> None:
@@ -2483,8 +2482,6 @@ class G1_ReadOnlyCli(unittest.TestCase):
         for bad in ("-x", "--hostname=evil", "evil.example:8443", "https://evil.example", "a b", "evil.example/x", ""):
             with self.assertRaises((rs.ToolError, SystemExit), msg=bad):
                 collect(r, "--provider", "github", "--hostname", bad, env={"GITHUB_TOKEN": FAKE})
-        with self.assertRaises(rs.ApiError):
-            rs.Cli("gh", "evil example", helpers.clean_env())
 
     def test_hostname_needs_provider_for_unknown_hosts(self) -> None:
         """--hostname for a host that is not github.com/gitlab.com needs --provider."""
@@ -2494,7 +2491,7 @@ class G1_ReadOnlyCli(unittest.TestCase):
         self.assertTrue(any("needs --provider" in w for w in d["meta"]["warnings"]))
 
     def test_every_call_is_read_only_explicit_host_and_outside_the_repo(self) -> None:
-        """Each gh/glab call has --hostname and --include, no write flags, and runs from an empty temp dir."""
+        """Each gh/glab call has --hostname and --include, no write flags, and runs from the system temp dir."""
         for remote, provider_env, handler_for in (
                 ("https://github.com/acme/widgets.git", "GITHUB_TOKEN",
                  lambda r: ms.github_handler(desc_nodes(github_nodes(r)), page_size=3)),
@@ -2507,7 +2504,6 @@ class G1_ReadOnlyCli(unittest.TestCase):
             self.assertEqual(d["meta"]["mode"], "api", remote)
             calls = helpers.cli_calls(log)
             self.assertGreater(len(calls), 1)
-            cwds = set()
             for c in calls:
                 argv = c["argv"]
                 self.assertEqual(argv[0], "api")
@@ -2519,14 +2515,10 @@ class G1_ReadOnlyCli(unittest.TestCase):
                     self.assertEqual(argv[1], "graphql")
                     query = next(a for a in argv if a.startswith("query="))[len("query="):]
                     self.assertTrue(rs.READ_ONLY_GRAPHQL.match(query))
-                cwd = Path(c["cwd"]).resolve()
-                self.assertFalse(str(cwd).startswith(str(Path(r.path).resolve())), cwd)
-                cwds.add(cwd)
-            for cwd in cwds:
-                self.assertFalse(cwd.exists(), "the temporary working directory is removed afterwards")
+                self.assertEqual(Path(c["cwd"]).resolve(), Path(tempfile.gettempdir()).resolve())
 
-    def test_cli_environment_is_quiet_and_has_no_debug_switches(self) -> None:
-        """The CLIs run with telemetry, prompts and update checks off, and without request-dumping debug flags."""
+    def test_cli_environment_has_no_telemetry_or_debug_switches(self) -> None:
+        """glab runs with telemetry off, and neither CLI gets request-dumping debug flags."""
         r = api_repo("git@gitlab.com:grp/sub/proj.git")
         log = tmpdir() / "cli.log"
         noisy = {"GH_DEBUG": "api", "DEBUG": "1", "GLAB_DEBUG": "true", "GLAB_DEBUG_HTTP": "true"}
@@ -2535,8 +2527,7 @@ class G1_ReadOnlyCli(unittest.TestCase):
         calls = helpers.cli_calls(log)
         self.assertTrue(calls)
         for c in calls:
-            for k, v in rs.CLI_QUIET_ENV.items():
-                self.assertEqual(c["env"].get(k), v, k)
+            self.assertEqual(c["env"].get("GLAB_SEND_TELEMETRY"), "false")
             for k in noisy:
                 self.assertNotIn(k, c["env"])
             self.assertEqual(c["env"].get("GITLAB_TOKEN"), FAKE, "the CLI keeps its own login variables")
