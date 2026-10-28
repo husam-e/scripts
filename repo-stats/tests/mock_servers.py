@@ -102,18 +102,21 @@ def gh_node(number: int, title: str, created: int, merged: int | None = None, cl
             state: str | None = None, base: str = "main", head: str | None = None, author: str = "alice",
             author_type: str = "User", additions: int = 10, deletions: int = 2, files: int = 1, commits: int = 1,
             first_commit: int | None = None, merge_oid: str | None = None, labels: Iterable[str] = (),
-            reviews: Iterable[tuple[str, str, str, int]] = (), ready: int | None = None,
-            draft: bool = False) -> dict[str, Any]:
+            reviews: Iterable[tuple[Any, ...]] = (), ready: int | None = None,
+            draft: bool = False, review_total: int | None = None) -> dict[str, Any]:
     """Build one GitHub GraphQL pullRequest node with the fields repo_stats queries.
 
     Times are Unix seconds. The state is MERGED when `merged` is set and OPEN otherwise, unless
     `state` is given.
 
     Args:
-        reviews: (login, author __typename, review state, submitted time) tuples.
+        reviews: (login, author __typename, review state, submitted time[, reviewed commit oid]) tuples.
+            Without an oid every review is of the same commit "c0".
         ready: Time of the ready-for-review event, if any.
+        review_total: reviews.totalCount; defaults to the number of reviews given.
     """
     state = state or ("MERGED" if merged else "OPEN")
+    reviews = list(reviews)
     return {
         "number": number, "title": title, "state": state, "isDraft": draft, "createdAt": iso(created),
         "mergedAt": iso(merged), "closedAt": iso(closed or merged), "additions": additions, "deletions": deletions,
@@ -122,8 +125,9 @@ def gh_node(number: int, title: str, created: int, merged: int | None = None, cl
         "labels": {"nodes": [{"name": l} for l in labels]},
         "mergeCommit": {"oid": merge_oid} if merge_oid else None,
         "commits": {"totalCount": commits, "nodes": [{"commit": {"authoredDate": iso(first_commit or created)}}]},
-        "reviews": {"nodes": [{"submittedAt": iso(ts), "state": st, "author": {"login": lg, "__typename": ty}}
-                              for lg, ty, st, ts in reviews]},
+        "reviews": {"totalCount": len(reviews) if review_total is None else review_total,
+                    "nodes": [{"submittedAt": iso(r[3]), "state": r[2], "commit": {"oid": r[4] if len(r) > 4 else "c0"},
+                               "author": {"login": r[0], "__typename": r[1]}} for r in reviews]},
         "timelineItems": {"nodes": [{"createdAt": iso(ready)}] if ready else []},
     }
 
@@ -208,9 +212,19 @@ def gitlab_handler(mrs: Sequence[Mapping[str, Any]], commits: Mapping[int, list[
     return handler
 
 
-def gl_note(author: str, ts: int, system: bool = False, bot: bool = False) -> dict[str, Any]:
-    """Build one GitLab note (MR comment) object."""
-    return {"author": {"username": author, "bot": bot}, "created_at": iso(ts), "system": system}
+def gl_note(author: str, ts: int, system: bool = False, bot: bool = False, body: str = "") -> dict[str, Any]:
+    """Build one GitLab note (MR comment, or a system note such as "added 1 commit") object."""
+    return {"author": {"username": author, "bot": bot}, "created_at": iso(ts), "system": system, "body": body}
+
+
+def gl_push(author: str, ts: int, n: int = 1) -> dict[str, Any]:
+    """Build the GitLab system note written when `author` pushes `n` commits to the MR branch."""
+    return gl_note(author, ts, system=True, body=f"added {n} commit{'s' if n != 1 else ''}\n\n<ul><li>abc - msg</li></ul>")
+
+
+def gl_approval(author: str, ts: int) -> dict[str, Any]:
+    """Build the GitLab system note written when `author` approves the MR."""
+    return gl_note(author, ts, system=True, body="approved this merge request")
 
 
 def gl_commit(ts: int) -> dict[str, Any]:

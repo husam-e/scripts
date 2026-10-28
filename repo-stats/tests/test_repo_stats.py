@@ -2633,5 +2633,158 @@ class G2_GitLabJobToken(unittest.TestCase):
         self.assertEqual(set(seen), {"job-tok-123"})
 
 
+class H1_ReviewCycles(unittest.TestCase):
+    """Review cycles per PR: one cycle per reviewed version, from GitHub review commits or GitLab notes."""
+
+    H = 3600
+
+    def _gh(self, reviews: Sequence[tuple[Any, ...]], **kw: Any) -> dict[str, Any]:
+        """Convert a merged mock GitHub PR by "alice" with `reviews` into a raw PR dict."""
+        return rs.github_pr(ms.gh_node(1, "feat: x", BASE, merged=BASE + 20 * self.H, reviews=reviews, **kw))
+
+    def _gl(self, notes: Sequence[dict[str, Any]], merged: int | None = BASE + 20 * 3600,
+            want_reviews: bool = True) -> dict[str, Any]:
+        """Run fetch_gitlab for one MR by "alice" with `notes` and return its raw PR dict."""
+        mr = ms.gl_mr(1, "feat: x", BASE, merged=merged)
+        env = helpers.clean_env({"GITLAB_TOKEN": FAKE})
+        with ms.MockServer(ms.gitlab_handler([mr], {1: [ms.gl_commit(BASE)]}, {1: list(notes)})) as srv:
+            cli = rs.Cli("glab", "gitlab.com", {**env, "REPO_STATS_FAKE_URL": srv.url})
+            return rs.fetch_gitlab(cli, "g/p", None, "main", False, None, want_reviews, progress=lambda m: None)[0]
+
+    # -- the counting rule
+
+    def test_count_rule(self) -> None:
+        """Versions and pushes start cycles; repeat reviews of one version and unreviewed pushes do not."""
+        c = rs.count_review_cycles
+        self.assertEqual(c([]), (0, False))
+        self.assertEqual(c([(1, "review", "a"), (2, "review", "a"), (3, "review", "a")]), (1, False))
+        self.assertEqual(c([(1, "review", "a"), (2, "review", "b"), (3, "review", "b"), (4, "review", "c")]), (3, False))
+        self.assertEqual(c([(1, "review", None), (2, "push", None), (3, "review", None), (4, "review", None)]), (2, False))
+        self.assertEqual(c([(1, "push", None), (2, "push", None), (3, "review", None)]), (1, False))
+        self.assertEqual(c([(1, "review", None), (2, "push", None)]), (1, False))  # unreviewed final push
+        self.assertEqual(c([(3, "review", None), (1, "review", None), (2, "push", None)]), (2, False))  # any order
+        self.assertEqual(c([(1, "review", "a"), (2, "review", None), (3, "review", "a")]), (1, False))  # unknown oid
+
+    def test_cap(self) -> None:
+        """Counting stops at the cap and says so."""
+        events = [(i, "review", str(i)) for i in range(rs.REVIEW_CYCLE_CAP + 10)]
+        self.assertEqual(rs.count_review_cycles(events), (rs.REVIEW_CYCLE_CAP, True))
+        self.assertEqual(rs.count_review_cycles(events, cap=3), (3, True))
+
+    # -- GitHub
+
+    def test_github_scenarios(self) -> None:
+        """The plan's scenarios, counted from the commit each review was made against."""
+        b, h = BASE, self.H
+        self.assertEqual(self._gh([])["review_cycles"], 0)
+        self.assertEqual(self._gh([("bob", "User", "APPROVED", b + h, "c1")])["review_cycles"], 1)
+        p = self._gh([("bob", "User", "CHANGES_REQUESTED", b + h, "c1"), ("bob", "User", "APPROVED", b + 3 * h, "c2")])
+        self.assertEqual((p["review_cycles"], p["changes_requested"], p["reviewers"]), (2, 1, 1))
+        p = self._gh([("bob", "User", "COMMENTED", b + h, "c1"), ("carol", "User", "CHANGES_REQUESTED", b + 2 * h, "c1"),
+                      ("dave", "User", "COMMENTED", b + 3 * h, "c1"), ("bob", "User", "APPROVED", b + 5 * h, "c2")])
+        self.assertEqual((p["review_cycles"], p["changes_requested"], p["reviewers"]), (2, 1, 3))
+        self.assertEqual(p["inferred"], [])
+
+    def test_github_force_push_is_a_new_version(self) -> None:
+        """A rebased or force-pushed head has a new oid, so its review is a new cycle."""
+        p = self._gh([("bob", "User", "APPROVED", BASE + self.H, "aaa"), ("bob", "User", "APPROVED", BASE + 2 * self.H, "bbb"),
+                      ("bob", "User", "APPROVED", BASE + 3 * self.H, "ccc")])
+        self.assertEqual(p["review_cycles"], 3)
+
+    def test_github_ignored_reviews(self) -> None:
+        """Author, bot, pending and post-merge reviews start no cycle."""
+        b, h = BASE, self.H
+        p = self._gh([("alice", "User", "COMMENTED", b + h, "c1"), ("ci[bot]", "Bot", "COMMENTED", b + 2 * h, "c2"),
+                      ("carol", "User", "PENDING", b + 3 * h, "c3"), ("bob", "User", "APPROVED", b + 4 * h, "c4"),
+                      ("bob", "User", "COMMENTED", b + 30 * h, "c5")])  # after the merge
+        self.assertEqual((p["review_cycles"], p["reviewers"], p["changes_requested"]), (1, 1, 0))
+
+    def test_github_truncated_reviews_are_a_lower_bound(self) -> None:
+        """More reviews than one page returns marks the count as inferred."""
+        p = self._gh([("bob", "User", "APPROVED", BASE + self.H, "c1")], review_total=150)
+        self.assertIn("review_cycles", p["inferred"])
+
+    def test_github_query_asks_for_review_commits(self) -> None:
+        """The GraphQL query requests the reviewed commit and the review total, and stays read-only."""
+        self.assertIn("commit{oid}", rs.GITHUB_QUERY)
+        self.assertIn("reviews(first:100){totalCount", rs.GITHUB_QUERY)
+        self.assertTrue(rs.READ_ONLY_GRAPHQL.match(rs.GITHUB_QUERY))
+        self.assertFalse(rs.WRITE_GRAPHQL.search(rs.GITHUB_QUERY))
+
+    def test_github_records_end_to_end(self) -> None:
+        """Through collect(): fixture PR #1 had one outside review, #10 none, the open PR #6 none so far."""
+        r = api_repo()
+        with ms.MockServer(ms.github_handler(desc_nodes(github_nodes(r)), page_size=50)) as srv:
+            d, _ = collect(r, "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
+        prs = by_number(d)
+        self.assertEqual((prs[1]["review_cycles"], prs[1]["reviewers"]), (1, 1))
+        self.assertEqual(prs[3]["changes_requested"], 1)
+        self.assertEqual(prs[10]["review_cycles"], 0)
+        self.assertFalse(prs[10]["reviewed"])
+        self.assertEqual(prs[6]["review_cycles"], 0)
+        self.assertEqual(d["meta"]["heuristics"]["review_cycle_cap"], rs.REVIEW_CYCLE_CAP)
+
+    # -- GitLab
+
+    def test_gitlab_pushes_split_cycles(self) -> None:
+        """Comments and approvals between pushes are one cycle; "added N commits" notes are pushes."""
+        b, h = BASE, self.H
+        p = self._gl([ms.gl_push("alice", b + h), ms.gl_note("bob", b + 2 * h), ms.gl_note("carol", b + 3 * h),
+                      ms.gl_push("alice", b + 4 * h, n=2), ms.gl_approval("bob", b + 5 * h),
+                      ms.gl_push("alice", b + 6 * h)])  # unreviewed final push
+        self.assertEqual((p["review_cycles"], p["reviewers"], p["first_review"]), (2, 2, b + 2 * h))
+        self.assertIsNone(p["changes_requested"])
+        self.assertTrue(p["reviewed"])
+
+    def test_gitlab_approval_alone_is_a_review(self) -> None:
+        """An approval with no comment is a review and one cycle."""
+        p = self._gl([ms.gl_approval("bob", BASE + self.H)])
+        self.assertEqual((p["review_cycles"], p["first_review"]), (1, BASE + self.H))
+        self.assertTrue(p["reviewed"])
+
+    def test_gitlab_ignored_notes(self) -> None:
+        """Author and bot notes, other system notes and post-merge notes are not reviews."""
+        b, h = BASE, self.H
+        p = self._gl([ms.gl_note("alice", b + h), ms.gl_note("ci-bot", b + 2 * h, bot=True),
+                      ms.gl_note("root", b + 3 * h, system=True, body="changed the description"),
+                      ms.gl_approval("alice", b + 4 * h), ms.gl_note("bob", b + 30 * h)])
+        self.assertEqual((p["review_cycles"], p["reviewers"]), (0, 0))
+        self.assertFalse(p["reviewed"])
+
+    def test_gitlab_no_reviews_leaves_cycles_unknown(self) -> None:
+        """--no-reviews skips the notes, so cycles are unknown, not 0."""
+        p = self._gl([ms.gl_note("bob", BASE + self.H)], want_reviews=False)
+        self.assertIsNone(p["review_cycles"])
+        self.assertIsNone(p["reviewers"])
+
+    def test_gitlab_cap_stops_paging(self) -> None:
+        """An MR with far more cycles than the cap is capped at it and marked inferred (a lower bound)."""
+        b, notes = BASE, []
+        for i in range(rs.REVIEW_CYCLE_CAP * 3):
+            notes += [ms.gl_push("alice", b + 2 * i), ms.gl_note("bob", b + 2 * i + 1)]
+        p = self._gl(notes, merged=b + 10 * DAY)
+        self.assertEqual(p["review_cycles"], rs.REVIEW_CYCLE_CAP)
+        self.assertIn("review_cycles", p["inferred"])
+
+    # -- git mode and output
+
+    def test_git_mode_has_no_cycles(self) -> None:
+        """Git history has no reviews, so every record's cycles are None."""
+        d = merge_data()
+        self.assertTrue(d["prs"])
+        self.assertTrue(all(p["review_cycles"] is None and p["reviewers"] is None for p in d["prs"]))
+
+    def test_csv_columns(self) -> None:
+        """The CSV has the three review columns, with blanks for unknown values."""
+        recs = [{"id": 1, "review_cycles": 2, "changes_requested": 1, "reviewers": 2},
+                {"id": 2, "review_cycles": None, "changes_requested": None, "reviewers": None}]
+        path = tmpdir() / "out.csv"
+        rs.write_csv(str(path), recs)
+        with path.open(encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual([(r["review_cycles"], r["changes_requested"], r["reviewers"]) for r in rows],
+                         [("2", "1", "2"), ("", "", "")])
+
+
 if __name__ == "__main__":
     unittest.main()

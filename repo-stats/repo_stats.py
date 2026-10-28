@@ -111,6 +111,13 @@ RISK = {
 }
 
 SIZE_BUCKETS = [[10, "XS"], [100, "S"], [500, "M"], [1000, "L"], [None, "XL"]]
+# Review cycles per PR: the dashboard groups counts into these bars; the last one is "this many or more".
+REVIEW_CYCLE_BUCKETS = [0, 1, 2, 3, 4, 5]
+# Counting stops here (the value is then marked inferred). Real PRs very rarely go past a handful.
+REVIEW_CYCLE_CAP = 50
+# GitLab system notes that mark a push to the MR branch, an approval and a change request.
+GITLAB_PUSH_NOTE = re.compile(r"^\s*(?:added \d+ (?:new )?commits?|force-pushed)\b", re.I)
+GITLAB_REVIEW_NOTE = re.compile(r"^\s*(?:approved this merge request|requested changes)\b", re.I)
 
 DEFAULT_SENSITIVE = (
     r"(^|/)(migrations?|db/migrate|schema|auth|authn|authz|security|crypto|secrets?|payments?|"
@@ -895,7 +902,7 @@ query($owner:String!,$name:String!,$cursor:String){
         labels(first:20){nodes{name}}
         mergeCommit{oid}
         commits(first:1){totalCount nodes{commit{authoredDate}}}
-        reviews(first:50){nodes{submittedAt state author{login __typename}}}
+        reviews(first:100){totalCount nodes{submittedAt state commit{oid} author{login __typename}}}
         timelineItems(first:20,itemTypes:[READY_FOR_REVIEW_EVENT]){nodes{... on ReadyForReviewEvent{createdAt}}}
       }
     }
@@ -959,6 +966,31 @@ def _is_bot(login: Optional[str], typename: Optional[str] = None) -> bool:
     return bool(typename == "Bot" or (login and (login.endswith("[bot]") or login.endswith("-bot"))))
 
 
+def count_review_cycles(events: Iterable[Tuple[int, str, Optional[str]]], cap: int = REVIEW_CYCLE_CAP) -> Tuple[int, bool]:
+    """Count review cycles from (time, kind, version) events; return (cycles, capped).
+
+    kind is "review" or "push". A cycle starts at the first review of a version that no earlier review
+    covered: when the reviewed version (a commit oid) differs from the previous review's, or, for events
+    without a version, at the first review after a push. Reviews of the same version are one cycle, and a
+    push that nobody reviews before the merge starts none. Counting stops at `cap` (capped is then True).
+    """
+    cycles = 0
+    fresh = True  # the next review sees a version that no review has covered yet
+    last_version: Optional[str] = None
+    for _, kind, version in sorted(events, key=lambda e: (e[0], e[1] != "push")):
+        if kind == "push":
+            fresh = True
+            continue
+        if fresh or (version is not None and last_version is not None and version != last_version):
+            cycles += 1
+            if cycles >= cap:
+                return cap, True
+        fresh = False
+        if version is not None:
+            last_version = version
+    return cycles, False
+
+
 def github_pr(n: Dict[str, Any]) -> PR:
     """Convert one GraphQL pullRequest node into a raw PR dict."""
     author = (n.get("author") or {})
@@ -970,12 +1002,18 @@ def github_pr(n: Dict[str, Any]) -> PR:
             ready = parse_iso(t["createdAt"])
             break
     merged_at = parse_iso(n.get("mergedAt"))
-    reviews = [r for r in (n.get("reviews") or {}).get("nodes", [])
-               if r and r.get("submittedAt") and r["state"] != "PENDING"
+    review_page = n.get("reviews") or {}
+    review_nodes = [r for r in review_page.get("nodes") or [] if r]
+    reviews = [r for r in review_nodes
+               if r.get("submittedAt") and r["state"] != "PENDING"
                and (merged_at is None or cast(int, parse_iso(r["submittedAt"])) <= merged_at)  # post-merge reviews do not count
                and (r.get("author") or {}).get("login") != login
                and not _is_bot((r.get("author") or {}).get("login"), (r.get("author") or {}).get("__typename"))]
     first_review = min((cast(int, parse_iso(r["submittedAt"])) for r in reviews), default=None)
+    # Each review names the head commit it was made against, so a new oid is a new version under review.
+    cycles, capped = count_review_cycles(
+        (cast(int, parse_iso(r["submittedAt"])), "review", (r.get("commit") or {}).get("oid")) for r in reviews)
+    truncated = (review_page.get("totalCount") or 0) > len(review_nodes)
     commits = n.get("commits") or {}
     first_commit = None
     if commits.get("nodes"):
@@ -991,7 +1029,10 @@ def github_pr(n: Dict[str, Any]) -> PR:
         "additions": n.get("additions"), "deletions": n.get("deletions"), "files": n.get("changedFiles"),
         "labels": [l["name"] for l in (n.get("labels") or {}).get("nodes", []) if l],
         "reviewed": first_review is not None if state == "merged" else None,
-        "source": "api", "inferred": [], "local": None,
+        "review_cycles": cycles,
+        "changes_requested": sum(1 for r in reviews if r["state"] == "CHANGES_REQUESTED"),
+        "reviewers": len({(r.get("author") or {}).get("login") for r in reviews}),
+        "source": "api", "inferred": ["review_cycles"] if truncated or capped else [], "local": None,
     }
 
 
@@ -1061,12 +1102,13 @@ def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch:
             pass
 
     def details(mr: Dict[str, Any]) -> Dict[str, Any]:
-        """Fetch first commit time, commit count and first review time for one MR.
+        """Fetch first commit time, commit count, first review time and review cycles for one MR.
 
         API errors are recorded under "commits_error" / "review_error" instead of raised, and the affected
         values stay None (unknown) rather than being read as "no commits" or "no review".
         """
-        out: dict[str, Any] = {"first_commit": None, "commits": None, "first_review": None}
+        out: dict[str, Any] = {"first_commit": None, "commits": None, "first_review": None,
+                               "review_cycles": None, "reviewers": None, "cycles_capped": False}
         iid = mr["iid"]
         if not commits_refused:
             try:
@@ -1081,15 +1123,32 @@ def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch:
             try:
                 me = (mr.get("author") or {}).get("username")
                 merged_at = parse_iso(mr.get("merged_at"))
+                # Pushes come from system notes ("added 2 commits"), stamped when pushed, not when authored.
+                events: list[tuple[int, str, Optional[str]]] = []
+                reviewers: set[str] = set()
+                first_review: Optional[int] = None
                 for note in pages(f"{base}/{int(iid)}/notes", {"sort": "asc", "order_by": "created_at"}):
                     a = note.get("author") or {}
-                    if note.get("system") or a.get("username") == me or _is_bot(a.get("username"), "Bot" if a.get("bot") else None):
-                        continue
                     t = parse_iso(note.get("created_at"))
                     if t is None or (merged_at is not None and t > merged_at):
                         continue  # comments after the merge are not a review
-                    out["first_review"] = t
-                    break
+                    body = note.get("body") or ""
+                    if note.get("system") and GITLAB_PUSH_NOTE.match(body):
+                        events.append((t, "push", None))
+                        continue
+                    if note.get("system") and not GITLAB_REVIEW_NOTE.match(body):
+                        continue
+                    if a.get("username") == me or _is_bot(a.get("username"), "Bot" if a.get("bot") else None):
+                        continue
+                    events.append((t, "review", None))
+                    reviewers.add(str(a.get("username")))
+                    if first_review is None:
+                        first_review = t
+                    if len(events) % 100 == 0 and count_review_cycles(events)[1]:
+                        break  # REVIEW_CYCLE_CAP cycles is far past anything useful: stop paging
+                out["first_review"] = first_review
+                out["review_cycles"], out["cycles_capped"] = count_review_cycles(events)
+                out["reviewers"] = len(reviewers)
             except (ApiError, ValueError, KeyError, TypeError, AttributeError) as e:
                 out["review_error"] = str(e)
         return out
@@ -1115,7 +1174,11 @@ def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch:
             "additions": None, "deletions": None, "files": None,
             "labels": mr.get("labels") or [],
             "reviewed": (ex["first_review"] is not None) if (state == "merged" and review_known) else None,
-            "source": "api", "inferred": ["ready"] + ([] if review_known else ["first_review"]),
+            # Older GitLab versions record no "requested changes" event, so a 0 could mislead: leave it unknown.
+            "review_cycles": ex["review_cycles"] if review_known else None, "changes_requested": None,
+            "reviewers": ex["reviewers"] if review_known else None,
+            "source": "api", "inferred": ["ready"] + ([] if review_known else ["first_review"])
+                                         + (["review_cycles"] if ex["cycles_capped"] else []),
             "squash_sha": mr.get("squash_commit_sha"), "local": None, "commits_refused": commits_refused,
         })
     return result
@@ -1237,6 +1300,9 @@ def build_records(prs: List[PR], ctx: Dict[str, Any]) -> List[Record]:
             "additions": add_, "deletions": del_, "lines": lines, "files": pr["files"], "commits": pr["commits"],
             "kind": kind, "source": pr["source"], "inferred": list(pr["inferred"]),
             "reviewed": pr.get("reviewed"),
+            # None when unknown: git mode, GitLab with --no-reviews, or a failed review lookup.
+            "review_cycles": pr.get("review_cycles"), "changes_requested": pr.get("changes_requested"),
+            "reviewers": pr.get("reviewers"),
         }
         sensitive = tests = code_lines = None
         if c is not None:
@@ -1336,7 +1402,7 @@ def write_csv(path: str, records: Iterable[Record]) -> None:
     cols = ["id", "title", "type", "scope", "breaking", "state", "bot", "created", "first_commit", "first_review",
             "merged", "additions", "deletions", "files", "commits", "risk", "risk_level", "kind",
             "coding", "pickup", "review", "open_to_merge", "lead", "deployed", "deploy_wait", "lead_to_deploy",
-            "restore", "source"]
+            "restore", "review_cycles", "changes_requested", "reviewers", "source"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(cols)
@@ -1573,7 +1639,8 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
         "reviews": mode == "api" and not (provider == "gitlab" and args.no_reviews),
         "commits_as_prs": bool(args.commits_as_prs),
         "heuristics": {"risk": RISK, "size_buckets": SIZE_BUCKETS, "sensitive": args.sensitive_pattern or DEFAULT_SENSITIVE,
-                       "test_path": TEST_PATH.pattern, "doc_path": DOC_PATH.pattern},
+                       "test_path": TEST_PATH.pattern, "doc_path": DOC_PATH.pattern,
+                       "review_cycle_buckets": REVIEW_CYCLE_BUCKETS, "review_cycle_cap": REVIEW_CYCLE_CAP},
     }
     return {"meta": meta, "prs": records, "loc": loc, "deploys": deploys}
 
