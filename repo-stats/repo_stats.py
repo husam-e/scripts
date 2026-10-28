@@ -37,7 +37,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optio
 __version__ = "0.1.0"
 
 # A first-parent commit summary from Scanner.scan: sha, parents, at, ct, author, subject, body, add, del,
-# lines, files, code_lines, tests, sensitive, langs.
+# lines, files, code_lines, tests, sensitive, langs, test_net, test_code_net.
 Commit = Dict[str, Any]
 # A raw PR/MR from the API or inferred from git, before build_records.
 PR = Dict[str, Any]
@@ -447,9 +447,10 @@ class Scanner:
     def summarize(self, numstat_lines: Iterable[str]) -> Commit:
         """Sum `git log --numstat` lines into size, file, language, test and sensitive-path stats.
 
-        langs maps language -> [added, deleted, kind].
+        langs maps language -> [added, deleted, kind]. test_net and test_code_net are the net lines (added minus
+        deleted) in test paths, for all languages and for code languages only.
         """
-        total_add = total_del = files = code_lines = 0
+        total_add = total_del = files = code_lines = test_net = test_code_net = 0
         tests = sensitive = False
         langs: dict[str, list[Any]] = {}
         for line in numstat_lines:
@@ -472,12 +473,17 @@ class Scanner:
             la[1] += d
             is_test = bool(TEST_PATH.search(path))
             tests = tests or is_test
+            if is_test:
+                test_net += a - d
+                if kind == "code":
+                    test_code_net += a - d
             if not is_test and not DOC_PATH.search(path) and kind == "code":
                 code_lines += a + d
             if self.sensitive.search(path):
                 sensitive = True
         return {"add": total_add, "del": total_del, "lines": total_add + total_del, "files": files,
-                "code_lines": code_lines, "tests": tests, "sensitive": sensitive, "langs": langs}
+                "code_lines": code_lines, "tests": tests, "sensitive": sensitive, "langs": langs,
+                "test_net": test_net, "test_code_net": test_code_net}
 
     def scan(self, repo: str, branch: str) -> List[Commit]:
         """Return a chronologically ordered list of first-parent commit dicts.
@@ -548,32 +554,37 @@ def build_loc_series(first_parent: List[Commit]) -> Dict[str, Any]:
     """Return cumulative lines of code per UTC day, total and per language.
 
     Returns:
-        {"days": [[day start, total, added, deleted], ...], "langs": language -> per-day lines,
-        "kinds": language -> kind}.
+        {"days": [[day start, total, added, deleted, test, test code], ...], "langs": language -> per-day lines,
+        "kinds": language -> kind}. test and test code are the cumulative lines in test paths, for all
+        languages and for code languages only.
     """
     day = None
     days: list[list[int]] = []
     langs_cum: dict[str, int] = collections.defaultdict(int)
     kinds: dict[str, str] = {}
     snapshots: list[Any] = []  # per day: dict of cumulative lang -> lines
-    total = 0
+    total = test = test_code = 0
     last_ct = 0
     for c in first_parent:
         ct = max(c["ct"], last_ct)
         last_ct = ct
         d = ct - ct % 86400
         if d != day:
-            days.append([d, 0, 0, 0])
+            days.append([d, 0, 0, 0, 0, 0])
             snapshots.append(None)
             day = d
         entry = days[-1]
         entry[2] += c["add"]
         entry[3] += c["del"]
         total += c["add"] - c["del"]
+        test += c["test_net"]
+        test_code += c["test_code_net"]
         for lang, (a, dl, kind) in c["langs"].items():
             langs_cum[lang] += a - dl
             kinds[lang] = kind
         entry[1] = total
+        entry[4] = test
+        entry[5] = test_code
         snapshots[-1] = dict(langs_cum)
     peak: collections.Counter[str] = collections.Counter()
     for snap in snapshots:
