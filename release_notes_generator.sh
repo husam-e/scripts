@@ -1,6 +1,6 @@
 #!/bin/bash
 
-read -r -d '' USAGE << EOM
+read -r -d '' USAGE << 'EOM'
 Usage: release_notes_helper.sh [-j JIRAKEY] [-s SCOPES] <START_VERSION> [END_VERSION]
 
     example 1 (from a release tag to main, for an upcoming tag):      ./release_notes_helper.sh v1.1.0 origin/main
@@ -26,18 +26,18 @@ while getopts ":j:s:h" opt; do
             ;;
         h) echo "${USAGE}" && exit 0
             ;;
-        \? ) echo "${USAGE}" && exit -2
+        \? ) echo "${USAGE}" && exit 2
             ;;
     esac
 done
 
-START_VERSION=${@:$OPTIND:1}
+START_VERSION=${*:$OPTIND:1}
 if [ -z "${START_VERSION}" ]; then
   echo "${USAGE}"
-  exit -1
+  exit 1
 fi
 
-END_VERSION=${@:$OPTIND+1:1}
+END_VERSION=${*:$OPTIND+1:1}
 if [ -z "${END_VERSION}" ]; then
   END_VERSION="HEAD"
 fi
@@ -59,7 +59,7 @@ echo ""
 echo "Generating release notes from ${START_VERSION} to ${END_VERSION}"
 echo "Copy the lines below into the release notes."
 echo "-----"
-git log ${START_VERSION}...${END_VERSION} --pretty=format:"- [(%h)](${CI_PROJECT_URL}/commit/%H) %s" --reverse |
+git log "${START_VERSION}...${END_VERSION}" --pretty=format:"- [(%h)](${CI_PROJECT_URL}/commit/%H) %s" --reverse |
     grep "${SCOPES}" |
     sort -k 3,3 |
     sed -e $'s/*/\\n  */g' |
@@ -93,9 +93,9 @@ git log ${START_VERSION}...${END_VERSION} --pretty=format:"- [(%h)](${CI_PROJECT
 echo "-----"
 
 # TODO: remove blanks when Issue does not exist
-issues=($(git log ${START_VERSION}...${END_VERSION} --pretty=format:'%s' --reverse | grep -oe "${ISSUEPREFIX}[0-9]\+"))
-unique=($(echo "${issues[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+mapfile -t issues < <(git log "${START_VERSION}...${END_VERSION}" --pretty=format:'%s' --reverse | grep -oe "${ISSUEPREFIX}[0-9]\+")
+mapfile -t unique < <(printf '%s\n' "${issues[@]}" | grep . | sort -u)
 echo "Commit range includes ${#unique[@]} Issues"
 list=$(IFS=, ; echo "${unique[*]}")
 # If JIRAKEY is set, output JIRA query
-[[ ! -z "$JIRAKEY" ]] && echo "project=${JIRAKEY} and id in (${list})"
+[[ -n "$JIRAKEY" ]] && echo "project=${JIRAKEY} and id in (${list})"
