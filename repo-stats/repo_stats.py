@@ -16,6 +16,7 @@ import argparse
 import calendar
 import collections
 import concurrent.futures
+import contextlib
 import csv
 import datetime as dt
 import email.utils
@@ -31,7 +32,7 @@ import time
 import urllib.parse
 import webbrowser
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, TypedDict, cast
+from typing import IO, Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, TypedDict, cast
 
 __version__ = "0.1.0"
 
@@ -1587,13 +1588,44 @@ def render_html(data: Dict[str, Any]) -> str:
     return template.replace(marker, embed_json(data), 1)
 
 
+def write_output(path: str, write: Callable[[IO[str]], None]) -> None:
+    """Write a text output file atomically, and never through a symbolic link.
+
+    The text goes to a new temp file in the same directory, which then replaces `path` (os.replace swaps
+    the directory entry and never follows a link), so a symlink planted at the output path in an untrusted
+    checkout cannot redirect the write. An existing symlink is refused outright. Characters that cannot be
+    encoded (lone surrogates from API text) are written as backslash escapes, which inside the dashboard's
+    JSON decode back to the same string.
+    """
+    if os.path.islink(path):
+        raise ToolError(f"Refusing to write {path}: it is a symbolic link")
+    directory = os.path.dirname(os.path.abspath(path))
+    try:
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix="." + os.path.basename(path) + ".", suffix=".tmp")
+    except OSError as e:  # report the output path, not the temp name
+        raise OSError(e.errno, e.strerror, path) from None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace", newline="") as f:
+            write(f)
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp, 0o666 & ~umask)  # mkstemp creates 0600; give the usual permissions of a new file
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def write_csv(path: str, records: Iterable[Record]) -> None:
     """Write one row per PR record to a CSV file, guarding against spreadsheet formula injection."""
     cols = ["id", "title", "type", "scope", "breaking", "state", "bot", "created", "first_commit", "first_review",
             "merged", "additions", "deletions", "files", "commits", "risk", "risk_level", "kind",
             "coding", "pickup", "review", "open_to_merge", "lead", "deployed", "deploy_wait", "lead_to_deploy",
             "restore", "review_cycles", "changes_requested", "reviewers", "source"]
-    with open(path, "w", newline="", encoding="utf-8") as f:
+
+    def write(f: IO[str]) -> None:
+        """Write the header and one guarded row per record to f."""
         w = csv.writer(f)
         w.writerow(cols)
         for r in records:
@@ -1604,6 +1636,8 @@ def write_csv(path: str, records: Iterable[Record]) -> None:
                     v = "'" + v  # neutralise spreadsheet formula injection, also after leading spaces
                 row.append("" if v is None else v)
             w.writerow(row)
+
+    write_output(path, write)
 
 
 WHEN_DATE = re.compile(r"^\d{4}(?:-\d{2}(?:-\d{2})?)?$")
@@ -1995,9 +2029,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         data = collect(args)
         out = Path(args.out)
-        out.write_text(render_html(data), encoding="utf-8")
+        html = render_html(data)
+        write_output(args.out, lambda f: f.write(html))
         if args.json:
-            Path(args.json).write_text(json.dumps(data, indent=1), encoding="utf-8")
+            write_output(args.json, lambda f: f.write(json.dumps(data, indent=1)))
         if args.csv:
             write_csv(args.csv, data["prs"])
     except ToolError as e:

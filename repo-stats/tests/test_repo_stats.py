@@ -2906,6 +2906,65 @@ class I1_SecurityHardening(unittest.TestCase):
         self.addCleanup(cli.close)
         return cli
 
+    # -- S1: outputs are written atomically and never through a symlink
+
+    def test_write_output_refuses_symlinks(self) -> None:
+        """An existing or dangling symlink at the output path is refused; its target is never touched."""
+        d = tmpdir()
+        victim = d / "victim.txt"
+        victim.write_text("keep")
+        (d / "link.html").symlink_to(victim)
+        (d / "dangling.html").symlink_to(d / "created-by-attack")
+        for name in ("link.html", "dangling.html"):
+            with self.assertRaises(rs.ToolError, msg=name):
+                rs.write_output(str(d / name), lambda f: f.write("pwned"))
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertFalse((d / "created-by-attack").exists())
+        self.assertEqual(sorted(p.name for p in d.iterdir()), ["dangling.html", "link.html", "victim.txt"])
+
+    def test_write_output_is_atomic(self) -> None:
+        """A write replaces the file in one step, leaves no temp file, and a failed write keeps the old file."""
+        d = tmpdir()
+        out = d / "o.html"
+        out.write_text("old")
+        rs.write_output(str(out), lambda f: f.write("new"))
+        self.assertEqual(out.read_text(), "new")
+
+        def boom(f: Any) -> None:
+            """Write part of the output, then fail."""
+            f.write("partial")
+            raise RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            rs.write_output(str(out), boom)
+        self.assertEqual(out.read_text(), "new")
+        self.assertEqual([p.name for p in d.iterdir()], ["o.html"], "no temp file is left behind")
+
+    def test_cli_refuses_symlinked_outputs(self) -> None:
+        """-o, --json and --csv pointing at a symlink exit 1 with a clear error and leave the target alone."""
+        for flag in ("-o", "--json", "--csv"):
+            d = tmpdir()
+            victim = d / "victim.txt"
+            victim.write_text("keep")
+            (d / "out.x").symlink_to(victim)
+            args = [merge_repo().path, "-o", d / "real.html"] if flag != "-o" else [merge_repo().path]
+            p = run_cli([*args, flag, d / "out.x"])
+            self.assertEqual(p.returncode, 1, flag)
+            self.assertIn("symbolic link", p.stderr, flag)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertEqual(victim.read_text(), "keep", flag)
+
+    # -- N5: lone surrogates in API text cannot crash a write
+
+    def test_lone_surrogates_are_written(self) -> None:
+        """A lone surrogate is written as an escape: the dashboard JSON still decodes to the same string."""
+        d = tmpdir()
+        data = {"title": "a\ud800b"}
+        rs.write_output(str(d / "x.html"), lambda f: f.write(rs.embed_json(data)))
+        self.assertEqual(json.loads((d / "x.html").read_text(encoding="utf-8")), data)
+        rs.write_csv(str(d / "x.csv"), [{"id": 1, "title": "t\udfffx"}])
+        self.assertIn("\\udfff", (d / "x.csv").read_text(encoding="utf-8"))
+
     # -- S4, N9: the gh/glab environment is an allowlist
 
     def test_cli_environment_is_an_allowlist(self) -> None:
