@@ -23,7 +23,6 @@ import http.server
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -223,21 +222,99 @@ def language_of(path: str) -> Tuple[str, str]:
 # Git access
 # ---------------------------------------------------------------------------
 
-# Names of variables that may hold an API credential. repo-stats never reads their values. It removes them
-# from git's environment, because git needs none of them, so hooks, filters and textconv drivers that git
-# runs inside the analysed repository cannot read them.
+# Names of variables that may hold an API credential. repo-stats never reads their values. git gets none of
+# them (its environment is built from GIT_ENV_ALLOW, which lists none), so they do not leak to git by
+# accident. This is not a boundary against code that git runs: a program running as the same user can read
+# the parent process's environment.
 CREDENTIAL_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GITLAB_TOKEN",
                    "GITLAB_ACCESS_TOKEN", "GITLAB_PRIVATE_TOKEN", "OAUTH_TOKEN", "CI_JOB_TOKEN")
 
+# What any child process needs: the search path, home and user, locale, temp dirs, and Windows essentials.
+BASE_ENV_ALLOW = {
+    "PATH", "HOME", "USER", "LOGNAME", "USERNAME", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TMP", "TEMP",
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+}
+# git also reads its own config files. GIT_DIR, GIT_WORK_TREE, GIT_CONFIG_PARAMETERS and the like are left
+# out on purpose: they would override `-C repo` or inject configuration.
+GIT_ENV_ALLOW = BASE_ENV_ALLOW | {"XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"}
+
+
+def allowed_env(environ: Mapping[str, str], names: Set[str], prefixes: Tuple[str, ...] = ()) -> Dict[str, str]:
+    """Return the variables of environ whose upper-cased name is in `names` or starts with one of `prefixes`."""
+    prefixes = ("LC_",) + prefixes
+    return {k: v for k, v in environ.items() if k.upper() in names or k.upper().startswith(prefixes)}
+
 
 def git_env() -> Dict[str, str]:
-    """Return os.environ without the credential variables, for git subprocesses."""
-    return {k: v for k, v in os.environ.items() if k not in CREDENTIAL_VARS}
+    """Return the environment for git subprocesses: an allowlist of os.environ, never a credential.
+
+    Missing objects of a partial clone are never fetched (GIT_NO_LAZY_FETCH, git 2.44+; protocol.allow=never
+    in git_cmd also blocks the fetch on older versions), and git never prompts.
+    """
+    env = allowed_env(os.environ, GIT_ENV_ALLOW)
+    env.update({"GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0"})
+    if os.name == "nt":
+        env["NoDefaultCurrentDirectoryInExePath"] = "1"  # child processes never run programs from the cwd
+    return env
+
+
+def find_executable(name: str, path: Optional[str] = None) -> Optional[str]:
+    """Return the absolute path of program `name` on `path` (default: os.environ's PATH), or None.
+
+    Unlike shutil.which, never looks in the current directory, which is often the analysed checkout: empty,
+    "." and other relative PATH entries are skipped. (On Windows, CreateProcess with a bare name and
+    shutil.which before Python 3.12 both search the current directory first.)
+    """
+    if path is None:
+        path = os.environ.get("PATH", os.defpath)
+    exts = [""]
+    if os.name == "nt" and not os.path.splitext(name)[1]:
+        exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+    for d in path.split(os.pathsep):
+        if not d or not os.path.isabs(d):
+            continue
+        for ext in exts:
+            cand = os.path.join(d, name + ext)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+    return None
+
+
+def git_exe() -> str:
+    """Return the absolute path of git, or raise ToolError."""
+    git = find_executable("git")
+    if not git:
+        raise ToolError("git was not found on PATH (relative PATH entries are ignored)")
+    return git
 
 
 def git_cmd(repo: str, *args: str) -> List[str]:
-    """Build a git argv for `repo` with stable, unquoted path output."""
-    return ["git", "-C", repo, "-c", "core.quotepath=off", "-c", "log.showSignature=false", *args]
+    """Build a git argv for `repo` with stable, unquoted path output and no fsmonitor or fetch."""
+    return [git_exe(), "-C", os.path.abspath(repo), "-c", "core.quotepath=off", "-c", "log.showSignature=false",
+            "-c", "core.fsmonitor=false", "-c", "protocol.allow=never", *args]
+
+
+_git_version: Optional[Tuple[int, int]] = None
+
+
+def git_version() -> Tuple[int, int]:
+    """Return git's (major, minor) version, or (0, 0) if it cannot be read. Cached."""
+    global _git_version
+    if _git_version is None:
+        p = subprocess.run([git_exe(), "--version"], capture_output=True, text=True, env=git_env())
+        m = re.search(r"(\d+)\.(\d+)", p.stdout)
+        _git_version = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+    return _git_version
+
+
+def revs(*names: str) -> List[str]:
+    """Return revision arguments for `git log` / `git rev-parse`, after --end-of-options where supported.
+
+    rev-parse accepts --end-of-options from git 2.30 (log from 2.24). On older git, collect() still refuses
+    a branch that starts with "-", so a revision can never be read as an option.
+    """
+    return (["--end-of-options"] if git_version() >= (2, 30) else []) + list(names)
 
 
 def run_git(repo: str, *args: str, check: bool = True) -> str:
@@ -272,10 +349,25 @@ def detect_branch(repo: str, remote: str = "origin") -> str:
     if head:
         return head
     for cand in (f"{remote}/main", f"{remote}/master", "main", "master"):
-        if run_git(repo, "rev-parse", "--verify", "-q", cand + "^{commit}", check=False).strip():
+        if run_git(repo, "rev-parse", "--verify", "-q", *revs(cand + "^{commit}"), check=False).strip():
             return cand
     # Fall back to the checked-out branch (e.g. "trunk"), or HEAD when detached.
     return run_git(repo, "symbolic-ref", "--short", "-q", "HEAD", check=False).strip() or "HEAD"
+
+
+PARTIAL_CLONE_HINT = ("This is a partial clone (made with --filter, or actions/checkout's `filter`). repo-stats "
+                      "never downloads missing objects, so history that needs them cannot be read. Clone without "
+                      "a filter for full results.")
+
+
+def is_partial_clone(repo: str) -> bool:
+    """Return True if the repository has a promisor remote, i.e. objects that git would fetch on demand."""
+    out = run_git(repo, "config", "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor)$", check=False)
+    for line in out.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "extensions.partialclone" or value.strip().lower() in ("true", "yes", "on", "1"):
+            return True
+    return False
 
 
 def strip_remote_prefix(repo: str, branch: str) -> str:
@@ -496,7 +588,7 @@ class Scanner:
         meta_fmt = "%H%x00%P%x00%at%x00%ct%x00%an%x00%s%x00%b"
         commits: list[Commit] = []
         by_sha: dict[str, Commit] = {}
-        fields = run_git(repo, "log", "-z", "--first-parent", "--reverse", f"--format={meta_fmt}", branch).split("\0")
+        fields = run_git(repo, "log", "-z", "--first-parent", "--reverse", f"--format={meta_fmt}", *revs(branch)).split("\0")
         n = 7
         for i in range(0, len(fields) - n + 1, n):
             sha, parents, at, ct, author, subject, body = fields[i:i + n]
@@ -511,8 +603,8 @@ class Scanner:
         # %x00 cannot appear in a path or in git's numstat output, so it safely marks each commit header.
         stats: dict[str, list[str]] = {}
         cur: Optional[list[str]] = None
-        for line in stream_git(repo, "log", "--first-parent", "-m", "--numstat", "--no-renames",
-                               "--format=%x00%H", branch):
+        for line in stream_git(repo, "log", "--first-parent", "-m", "--numstat", "--no-renames", "--no-textconv",
+                               "--no-ext-diff", "--format=%x00%H", *revs(branch)):
             if line.startswith("\0"):
                 cur = stats.setdefault(line[1:].strip(), [])
             elif cur is not None:
@@ -529,7 +621,7 @@ class Scanner:
 def load_graph(repo: str, branch: str) -> Graph:
     """Return sha -> (parents, author time, committer time) for every commit reachable from branch."""
     graph: Graph = {}
-    for line in stream_git(repo, "log", "--format=%H %P|%at|%ct", branch):
+    for line in stream_git(repo, "log", "--format=%H %P|%at|%ct", *revs(branch)):
         left, at, ct = line.rstrip("\n").split("|")
         parts = left.split()
         graph[parts[0]] = (tuple(parts[1:]), int(at), int(ct))
@@ -539,7 +631,7 @@ def load_graph(repo: str, branch: str) -> Graph:
 def load_reverts(repo: str, branch: str) -> Dict[str, str]:
     """Return sha -> sha (or prefix) of the commit it reverts, from 'This reverts commit' lines."""
     out: dict[str, str] = {}
-    text = run_git(repo, "log", "--format=%x1e%H%x1f%b", "--grep=This reverts commit", branch, check=False)
+    text = run_git(repo, "log", "--format=%x1e%H%x1f%b", "--grep=This reverts commit", *revs(branch), check=False)
     for rec in text.split("\x1e"):
         if "\x1f" not in rec:
             continue
@@ -761,8 +853,31 @@ def ci_login_hint(tool: str, host: str) -> str:
     return "GH_TOKEN" if host == "github.com" or host.endswith(".ghe.com") else "GH_ENTERPRISE_TOKEN"
 
 
-# Debug switches that make the CLIs dump requests to stderr, which repo-stats may quote in an error.
-CLI_DEBUG_VARS = ("GH_DEBUG", "DEBUG", "GLAB_DEBUG", "GLAB_DEBUG_HTTP")
+# The gh/glab environment is an allowlist: what they need to find their login (token variables, config and
+# keyring locations, GitLab CI autologin), reach the API (proxy and TLS settings) and run. Host and repo
+# overrides (GH_HOST, GH_REPO, GITLAB_HOST, GL_HOST, GITLAB_URI, GITLAB_API_HOST, GLAB_API_PROTOCOL, ...),
+# TLS-verification switches and request-dumping debug switches (GH_DEBUG, DEBUG, GLAB_DEBUG, GLAB_DEBUG_HTTP)
+# are left out, so the API host is always the --hostname that repo-stats passes.
+# Sources: `gh help environment` and https://docs.gitlab.com/cli/configuration/#environment-variables
+CLI_ENV_ALLOW = BASE_ENV_ALLOW | {
+    "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+    "GITLAB_TOKEN", "GITLAB_ACCESS_TOKEN", "OAUTH_TOKEN",
+    "GLAB_ENABLE_CI_AUTOLOGIN", "GITLAB_CI", "CI_JOB_TOKEN",
+    "GH_CONFIG_DIR", "GLAB_CONFIG_DIR", "GLAB_USE_KEYRING", "USE_KEYRING", "DBUS_SESSION_BUS_ADDRESS",
+    "GITLAB_SUBFOLDER",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "GLAB_PROXY", "PROXY",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "GLAB_CA_CERT", "CA_CERT", "GLAB_CLIENT_CERT", "CLIENT_CERT",
+    "GLAB_CLIENT_KEY", "CLIENT_KEY",
+}
+# CI_SERVER_* for glab's CI autologin; XDG_* for config and keyring locations. REPO_STATS_FAKE_* is read
+# only by the test suite's fake gh/glab (tests/fake_cli), which needs its mock server URL and call log
+# passed through this allowlist; the real CLIs ignore it.
+CLI_ENV_PREFIXES = ("CI_SERVER_", "XDG_", "REPO_STATS_FAKE_")
+# Set for every call: no prompts, no update checks or telemetry (extra requests, glab's with the credential).
+CLI_ENV_SET = {
+    "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "GH_TELEMETRY": "false",
+    "GLAB_NO_PROMPT": "true", "GLAB_CHECK_UPDATE": "false", "GLAB_SEND_TELEMETRY": "false",
+}
 CLI_TIMEOUT = 120
 CLI_RETRIES = 4
 HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
@@ -819,21 +934,30 @@ class Cli:
     """Read-only access to one GitHub or GitLab host through `gh api` or `glab api`.
 
     Every request passes the read-only allowlist, gets an explicit --hostname, runs from a private temp
-    directory (removed by close() or at the end of a `with` block), and runs without debug switches and
-    (for glab) without telemetry, which would send its own request with the credential.
+    directory (removed by close() or at the end of a `with` block) with an allowlisted environment, and runs
+    without debug switches, update checks and telemetry (glab's would send its own request with the credential).
     """
 
     def __init__(self, tool: str, host: str, environ: Optional[Mapping[str, str]] = None) -> None:
         """Find the CLI on PATH and prepare its environment; raise CliUnavailable if it is not installed."""
-        env = {k: v for k, v in (os.environ if environ is None else environ).items() if k not in CLI_DEBUG_VARS}
-        env["GLAB_SEND_TELEMETRY"] = "false"
-        exe = shutil.which(tool, path=env.get("PATH", os.defpath))
+        env = allowed_env(os.environ if environ is None else environ, CLI_ENV_ALLOW, CLI_ENV_PREFIXES)
+        env.update(CLI_ENV_SET)
+        if tool == "glab":
+            # glab sends an environment token only to the host named by GITLAB_HOST (or its config), so name
+            # the same host as --hostname. Any GITLAB_HOST from the caller was dropped above.
+            env["GITLAB_HOST"] = host
+        if os.name == "nt":
+            env["NoDefaultCurrentDirectoryInExePath"] = "1"
+        exe = find_executable(tool, env.get("PATH", os.defpath))
         if not exe:
             raise CliUnavailable(f"{tool} is not installed. Install it from {CLI_INSTALL[tool]} for exact PR data.")
         self.tool, self.host, self.exe, self.env = tool, host, exe, env
         self.hint = f"Run `{tool} auth login --hostname {host}`, or in CI set {ci_login_hint(tool, host)}."
         # Mode 0700 and empty: no .git or CLI config of the analysed repository or of another local user.
         self._cwd = tempfile.TemporaryDirectory(prefix="repo-stats-cli-")
+        # git (which the CLIs may run) stops looking for a repository at the temp dir, so it cannot find a
+        # .git that another user planted in a shared /tmp either.
+        self.env["GIT_CEILING_DIRECTORIES"] = os.path.dirname(self._cwd.name)
 
     def close(self) -> None:
         """Remove the private working directory."""
@@ -1519,13 +1643,18 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
             and run_git(repo, "rev-parse", "--is-bare-repository", check=False).strip() != "true":
         raise ToolError(f"{repo} is not a git repository")
     branch = args.branch or detect_branch(repo, args.remote)
-    if not run_git(repo, "rev-parse", "--verify", "-q", branch + "^{commit}", check=False).strip():
+    if branch.startswith("-"):  # never let a ref (possibly from a crafted repository) be read as an option
+        raise ToolError(f"Branch or ref '{branch}' starts with '-'; pass another --branch.")
+    if not run_git(repo, "rev-parse", "--verify", "-q", *revs(branch + "^{commit}"), check=False).strip():
         raise ToolError(f"Branch or ref '{branch}' not found. Pass --branch.")
     short_branch = strip_remote_prefix(repo, branch)
     warnings: list[str] = []
     if run_git(repo, "rev-parse", "--is-shallow-repository", check=False).strip() == "true":
         warnings.append("This is a shallow clone. History, lines of code over time and timings are incomplete. "
                         "Run `git fetch --unshallow` for full results.")
+    partial = is_partial_clone(repo)
+    if partial:
+        log(f"warning: {PARTIAL_CLONE_HINT}")
     since = parse_when(args.since, "--since", end=False)
     until = parse_when(args.until, "--until", end=True)  # exclusive: the first moment after the period
     if since is not None and until is not None and since >= until:
@@ -1539,7 +1668,12 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
 
     log(f"Scanning history of {branch} ...")
     scanner = Scanner(excludes, sensitive_re)
-    first_parent = scanner.scan(repo, branch)
+    try:
+        first_parent = scanner.scan(repo, branch)
+    except ToolError as e:
+        if partial:
+            raise ToolError(f"{e}\n{PARTIAL_CLONE_HINT}")
+        raise
     if not first_parent:
         raise ToolError(f"No commits found on {branch}")
     graph = load_graph(repo, branch)
@@ -1559,7 +1693,7 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
 
     # Decide where PR data comes from.
     env = os.environ if environ is None else environ
-    remote = run_git(repo, "remote", "get-url", args.remote, check=False).strip()
+    remote = run_git(repo, "remote", "get-url", "--", args.remote, check=False).strip()
     parsed = parse_remote(remote) if remote else None
     host_provider = detect_provider(parsed[0]) if parsed else None
     ci = ci_server(env)
