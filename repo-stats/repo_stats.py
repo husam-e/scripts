@@ -720,7 +720,8 @@ def infer_prs_from_git(first_parent: List[Commit], graph: Graph, default_branch:
 # GitLab CI job token. Two CLI behaviours shape this code: both send an environment token to whatever
 # --hostname they are given, and glab without --hostname follows the remote of the git repository in its
 # working directory. So the host always comes from the allowlist or an explicit flag, it is always passed
-# as --hostname, and the CLI runs from the system temp directory, not the analysed repository.
+# as --hostname, and the CLI runs from a new private temp directory, not the analysed repository (or the
+# shared system temp directory, where another local user could plant a .git).
 
 class ApiError(ToolError):
     """A failed or unexpected GitHub/GitLab API call. `status` is the HTTP status, when there was one."""
@@ -736,10 +737,19 @@ class CliUnavailable(ApiError):
 
 
 CLI_FOR = {"github": "gh", "gitlab": "glab"}
-CLI_HELP = {  # tool -> (install page, what to set in CI)
-    "gh": ("https://cli.github.com", "GH_TOKEN"),
-    "glab": ("https://gitlab.com/gitlab-org/cli", "GLAB_ENABLE_CI_AUTOLOGIN=true or GITLAB_TOKEN"),
-}
+CLI_INSTALL = {"gh": "https://cli.github.com", "glab": "https://gitlab.com/gitlab-org/cli"}
+
+
+def ci_login_hint(tool: str, host: str) -> str:
+    """Return what to set in CI so `tool` finds a login for `host`.
+
+    gh reads GH_TOKEN only for github.com and *.ghe.com; GitHub Enterprise Server needs GH_ENTERPRISE_TOKEN.
+    """
+    if tool == "glab":
+        return "GLAB_ENABLE_CI_AUTOLOGIN=true or GITLAB_TOKEN"
+    return "GH_TOKEN" if host == "github.com" or host.endswith(".ghe.com") else "GH_ENTERPRISE_TOKEN"
+
+
 # Debug switches that make the CLIs dump requests to stderr, which repo-stats may quote in an error.
 CLI_DEBUG_VARS = ("GH_DEBUG", "DEBUG", "GLAB_DEBUG", "GLAB_DEBUG_HTTP")
 CLI_TIMEOUT = 120
@@ -750,6 +760,11 @@ HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 READ_ONLY_GRAPHQL = re.compile(r"^\s*query\b")
 WRITE_GRAPHQL = re.compile(r"\b(?:mutation|subscription)\b")
 GITLAB_READ_ENDPOINT = re.compile(r"^projects/[^/?#\s]+/merge_requests(?:/\d+/(?:commits|notes))?$")
+
+
+def _backoff(seconds: float) -> None:
+    """Wait between API retries. Tests replace this, not time.sleep, which subprocess also uses."""
+    time.sleep(seconds)
 
 
 def _retry_after(value: Optional[str], default: int) -> int:
@@ -792,9 +807,9 @@ def parse_cli_response(out: bytes) -> Tuple[Optional[int], Dict[str, str], bytes
 class Cli:
     """Read-only access to one GitHub or GitLab host through `gh api` or `glab api`.
 
-    Every request passes the read-only allowlist, gets an explicit --hostname, runs from the system temp
-    directory, and runs without debug switches and (for glab) without telemetry, which would send its own
-    request with the credential.
+    Every request passes the read-only allowlist, gets an explicit --hostname, runs from a private temp
+    directory (removed by close() or at the end of a `with` block), and runs without debug switches and
+    (for glab) without telemetry, which would send its own request with the credential.
     """
 
     def __init__(self, tool: str, host: str, environ: Optional[Mapping[str, str]] = None) -> None:
@@ -803,9 +818,23 @@ class Cli:
         env["GLAB_SEND_TELEMETRY"] = "false"
         exe = shutil.which(tool, path=env.get("PATH", os.defpath))
         if not exe:
-            raise CliUnavailable(f"{tool} is not installed. Install it from {CLI_HELP[tool][0]} for exact PR data.")
+            raise CliUnavailable(f"{tool} is not installed. Install it from {CLI_INSTALL[tool]} for exact PR data.")
         self.tool, self.host, self.exe, self.env = tool, host, exe, env
-        self.hint = f"Run `{tool} auth login --hostname {host}`, or in CI set {CLI_HELP[tool][1]}."
+        self.hint = f"Run `{tool} auth login --hostname {host}`, or in CI set {ci_login_hint(tool, host)}."
+        # Mode 0700 and empty: no .git or CLI config of the analysed repository or of another local user.
+        self._cwd = tempfile.TemporaryDirectory(prefix="repo-stats-cli-")
+
+    def close(self) -> None:
+        """Remove the private working directory."""
+        self._cwd.cleanup()
+
+    def __enter__(self) -> "Cli":
+        """Return self; the working directory is removed on exit."""
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        """Remove the private working directory."""
+        self.close()
 
     def graphql(self, query: str, variables: Mapping[str, Optional[str]]) -> Any:
         """Send a read-only GraphQL query with string variables (None values are left out); return the JSON."""
@@ -831,11 +860,11 @@ class Cli:
         delay = 2
         for attempt in range(CLI_RETRIES + 1):
             try:
-                p = subprocess.run([self.exe, *args], cwd=tempfile.gettempdir(), env=self.env, stdin=subprocess.DEVNULL,
+                p = subprocess.run([self.exe, *args], cwd=self._cwd.name, env=self.env, stdin=subprocess.DEVNULL,
                                    capture_output=True, timeout=CLI_TIMEOUT)
             except subprocess.TimeoutExpired:
                 if attempt < CLI_RETRIES:
-                    time.sleep(delay)
+                    _backoff(delay)
                     delay *= 2
                     continue
                 raise ApiError(f"{self.tool} api timed out after {CLI_TIMEOUT}s")
@@ -849,7 +878,7 @@ class Cli:
                 # No HTTP response at all (DNS, refused connection, TLS): retrying will not fix it.
                 raise ApiError(f"Could not reach the API through {self.tool}: {err or f'exit status {p.returncode}'}")
             if status in (429, 500, 502, 503, 504) and attempt < CLI_RETRIES:
-                time.sleep(_retry_after(headers.get("retry-after"), delay))
+                _backoff(_retry_after(headers.get("retry-after"), delay))
                 delay *= 2
                 continue
             if status == 401:
@@ -1046,8 +1075,8 @@ def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch:
     """Fetch merge requests from the GitLab REST API through `glab api`, with per-MR commit and review times.
 
     REST, not GraphQL, because a GitLab CI job token cannot call GraphQL. A job token can list MRs and
-    their notes but not their commits; when the commits endpoint is refused, commit lookups stop and the
-    PRs are marked "commits_refused" so build_records can use local merge commits instead.
+    their notes but not their commits; when the commits endpoint is refused (401 or 403), commit lookups
+    stop and the PRs are marked "commits_refused" so build_records can use local merge commits instead.
 
     `info`, if given, receives "seen" (MRs fetched), "detail_errors" and "commits_refused" (0 or 1).
     """
@@ -1101,7 +1130,7 @@ def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch:
         try:
             probe = mr_commits(mrs[0]["iid"])
         except ApiError as e:
-            commits_refused = e.status in (401, 403, 404)
+            commits_refused = e.status in (401, 403)  # a 404 is about that one MR, not the login
         except (ValueError, KeyError, TypeError, AttributeError):
             pass
 
@@ -1555,17 +1584,17 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
             tool = CLI_FOR[provider]
             path = parsed[1]
             try:
-                cli = Cli(tool, api_host, env)
-                log(f"Fetching pull requests from {api_host} with `{tool} api` ...")
-                if provider == "github":
-                    if "/" not in path:
-                        raise ApiError(f"Cannot read owner/name from the remote path '{path}'")
-                    owner, name = path.split("/", 1)
-                    api_prs = fetch_github(cli, owner, name, since, short_branch, args.all_bases, args.max_prs,
-                                           info=info)
-                else:
-                    api_prs = fetch_gitlab(cli, path, since, short_branch, args.all_bases, args.max_prs,
-                                           not args.no_reviews, info=info)
+                with Cli(tool, api_host, env) as cli:
+                    log(f"Fetching pull requests from {api_host} with `{tool} api` ...")
+                    if provider == "github":
+                        if "/" not in path:
+                            raise ApiError(f"Cannot read owner/name from the remote path '{path}'")
+                        owner, name = path.split("/", 1)
+                        api_prs = fetch_github(cli, owner, name, since, short_branch, args.all_bases, args.max_prs,
+                                               info=info)
+                    else:
+                        api_prs = fetch_gitlab(cli, path, since, short_branch, args.all_bases, args.max_prs,
+                                               not args.no_reviews, info=info)
             except CliUnavailable as e:
                 if source == "api":
                     raise
