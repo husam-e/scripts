@@ -1,7 +1,8 @@
 """Python-side tests for repo_stats.py (plan sections A, B, C and the non-browser parts of E).
 
 Run:  python3 -m unittest discover -s tests -v
-Stdlib only. Deterministic. No real network: API tests use 127.0.0.1 mock servers and fake tokens.
+Stdlib only. Deterministic. No real network: API tests run fake gh/glab CLIs (tests/fake_cli) that
+forward to 127.0.0.1 mock servers, with fake tokens.
 """
 from __future__ import annotations
 
@@ -542,6 +543,51 @@ class A11_Options(unittest.TestCase):
         d, _ = collect(r, "--until", "2022-01-06")
         self.assertEqual(len(d["prs"]), 1)
 
+    def test_month_and_year_windows(self) -> None:
+        """YYYY-MM and YYYY cover whole UTC months and years: --until includes the last second, not the next."""
+        r = Repo()
+        r.commit("chore: init", {"a.py": lines(2)})
+        for n, when in ((1, T0 + 30 * DAY + DAY - 1),   # 2022-01-31T23:59:59Z
+                        (2, T0 + 31 * DAY),             # 2022-02-01T00:00:00Z
+                        (3, T0 + 365 * DAY - 1),        # 2022-12-31T23:59:59Z
+                        (4, T0 + 365 * DAY)):           # 2023-01-01T00:00:00Z
+            r.clock = when
+            r.squash_pr(n, f"feat: pr {n}", {f"f{n}.py": lines(2)})
+        nums = lambda *a: [p["number"] for p in collect(r, *a)[0]["prs"]]  # noqa: E731
+        self.assertEqual(nums("--until", "2022-01"), [1])
+        self.assertEqual(nums("--since", "2022-02"), [2, 3, 4])
+        self.assertEqual(nums("--since", "2022-02", "--until", "2022-12"), [2, 3])
+        self.assertEqual(nums("--since", "2022", "--until", "2022"), [1, 2, 3])
+        self.assertEqual(nums("--since", "2023"), [4])
+        self.assertEqual(nums("--since", "2022-01-31", "--until", "2022-02-01"), [1, 2])
+
+    def test_durations_count_back_from_now(self) -> None:
+        """90d, 6w, 6m and 1y count back from now in UTC; months clamp to the month's last day."""
+        now = rs.dt.datetime(2025, 3, 31, 12, tzinfo=rs.dt.timezone.utc)
+        iso = lambda v: rs.dt.datetime.fromtimestamp(rs.parse_when(v, "--since", False, now), rs.dt.timezone.utc).isoformat()  # noqa: E731
+        self.assertEqual(iso("1y"), "2024-03-31T12:00:00+00:00")
+        self.assertEqual(iso("1m"), "2025-02-28T12:00:00+00:00")
+        self.assertEqual(iso("13m"), "2024-02-29T12:00:00+00:00")
+        self.assertEqual(iso("6w"), "2025-02-17T12:00:00+00:00")
+        self.assertEqual(iso("90d"), "2024-12-31T12:00:00+00:00")
+        self.assertEqual(iso("1Y"), iso("12m"))
+        self.assertEqual(rs.parse_when("2024-02", "--until", True, now), rs.parse_when("2024-03", "--since", False, now))
+
+    def test_relative_window_in_a_run(self) -> None:
+        """--since 1y drops PRs from 2022; a long enough duration keeps them all; --until 1d keeps them too."""
+        d, _ = collect(merge_repo(), "--since", "1y")
+        self.assertEqual(d["prs"], [])
+        self.assertEqual(d["deploys"], [])
+        d, _ = collect(merge_repo(), "--since", "100y", "--until", "1d")
+        self.assertEqual([p["number"] for p in d["prs"]], [1, 2, 3, 4, 5])
+
+    def test_since_must_be_before_until(self) -> None:
+        """An empty or reversed window is an error, not an empty dashboard."""
+        for since, until in (("2025-07", "2025-01"), ("2025-03-01", "2025-02-28"), ("2025-08", "2025-07")):
+            with self.assertRaises(rs.ToolError, msg=(since, until)):
+                collect(merge_repo(), "--since", since, "--until", until)
+        collect(merge_repo(), "--since", "2025-07", "--until", "2025-07")  # one whole month is fine
+
     def test_since_excludes_earlier_day(self) -> None:
         """--since drops PRs merged the day before."""
         r = Repo()
@@ -936,7 +982,7 @@ class B1_GitHub(unittest.TestCase):
         cls.r = api_repo()
         cls.nodes = github_nodes(cls.r)
         cls.srv = ms.MockServer(ms.github_handler(desc_nodes(cls.nodes), page_size=3, expect_token=FAKE)).start()
-        cls.data, cls.err = collect(cls.r, "--api-url", cls.srv.url, env={"GITHUB_TOKEN": FAKE})
+        cls.data, cls.err = collect(cls.r, "--fake-api", cls.srv.url, env={"GITHUB_TOKEN": FAKE})
         cls.prs = by_number(cls.data)
 
     @classmethod
@@ -949,7 +995,7 @@ class B1_GitHub(unittest.TestCase):
         self.assertEqual(self.data["meta"]["mode"], "api")
         self.assertEqual(self.data["meta"]["provider"], "github")
         self.assertEqual(len(self.srv.requests), 4)  # 10 nodes / 3 per page
-        cursors = [json.loads(q["body"])["variables"]["cursor"] for q in self.srv.requests]
+        cursors = [json.loads(q["body"])["variables"].get("cursor") for q in self.srv.requests]
         self.assertEqual(cursors, [None, "3", "6", "9"])
 
     def test_base_branch_filter(self) -> None:
@@ -960,7 +1006,7 @@ class B1_GitHub(unittest.TestCase):
     def test_all_bases(self) -> None:
         """--all-bases keeps PRs into other base branches."""
         with ms.MockServer(ms.github_handler(desc_nodes(self.nodes), page_size=3)) as srv:
-            d, _ = collect(self.r, "--api-url", srv.url, "--all-bases", env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(self.r, "--fake-api", srv.url, "--all-bases", env={"GITHUB_TOKEN": FAKE})
         self.assertIn(8, by_number(d))
 
     def test_states(self) -> None:
@@ -1033,7 +1079,7 @@ class B1_GitHub(unittest.TestCase):
         """--since stops paging once PRs are older than the cutoff."""
         day = time.strftime("%Y-%m-%d", time.gmtime(BASE + 4 * DAY))
         with ms.MockServer(ms.github_handler(desc_nodes(self.nodes), page_size=3)) as srv:
-            d, _ = collect(self.r, "--api-url", srv.url, "--since", day, env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(self.r, "--fake-api", srv.url, "--since", day, env={"GITHUB_TOKEN": FAKE})
             n_requests = len(srv.requests)
         self.assertLess(n_requests, 4, "pagination must stop once PRs older than --since are seen")
         self.assertTrue(all(p["number"] >= 4 for p in d["prs"]))
@@ -1041,7 +1087,7 @@ class B1_GitHub(unittest.TestCase):
     def test_max_prs(self) -> None:
         """--max-prs stops paging once enough PRs are fetched."""
         with ms.MockServer(ms.github_handler(desc_nodes(self.nodes), page_size=3)) as srv:
-            d, _ = collect(self.r, "--api-url", srv.url, "--max-prs", "4", env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(self.r, "--fake-api", srv.url, "--max-prs", "4", env={"GITHUB_TOKEN": FAKE})
             self.assertEqual(len(srv.requests), 2)
         self.assertEqual(len(d["prs"]), 4)
 
@@ -1056,43 +1102,31 @@ class B1_GitHub(unittest.TestCase):
     def test_graphql_errors_fall_back(self) -> None:
         """GraphQL errors fall back to git mode with a warning."""
         with ms.MockServer(lambda req: (200, {}, {"errors": [{"message": "Could not resolve to a Repository"}]})) as srv:
-            d, _ = collect(self.r, "--api-url", srv.url, env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(self.r, "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
         self.assertEqual(d["meta"]["mode"], "git")
         self.assertTrue(any("Could not resolve" in w for w in d["meta"]["warnings"]))
 
     def test_repository_null_falls_back(self) -> None:
         """A null repository in the response falls back to git mode."""
         with ms.MockServer(lambda req: (200, {}, {"data": {"repository": None}})) as srv:
-            d, _ = collect(self.r, "--api-url", srv.url, env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(self.r, "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
         self.assertEqual(d["meta"]["mode"], "git")
 
-    def test_missing_token_falls_back_with_warning(self) -> None:
-        """Without a token, auto mode uses git and warns."""
-        d, _ = collect(self.r, "--api-url", self.srv.url)
+    def test_not_logged_in_falls_back_with_warning(self) -> None:
+        """When gh has no login, auto mode uses git and says how to log in."""
+        n = len(self.srv.requests)
+        d, _ = collect(self.r, "--fake-api", self.srv.url)
         self.assertEqual(d["meta"]["mode"], "git")
-        self.assertTrue(any("No API token" in w for w in d["meta"]["warnings"]))
+        self.assertEqual(len(self.srv.requests), n)
+        self.assertTrue(any("not logged in" in w and "gh auth login --hostname github.com" in w
+                            for w in d["meta"]["warnings"]), d["meta"]["warnings"])
 
     def test_source_git_never_calls_api(self) -> None:
         """--source git never contacts the API."""
         n = len(self.srv.requests)
-        d, _ = collect(self.r, "--api-url", self.srv.url, "--source", "git", env={"GITHUB_TOKEN": FAKE})
+        d, _ = collect(self.r, "--fake-api", self.srv.url, "--source", "git", env={"GITHUB_TOKEN": FAKE})
         self.assertEqual(len(self.srv.requests), n)
         self.assertEqual(d["meta"]["mode"], "git")
-
-    def test_token_env_option(self) -> None:
-        """--token-env reads the token from the named variable."""
-        seen = []
-
-        def h(req: ms.Request) -> ms.Response:
-            """Record the Authorization header, then answer as the GitHub mock."""
-            seen.append(req["headers"].get("authorization"))
-            return ms.github_handler(desc_nodes(self.nodes), page_size=50)(req)
-
-        with ms.MockServer(h) as srv:
-            d, _ = collect(self.r, "--api-url", srv.url, "--token-env", "MY_CUSTOM_TOK",
-                           env={"MY_CUSTOM_TOK": "custom-tok-1", "GITHUB_TOKEN": "should-not-be-used"})
-        self.assertEqual(d["meta"]["mode"], "api")
-        self.assertEqual(set(seen), {"Bearer custom-tok-1"})
 
 
 def gitlab_fixture(r: Repo) -> tuple[list[dict[str, Any]], dict[int, list[dict[str, Any]]],
@@ -1128,7 +1162,7 @@ class B2_GitLab(unittest.TestCase):
         cls.r = api_repo("git@gitlab.com:grp/sub/proj.git")
         cls.mrs, cls.commits, cls.notes = gitlab_fixture(cls.r)
         cls.srv = ms.MockServer(ms.gitlab_handler(cls.mrs, cls.commits, cls.notes, page_size=2)).start()
-        cls.data, _ = collect(cls.r, "--api-url", cls.srv.url + "/api/v4", env={"GITLAB_TOKEN": FAKE})
+        cls.data, _ = collect(cls.r, "--fake-api", cls.srv.url, env={"GITLAB_TOKEN": FAKE})
         cls.prs = by_number(cls.data)
 
     @classmethod
@@ -1181,7 +1215,7 @@ class B2_GitLab(unittest.TestCase):
     def test_no_reviews_flag(self) -> None:
         """--no-reviews skips the notes requests and review metrics."""
         with ms.MockServer(ms.gitlab_handler(self.mrs, self.commits, self.notes, page_size=2)) as srv:
-            d, _ = collect(self.r, "--api-url", srv.url + "/api/v4", "--no-reviews", env={"GITLAB_TOKEN": FAKE})
+            d, _ = collect(self.r, "--fake-api", srv.url, "--no-reviews", env={"GITLAB_TOKEN": FAKE})
             self.assertFalse([q for q in srv.requests if q["path"].endswith("/notes")])
         p = by_number(d)[1]
         self.assertIsNone(p["first_review"])
@@ -1194,7 +1228,7 @@ class B2_GitLab(unittest.TestCase):
         """--since is sent as updated_after, not created_after."""
         # updated_after (not created_after): an MR opened before --since but merged after it must still be fetched.
         with ms.MockServer(ms.gitlab_handler(self.mrs, self.commits, self.notes, page_size=50)) as srv:
-            collect(self.r, "--api-url", srv.url + "/api/v4", "--since", "2022-02-05", env={"GITLAB_TOKEN": FAKE})
+            collect(self.r, "--fake-api", srv.url, "--since", "2022-02-05", env={"GITLAB_TOKEN": FAKE})
             q = [q for q in srv.requests if q["path"].endswith("/merge_requests")][0]
         self.assertEqual(q["query"]["updated_after"], ["2022-02-05T00:00:00Z"])
         self.assertNotIn("created_after", q["query"])
@@ -1202,7 +1236,7 @@ class B2_GitLab(unittest.TestCase):
     def test_all_bases_drops_target_filter(self) -> None:
         """--all-bases drops the target_branch filter."""
         with ms.MockServer(ms.gitlab_handler(self.mrs, self.commits, self.notes, page_size=50)) as srv:
-            collect(self.r, "--api-url", srv.url + "/api/v4", "--all-bases", env={"GITLAB_TOKEN": FAKE})
+            collect(self.r, "--fake-api", srv.url, "--all-bases", env={"GITLAB_TOKEN": FAKE})
             q = [q for q in srv.requests if q["path"].endswith("/merge_requests")][0]
         self.assertNotIn("target_branch", q["query"])
 
@@ -1215,20 +1249,20 @@ class B2_GitLab(unittest.TestCase):
             return ms.gitlab_handler(self.mrs, self.commits, self.notes, page_size=50)(req)
 
         with mock.patch.object(rs.time, "sleep", lambda s: None), ms.MockServer(h) as srv:
-            d, _ = collect(self.r, "--api-url", srv.url + "/api/v4", env={"GITLAB_TOKEN": FAKE})
+            d, _ = collect(self.r, "--fake-api", srv.url, env={"GITLAB_TOKEN": FAKE})
         self.assertEqual(d["meta"]["mode"], "api")
 
 
-class B3_Tokens(unittest.TestCase):
-    """Token handling in the CLI."""
+class B3_CliLogin(unittest.TestCase):
+    """repo-stats never handles a credential: gh and glab use their own login, and nothing leaks."""
 
     def _run(self, remote: str, provider_env: str, handler: ms.Handler,
              extra: Sequence[str] = ()) -> tuple[subprocess.CompletedProcess[str], Path, list[ms.Request]]:
-        """Run the CLI with all three outputs against a mock API and a fake token.
+        """Run the CLI with all three outputs against a mock API, with a fake token for the fake CLI.
 
         Args:
             remote: Origin URL for the test repo.
-            provider_env: Environment variable that carries the token.
+            provider_env: Environment variable the fake gh/glab reads its token from.
             handler: Mock API handler.
             extra: Extra CLI arguments.
 
@@ -1238,9 +1272,8 @@ class B3_Tokens(unittest.TestCase):
         r = api_repo(remote)
         out = tmpdir()
         with ms.MockServer(handler) as srv:
-            api = srv.url + ("/api/v4" if provider_env == "GITLAB_TOKEN" else "")
-            p = run_cli([r.path, "-o", out / "o.html", "--json", out / "o.json", "--csv", out / "o.csv", "--api-url", api, *extra],
-                        env={provider_env: FAKE})
+            p = run_cli([r.path, "-o", out / "o.html", "--json", out / "o.json", "--csv", out / "o.csv",
+                         "--fake-api", srv.url, *extra], env={provider_env: FAKE})
             reqs = list(srv.requests)
         return p, out, reqs
 
@@ -1252,19 +1285,18 @@ class B3_Tokens(unittest.TestCase):
         self.assertNotIn(FAKE, p.stderr)
         self.assertNotIn(FAKE, p.stdout)
 
-    def test_github_cli_no_leak_and_header(self) -> None:
-        """GitHub CLI runs send a bearer token and leak it nowhere."""
+    def test_github_cli_no_leak(self) -> None:
+        """A run through gh (logged in via GITHUB_TOKEN) gets API data and leaks the token nowhere."""
         nodes = github_nodes(fixtures.merge_workflow_repo())
         p, out, reqs = self._run("https://github.com/acme/widgets.git", "GITHUB_TOKEN",
                                  ms.github_handler(desc_nodes(nodes), page_size=50, expect_token=FAKE))
         self._assert_no_leak(p, out)
         self.assertIn("source: api", p.stderr)
+        self.assertIn("with `gh api`", p.stderr)
         self.assertTrue(reqs)
-        for q in reqs:
-            self.assertEqual(q["headers"]["authorization"], f"Bearer {FAKE}")
 
-    def test_gitlab_cli_no_leak_and_header(self) -> None:
-        """GitLab CLI runs send PRIVATE-TOKEN and leak it nowhere."""
+    def test_gitlab_cli_no_leak(self) -> None:
+        """A run through glab (logged in via GITLAB_TOKEN) gets API data and leaks the token nowhere."""
         mrs, commits, notes = gitlab_fixture(fixtures.merge_workflow_repo())
         p, out, reqs = self._run("https://gitlab.com/grp/proj.git", "GITLAB_TOKEN", ms.gitlab_handler(mrs, commits, notes, page_size=50))
         self._assert_no_leak(p, out)
@@ -1277,82 +1309,87 @@ class B3_Tokens(unittest.TestCase):
         nodes = github_nodes(fixtures.merge_workflow_repo())
         r = api_repo("https://octo:EMBEDDEDSECRET99@github.com/acme/widgets.git")
         out = tmpdir()
+        log = tmpdir() / "cli.log"
         with ms.MockServer(ms.github_handler(desc_nodes(nodes), page_size=50)) as srv:
-            p = run_cli([r.path, "-o", out / "o.html", "--json", out / "o.json", "--api-url", srv.url], env={"GITHUB_TOKEN": FAKE})
+            p = run_cli([r.path, "-o", out / "o.html", "--json", out / "o.json", "--fake-api", srv.url],
+                        env={"GITHUB_TOKEN": FAKE, "REPO_STATS_FAKE_LOG": str(log)})
             for q in srv.requests:
                 self.assertNotIn("EMBEDDEDSECRET99", json.dumps(q["headers"]) + q["raw_path"])
         self.assertEqual(p.returncode, 0, p.stderr)
         for f in ("o.html", "o.json"):
             self.assertNotIn("EMBEDDEDSECRET99", (out / f).read_text())
         self.assertNotIn("EMBEDDEDSECRET99", p.stderr)
+        self.assertNotIn("EMBEDDEDSECRET99", json.dumps([c["argv"] for c in helpers.cli_calls(log)]))
 
     def test_token_on_api_failure_not_in_stderr(self) -> None:
         """A failed API run does not print the token."""
         r = api_repo()
         with ms.MockServer(lambda req: (401, {}, {"message": "Bad credentials"})) as srv:
-            p = run_cli([r.path, "-o", tmpdir() / "o.html", "--api-url", srv.url, "--source", "api"], env={"GITHUB_TOKEN": FAKE})
+            p = run_cli([r.path, "-o", tmpdir() / "o.html", "--fake-api", srv.url, "--source", "api"], env={"GITHUB_TOKEN": FAKE})
         self.assertNotEqual(p.returncode, 0)
+        self.assertIn("gh auth login", p.stderr)
         self.assertNotIn(FAKE, p.stderr + p.stdout)
 
-    def test_no_token_means_no_request(self) -> None:
-        """Without a token no API request is made."""
+    def test_not_logged_in_means_no_request(self) -> None:
+        """When gh has no login, no API request is made and the run falls back to git."""
         r = api_repo()
         with ms.MockServer(lambda req: (200, {}, {})) as srv:
-            p = run_cli([r.path, "-o", tmpdir() / "o.html", "--api-url", srv.url])
+            p = run_cli([r.path, "-o", tmpdir() / "o.html", "--fake-api", srv.url])
             self.assertEqual(srv.requests, [])
         self.assertEqual(p.returncode, 0)
-        self.assertIn("No API token", p.stderr)
+        self.assertIn("not logged in", p.stderr)
 
-    def test_source_api_without_token_is_error(self) -> None:
-        """--source api without a token exits 1 with a clean error."""
+    def test_source_api_not_logged_in_is_error(self) -> None:
+        """--source api without a gh login exits 1 with the login command, no traceback."""
         r = api_repo()
         p = run_cli([r.path, "-o", tmpdir() / "o.html", "--source", "api"])
         self.assertEqual(p.returncode, 1)
-        self.assertIn("No API token", p.stderr)
+        self.assertIn("gh auth login --hostname github.com", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
-    def test_token_env_cli(self) -> None:
-        """--token-env works from the CLI and the token is not leaked."""
-        nodes = github_nodes(fixtures.merge_workflow_repo())
+    def test_missing_cli_falls_back_or_errors(self) -> None:
+        """Without gh installed, auto mode uses git and says where to get it; --source api is an error."""
         r = api_repo()
-        out = tmpdir()
-        with ms.MockServer(ms.github_handler(desc_nodes(nodes), page_size=50, expect_token="viaenv-777")) as srv:
-            p = run_cli([r.path, "-o", out / "o.html", "--api-url", srv.url, "--token-env", "CUSTOM_ENV_TOKEN"],
-                        env={"CUSTOM_ENV_TOKEN": "viaenv-777"})
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("source: api", p.stderr)
-        self.assertNotIn("viaenv-777", (out / "o.html").read_text() + p.stderr)
+        empty = tmpdir()  # a PATH with no gh on it (git still runs from the real PATH)
+        d, _ = collect(r, env={"PATH": str(empty), "GITHUB_TOKEN": FAKE})
+        self.assertEqual(d["meta"]["mode"], "git")
+        self.assertTrue(any("gh is not installed" in w and "cli.github.com" in w for w in d["meta"]["warnings"]))
+        with self.assertRaises(rs.CliUnavailable):
+            collect(r, "--source", "api", env={"PATH": str(empty)})
 
-    def test_loopback_api_never_uses_proxy(self) -> None:
-        """Requests to a loopback --api-url bypass http_proxy even when NO_PROXY does not exempt it."""
-        nodes = github_nodes(fixtures.merge_workflow_repo())
+    def test_missing_cli_warns_on_the_command_line(self) -> None:
+        """Without gh on PATH, the run prints a warning, uses local git history and says so."""
         r = api_repo()
-        with ms.MockServer(ms.github_handler(desc_nodes(nodes), page_size=50, expect_token=FAKE)) as srv, \
-                ms.MockServer(lambda req: (502, {}, {"message": "proxy"})) as proxy:
-            env = {"GITHUB_TOKEN": FAKE, "http_proxy": proxy.url, "HTTP_PROXY": proxy.url, "NO_PROXY": "", "no_proxy": ""}
-            p = run_cli([r.path, "-o", tmpdir() / "o.html", "--provider", "github", "--api-url", srv.url,
-                         "--source", "api"], env=env)
-            reqs, proxied = list(srv.requests), list(proxy.requests)
+        empty = tmpdir()
+        git_dir = Path(subprocess.run(["sh", "-c", "command -v git"], capture_output=True, text=True).stdout.strip()).parent
+        p = run_cli([r.path, "-o", tmpdir() / "o.html"], env={"PATH": os.pathsep.join([str(empty), str(git_dir)])})
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertTrue(reqs)
-        for q in reqs:
-            self.assertEqual(q["headers"]["authorization"], f"Bearer {FAKE}")
-        self.assertEqual(proxied, [])
+        self.assertIn("warning: gh is not installed", p.stderr)
+        self.assertIn("PRs are inferred from git history", p.stderr)
+        self.assertIn("source: git", p.stderr)
 
-    def test_collect_uses_given_environ(self) -> None:
-        """collect() reads tokens from its environ argument, not from os.environ."""
+    def test_collect_passes_given_environ_to_the_cli(self) -> None:
+        """collect() runs gh with its environ argument, not os.environ."""
         nodes = github_nodes(fixtures.merge_workflow_repo())
         r = api_repo()
         with ms.MockServer(ms.github_handler(desc_nodes(nodes), page_size=50)) as srv:
-            args = rs.build_parser().parse_args([str(r.path), "--provider", "github", "--api-url", srv.url])
+            args = rs.build_parser().parse_args([str(r.path)])
+            env = helpers.clean_env({"GITHUB_TOKEN": "from-param", "REPO_STATS_FAKE_URL": srv.url})
             with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "from-os-environ"}), \
                     contextlib.redirect_stderr(io.StringIO()):
-                d = rs.collect(args, environ={"GITHUB_TOKEN": "from-param"})
+                d = rs.collect(args, environ=env)
             auths = [q["headers"].get("authorization") for q in srv.requests]
         self.assertEqual(d["meta"]["mode"], "api")
-        self.assertTrue(auths)
         self.assertEqual(set(auths), {"Bearer from-param"})
-        self.assertNotIn("from-os-environ", json.dumps([q["headers"] for q in srv.requests]))
+
+    def test_repo_stats_never_reads_a_credential(self) -> None:
+        """The source never looks up a credential variable's value; it only removes the names for git."""
+        src = (ROOT / "repo_stats.py").read_text()
+        for name in rs.CREDENTIAL_VARS:
+            for pat in (rf"environ(?:\.get)?\(\s*[\"']{name}", rf"environ\[\s*[\"']{name}", rf"getenv\(\s*[\"']{name}"):
+                self.assertIsNone(re.search(pat, src), (name, pat))
+        self.assertNotIn("Authorization", src)
+        self.assertNotIn("PRIVATE-TOKEN", src)
 
 
 class B4_Failures(unittest.TestCase):
@@ -1371,7 +1408,7 @@ class B4_Failures(unittest.TestCase):
         """Auto mode falls back to git on 401, 403 and 404 with a warning."""
         for status, needle in ((401, "401"), (403, "403"), (404, "404")):
             with self._srv(status) as srv:
-                d, _ = collect(self.r, "--api-url", srv.url, env={"GITHUB_TOKEN": FAKE})
+                d, _ = collect(self.r, "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
             self.assertEqual(d["meta"]["mode"], "git", status)
             self.assertEqual(len(d["prs"]), 5)
             self.assertTrue(any("API fetch failed" in w and needle in w for w in d["meta"]["warnings"]), (status, d["meta"]["warnings"]))
@@ -1380,7 +1417,7 @@ class B4_Failures(unittest.TestCase):
         """--source api exits 1 with the status code on 4xx errors."""
         for status in (401, 403, 404):
             with self._srv(status) as srv:
-                p = run_cli([self.r.path, "-o", tmpdir() / "o.html", "--api-url", srv.url, "--source", "api"], env={"GITHUB_TOKEN": FAKE})
+                p = run_cli([self.r.path, "-o", tmpdir() / "o.html", "--fake-api", srv.url, "--source", "api"], env={"GITHUB_TOKEN": FAKE})
             self.assertEqual(p.returncode, 1, status)
             self.assertIn(f"{status}", p.stderr)
             self.assertIn("error:", p.stderr)
@@ -1390,7 +1427,7 @@ class B4_Failures(unittest.TestCase):
         """Server errors are retried with exponential back-off, then fall back."""
         sleeps = []
         with mock.patch.object(rs.time, "sleep", sleeps.append), self._srv(500) as srv:
-            d, _ = collect(self.r, "--api-url", srv.url, env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(self.r, "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
             self.assertEqual(len(srv.requests), 5)
         self.assertEqual(sleeps, [2, 4, 8, 16])
         self.assertEqual(d["meta"]["mode"], "git")
@@ -1399,7 +1436,7 @@ class B4_Failures(unittest.TestCase):
         """--source api raises ToolError after repeated 500s."""
         with mock.patch.object(rs.time, "sleep", lambda s: None), self._srv(500) as srv:
             with self.assertRaises(rs.ToolError) as cm:
-                collect(self.r, "--api-url", srv.url, "--source", "api", env={"GITHUB_TOKEN": FAKE})
+                collect(self.r, "--fake-api", srv.url, "--source", "api", env={"GITHUB_TOKEN": FAKE})
         self.assertIn("500", str(cm.exception))
 
     def test_connection_refused(self) -> None:
@@ -1410,11 +1447,11 @@ class B4_Failures(unittest.TestCase):
         s.close()
         sleeps = []
         with mock.patch.object(rs.time, "sleep", sleeps.append):
-            d, _ = collect(self.r, "--api-url", f"http://127.0.0.1:{port}", env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(self.r, "--fake-api", f"http://127.0.0.1:{port}", env={"GITHUB_TOKEN": FAKE})
             self.assertEqual(d["meta"]["mode"], "git")
             self.assertTrue(any("Could not reach" in w for w in d["meta"]["warnings"]))
             with self.assertRaises(rs.ToolError):
-                collect(self.r, "--api-url", f"http://127.0.0.1:{port}", "--source", "api", env={"GITHUB_TOKEN": FAKE})
+                collect(self.r, "--fake-api", f"http://127.0.0.1:{port}", "--source", "api", env={"GITHUB_TOKEN": FAKE})
         # UX: a dead host should not make the user wait this long before the git fallback kicks in.
         self.assertLessEqual(sum(sleeps) / 2, 10, f"waited {sum(sleeps) / 2}s of back-off before giving up on a refused connection")
 
@@ -1433,7 +1470,7 @@ class B4_Failures(unittest.TestCase):
 
         sleeps = []
         with mock.patch.object(rs.time, "sleep", sleeps.append), ms.MockServer(h) as srv:
-            d, _ = collect(self.r, "--api-url", srv.url, env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(self.r, "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
         self.assertEqual(sleeps, [3])
         self.assertEqual(d["meta"]["mode"], "api")
 
@@ -1451,7 +1488,7 @@ class B4_Failures(unittest.TestCase):
             return inner(req)
 
         with mock.patch.object(rs.time, "sleep", lambda s: None), ms.MockServer(h) as srv:
-            d, _ = collect(self.r, "--api-url", srv.url, env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(self.r, "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
         self.assertEqual(d["meta"]["mode"], "api")
 
     def test_non_json_200_falls_back(self) -> None:
@@ -1460,14 +1497,14 @@ class B4_Failures(unittest.TestCase):
         An HTML page (captive portal, proxy error) with status 200 must be a clean fallback, not a traceback.
         """
         with ms.MockServer(lambda req: (200, {"Content-Type": "text/html"}, "<html>proxy login</html>")) as srv:
-            d, _ = collect(self.r, "--api-url", srv.url, env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(self.r, "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
         self.assertEqual(d["meta"]["mode"], "git")
         self.assertTrue(any("API fetch failed" in w for w in d["meta"]["warnings"]))
 
     def test_non_json_200_cli_clean_error(self) -> None:
         """A non-JSON 200 with --source api exits 1 without a traceback."""
         with ms.MockServer(lambda req: (200, {}, "<html>nope</html>")) as srv:
-            p = run_cli([self.r.path, "-o", tmpdir() / "o.html", "--api-url", srv.url, "--source", "api"], env={"GITHUB_TOKEN": FAKE})
+            p = run_cli([self.r.path, "-o", tmpdir() / "o.html", "--fake-api", srv.url, "--source", "api"], env={"GITHUB_TOKEN": FAKE})
         self.assertEqual(p.returncode, 1)
         self.assertNotIn("Traceback", p.stderr)
 
@@ -1483,65 +1520,6 @@ class B4_Failures(unittest.TestCase):
 
 class B5_Safety(unittest.TestCase):
     """HTTP safety rules and remote URL parsing."""
-
-    def test_refuses_plain_http_non_loopback(self) -> None:
-        """Plain HTTP to non-loopback hosts is refused."""
-        for url in ("http://example.com/graphql", "http://10.1.2.3/x", "http://localhost.evil.test/x", "http://127.0.0.1.evil.test/x"):
-            with self.assertRaises(rs.ApiError, msg=url):
-                rs.http_json(url, {"Authorization": "Bearer x"})
-
-    def test_allows_loopback_http(self) -> None:
-        """Plain HTTP to 127.0.0.1 and localhost is allowed."""
-        with ms.MockServer(lambda req: (200, {}, {"ok": True})) as srv:
-            self.assertEqual(rs.http_json(srv.url + "/x", {})[0], {"ok": True})
-            self.assertEqual(rs.http_json(f"http://localhost:{srv.port}/x", {})[0], {"ok": True})
-
-    def test_cross_host_redirect_refused(self) -> None:
-        """Redirects to another port are refused before the token is sent."""
-        with ms.MockServer(lambda req: (200, {}, {"leak": True})) as other:
-            def h(req: ms.Request) -> ms.Response:
-                """Redirect every request to the other server."""
-                return 302, {"Location": f"{other.url}/steal"}, {}
-
-            with ms.MockServer(h) as srv:
-                with self.assertRaises(rs.ApiError):
-                    rs.http_json(srv.url + "/x", {"Authorization": f"Bearer {FAKE}"})
-            self.assertEqual(other.requests, [], "token must not reach the redirect target")
-
-    def test_cross_hostname_redirect_refused(self) -> None:
-        """Redirects from 127.0.0.1 to localhost are refused."""
-        with ms.MockServer(lambda req: (200, {}, {"leak": True})) as srv_b:
-            pass
-        with ms.MockServer(lambda req: (200, {}, {"ok": 1})) as srv:
-            def h(req: ms.Request) -> ms.Response:
-                """Redirect every request to the second server, addressed as localhost."""
-                return 302, {"Location": f"http://localhost:{srv.port}/x"}, {}
-
-            with ms.MockServer(h) as a:
-                with self.assertRaises(rs.ApiError):
-                    rs.http_json(a.url + "/x", {"Authorization": "Bearer t"})
-            self.assertEqual(srv.requests, [])
-
-    def test_same_host_redirect_followed(self) -> None:
-        """Same-host redirects are followed and keep the Authorization header."""
-        def h(req: ms.Request) -> ms.Response:
-            """Redirect /a to /b on the same server; /b echoes the Authorization header."""
-            if req["path"] == "/a":
-                return 302, {"Location": f"http://127.0.0.1:{req['port']}/b"}, {}
-            return 200, {}, {"final": req["headers"].get("authorization")}
-
-        with ms.MockServer(h) as srv:
-            self.assertEqual(rs.http_json(srv.url + "/a", {"Authorization": "Bearer t"})[0], {"final": "Bearer t"})
-
-    def test_https_to_http_downgrade_redirect_refused(self) -> None:
-        """An https-to-http redirect on the same host is refused.
-
-        Same host but https -> http would send the Authorization header in clear text.
-        """
-        handler = rs._SameHostRedirect()
-        req = urllib.request.Request("https://api.example.com/graphql", headers={"Authorization": f"Bearer {FAKE}"})
-        with self.assertRaises(rs.ApiError):
-            handler.redirect_request(req, None, 302, "Found", {}, "http://api.example.com/graphql")  # pyright: ignore[reportArgumentType]
 
     def test_parse_remote_styles(self) -> None:
         """parse_remote() handles HTTPS, SSH, scp-style and credentialed URLs."""
@@ -1573,7 +1551,7 @@ class B5_Safety(unittest.TestCase):
         """Lookalike hosts are not auto-detected as GitHub or GitLab.
 
         Only github.com and gitlab.com may be auto-detected; any other host (github.evil.com, *gitlab*)
-        needs an explicit --provider/--api-url, otherwise a crafted remote URL receives the token.
+        needs an explicit --provider/--hostname, because gh and glab send environment tokens to any host.
         """
         for host in ("github.evil.com", "github.evil.example", "gitlab.evil.com", "notgitlab.example", "my-gitlab.corp.example",
                      "github.com.evil.example"):
@@ -1588,18 +1566,24 @@ class B5_Safety(unittest.TestCase):
         d, _ = collect(r, env={"GITHUB_TOKEN": FAKE})  # must not even try https://github.evil.com/api
         self.assertEqual(d["meta"]["mode"], "git")
 
-    def test_provider_and_api_url_override(self) -> None:
-        """--provider and --api-url enable a self-hosted GitLab."""
+    def test_provider_and_hostname_override(self) -> None:
+        """--provider and --hostname enable a self-hosted GitLab, and glab gets exactly that host."""
         r = fixtures.merge_workflow_repo()
         add_remote(r, "git@git.corp.example:team/app.git")
         d, _ = collect(r, env={"GITLAB_TOKEN": FAKE})
         self.assertEqual(d["meta"]["mode"], "git")
         self.assertTrue(any("No GitHub or GitLab remote" in w for w in d["meta"]["warnings"]))
         mrs, commits, notes = gitlab_fixture(r)
+        log = tmpdir() / "cli.log"
         with ms.MockServer(ms.gitlab_handler(mrs, commits, notes, page_size=50)) as srv:
-            d, _ = collect(r, "--provider", "gitlab", "--api-url", srv.url + "/api/v4", env={"GITLAB_TOKEN": FAKE})
+            d, _ = collect(r, "--provider", "gitlab", "--fake-api", srv.url, env={"GITLAB_TOKEN": FAKE})
+            self.assertEqual(d["meta"]["mode"], "git", "--provider alone must not trust the remote's host")
+            d, _ = collect(r, "--provider", "gitlab", "--hostname", "Git.Corp.Example", "--fake-api", srv.url,
+                           env={"GITLAB_TOKEN": FAKE, "REPO_STATS_FAKE_LOG": str(log)})
             self.assertTrue(any("team%2Fapp" in q["raw_path"] for q in srv.requests))
         self.assertEqual(d["meta"]["mode"], "api")
+        hosts = {c["argv"][c["argv"].index("--hostname") + 1] for c in helpers.cli_calls(log)}
+        self.assertEqual(hosts, {"git.corp.example"})
         self.assertEqual(d["meta"]["name"], "app")
 
     def test_remote_option(self) -> None:
@@ -1608,7 +1592,7 @@ class B5_Safety(unittest.TestCase):
         add_remote(r, "https://github.com/acme/widgets.git", "upstream")
         nodes = desc_nodes(github_nodes(r))
         with ms.MockServer(ms.github_handler(nodes, page_size=50)) as srv:
-            d, _ = collect(r, "--remote", "upstream", "--api-url", srv.url, env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(r, "--remote", "upstream", "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
             body = json.loads(srv.requests[0]["body"])
         self.assertEqual(body["variables"]["owner"], "acme")
         self.assertEqual(body["variables"]["name"], "widgets")
@@ -1643,8 +1627,8 @@ class B6_ReviewerFindings(unittest.TestCase):
         """Auto mode falls back to git on any client exception."""
         r = api_repo()
         for exc in (ValueError("bad json"), TimeoutError("read timed out"), KeyError("data"), OSError("reset")):
-            with mock.patch.object(rs, "http_json", side_effect=exc):
-                d, _ = collect(r, "--api-url", "http://127.0.0.1:1", env={"GITHUB_TOKEN": FAKE})
+            with mock.patch.object(rs.Cli, "_run", side_effect=exc):
+                d, _ = collect(r, "--fake-api", "http://127.0.0.1:1", env={"GITHUB_TOKEN": FAKE})
             self.assertEqual(d["meta"]["mode"], "git", repr(exc))
             self.assertTrue(any("API fetch failed" in w for w in d["meta"]["warnings"]))
 
@@ -1658,7 +1642,7 @@ class B6_ReviewerFindings(unittest.TestCase):
         since_day = time.strftime("%Y-%m-%d", time.gmtime(BASE + 5 * DAY))
         nodes = [new, old, older]  # created DESC
         with ms.MockServer(ms.github_handler(nodes, page_size=1)) as srv:
-            d, _ = collect(r, "--api-url", srv.url, "--since", since_day, env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(r, "--fake-api", srv.url, "--since", since_day, env={"GITHUB_TOKEN": FAKE})
         self.assertEqual(sorted(p["number"] for p in d["prs"]), [20, 21])
 
     def test_branch_with_non_origin_remote_prefix_still_matches_api_base(self) -> None:
@@ -1667,7 +1651,7 @@ class B6_ReviewerFindings(unittest.TestCase):
         r.git("update-ref", "refs/remotes/upstream/main", "HEAD")
         nodes = desc_nodes(github_nodes(r))
         with ms.MockServer(ms.github_handler(nodes, page_size=50)) as srv:
-            d, _ = collect(r, "--branch", "upstream/main", "--api-url", srv.url, env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(r, "--branch", "upstream/main", "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
         self.assertEqual(d["meta"]["mode"], "api")
         self.assertGreater(len(d["prs"]), 0, "base-branch filter compared 'upstream/main' with 'main' and dropped every PR")
 
@@ -1679,7 +1663,7 @@ class B6_ReviewerFindings(unittest.TestCase):
         r.git("symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/main")
         nodes = desc_nodes(github_nodes(r))
         with ms.MockServer(ms.github_handler(nodes, page_size=50)) as srv:
-            d, _ = collect(r, "--remote", "upstream", "--api-url", srv.url, env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(r, "--remote", "upstream", "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
         self.assertEqual(d["meta"]["mode"], "api")
         self.assertGreater(len(d["prs"]), 0, "zero PRs with --remote upstream and no warning")
 
@@ -1688,7 +1672,7 @@ class B6_ReviewerFindings(unittest.TestCase):
         r = api_repo()
         nodes = [ms.gh_node(1, "feat: x", BASE, merged=BASE + 100, base="some-other-branch")]
         with ms.MockServer(ms.github_handler(nodes, page_size=50)) as srv:
-            d, _ = collect(r, "--api-url", srv.url, env={"GITHUB_TOKEN": FAKE})
+            d, _ = collect(r, "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
         if not d["prs"]:
             self.assertTrue(d["meta"]["warnings"], "API returned PRs but all were filtered out by base branch, silently")
 
@@ -1939,7 +1923,7 @@ class E1_Cli(unittest.TestCase):
         """Invalid dates exit 1 with a clear error."""
         r = merge_repo().path
         for flag in ("--since", "--until"):
-            for bad in ("2022-13-45", "yesterday", "2022/01/01"):
+            for bad in ("2022-13-45", "yesterday", "2022/01/01", "2022-1-5", "0d", "1q", "22", "2022-02-30"):
                 p = run_cli([r, "-o", tmpdir() / "o.html", flag, bad])
                 self.assertEqual(p.returncode, 1, (flag, bad))
                 self.assertIn("Invalid date", p.stderr)
@@ -2242,9 +2226,6 @@ class E5_SelfContained(unittest.TestCase):
         self.assertIsNone(self.RESOURCE.search(html))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # =====================================================================================================
 # F. Regression tests for review findings
@@ -2295,9 +2276,10 @@ class F2_GitLabDetailErrors(unittest.TestCase):
     def _fetch(self, handler: ms.Handler) -> tuple[list[dict[str, Any]], dict[str, int]]:
         """Run fetch_gitlab against `handler` and return (raw PRs, info)."""
         info: dict[str, int] = {}
+        env = helpers.clean_env({"GITLAB_TOKEN": FAKE})
         with mock.patch.object(rs.time, "sleep", lambda s: None), ms.MockServer(handler) as srv:
-            prs = rs.fetch_gitlab("g/p", FAKE, srv.url + "/api/v4", None, "main", False, None, True,
-                                  progress=lambda m: None, info=info)
+            cli = rs.Cli("glab", "gitlab.com", {**env, "REPO_STATS_FAKE_URL": srv.url})
+            prs = rs.fetch_gitlab(cli, "g/p", None, "main", False, None, True, progress=lambda m: None, info=info)
         return prs, info
 
     def test_notes_failure_is_not_unreviewed(self) -> None:
@@ -2329,7 +2311,7 @@ class F2_GitLabDetailErrors(unittest.TestCase):
             return (500, {}, {"message": "boom"}) if req["path"].endswith("/notes") else base(req)
 
         with mock.patch.object(rs.time, "sleep", lambda s: None), ms.MockServer(h) as srv:
-            d, _ = collect(r, "--api-url", srv.url + "/api/v4", env={"GITLAB_TOKEN": FAKE})
+            d, _ = collect(r, "--fake-api", srv.url, env={"GITLAB_TOKEN": FAKE})
         self.assertTrue(any("lookups fail" in w for w in d["meta"]["warnings"]))
         self.assertTrue(all(p["reviewed"] is None for p in d["prs"]))
 
@@ -2445,3 +2427,211 @@ class F4_CliAndServe(unittest.TestCase):
         with open(path, newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
         self.assertEqual([r["title"] for r in rows], ["'  =HYPERLINK(\"http://x\")", "   ", "fix: ok"])
+
+
+# =====================================================================================================
+# G. gh / glab: read-only requests, host trust and no credential handling
+# =====================================================================================================
+
+class G1_ReadOnlyCli(unittest.TestCase):
+    """Every API request is a read-only gh/glab call to an explicit host, from outside the repository."""
+
+    def _cli(self, tool: str, url: str = "http://127.0.0.1:1", **extra: str) -> rs.Cli:
+        """A Cli for `tool` that uses the fake CLIs and the mock server at `url`."""
+        return rs.Cli(tool, "github.com" if tool == "gh" else "gitlab.com",
+                      helpers.clean_env({"REPO_STATS_FAKE_URL": url, **extra}))
+
+    def test_graphql_refuses_mutations(self) -> None:
+        """Mutations, subscriptions and anything that is not a query are refused before gh runs."""
+        log = tmpdir() / "cli.log"
+        cli = self._cli("gh", REPO_STATS_FAKE_LOG=str(log))
+        for q in ("mutation { addStar(input:{starrableId:\"x\"}) { clientMutationId } }",
+                  "query { a } mutation { b }", "subscription { x }", "{ viewer { login } }", ""):
+            with self.assertRaises(rs.ApiError, msg=q):
+                cli.graphql(q, {})
+        self.assertEqual(helpers.cli_calls(log), [], "no gh process may start for a refused request")
+
+    def test_gitlab_refuses_endpoints_outside_the_allowlist(self) -> None:
+        """Only the three merge request list endpoints can be requested, and only with GET."""
+        log = tmpdir() / "cli.log"
+        cli = self._cli("glab", REPO_STATS_FAKE_LOG=str(log))
+        for ep in ("projects/g%2Fp/merge_requests/1/approve", "projects/g%2Fp/merge_requests/1/merge",
+                   "projects/g%2Fp", "user", "projects/g/p/merge_requests", "projects/g%2Fp/merge_requests/1",
+                   "projects/g%2Fp/merge_requests?x=1", "graphql", "/projects/g%2Fp/merge_requests"):
+            with self.assertRaises(rs.ApiError, msg=ep):
+                cli.get(ep, {})
+        with self.assertRaises(rs.ApiError):  # glab cannot send GraphQL, nor gh GitLab requests
+            cli.graphql(rs.GITHUB_QUERY, {})
+        with self.assertRaises(rs.ApiError):
+            self._cli("gh").get("projects/g%2Fp/merge_requests", {})
+        self.assertEqual(helpers.cli_calls(log), [])
+
+    def test_source_has_no_write_requests(self) -> None:
+        """The source sends no mutation and names no write method."""
+        src = (ROOT / "repo_stats.py").read_text()
+        self.assertTrue(rs.READ_ONLY_GRAPHQL.match(rs.GITHUB_QUERY))
+        self.assertIsNone(rs.WRITE_GRAPHQL.search(rs.GITHUB_QUERY))
+        for word in ('"POST"', '"PUT"', '"PATCH"', '"DELETE"', '"-X"', '"-F"', '"--field"', '"--input"', '"--form"'):
+            self.assertNotIn(word, src, word)
+        git_subcommands = set(re.findall(r'run_git\(repo, "([a-z-]+)"', src) + re.findall(r'stream_git\(repo, "([a-z-]+)"', src))
+        self.assertLessEqual(git_subcommands, {"log", "rev-parse", "for-each-ref", "symbolic-ref", "remote"}, git_subcommands)
+
+    def test_bad_hostnames_rejected(self) -> None:
+        """--hostname must be a plain host name: no ports, schemes, paths, spaces or leading dashes."""
+        r = api_repo()
+        for bad in ("-x", "--hostname=evil", "evil.example:8443", "https://evil.example", "a b", "evil.example/x", ""):
+            with self.assertRaises((rs.ToolError, SystemExit), msg=bad):
+                collect(r, "--provider", "github", "--hostname", bad, env={"GITHUB_TOKEN": FAKE})
+
+    def test_hostname_needs_provider_for_unknown_hosts(self) -> None:
+        """--hostname for a host that is not github.com/gitlab.com needs --provider."""
+        r = api_repo("git@git.corp.example:team/app.git")
+        d, _ = collect(r, "--hostname", "git.corp.example", env={"GITLAB_TOKEN": FAKE})
+        self.assertEqual(d["meta"]["mode"], "git")
+        self.assertTrue(any("needs --provider" in w for w in d["meta"]["warnings"]))
+
+    def test_every_call_is_read_only_explicit_host_and_outside_the_repo(self) -> None:
+        """Each gh/glab call has --hostname and --include, no write flags, and runs from the system temp dir."""
+        for remote, provider_env, handler_for in (
+                ("https://github.com/acme/widgets.git", "GITHUB_TOKEN",
+                 lambda r: ms.github_handler(desc_nodes(github_nodes(r)), page_size=3)),
+                ("git@gitlab.com:grp/sub/proj.git", "GITLAB_TOKEN",
+                 lambda r: ms.gitlab_handler(*gitlab_fixture(r), page_size=2))):
+            r = api_repo(remote)
+            log = tmpdir() / "cli.log"
+            with ms.MockServer(handler_for(r)) as srv:
+                d, _ = collect(r, "--fake-api", srv.url, env={provider_env: FAKE, "REPO_STATS_FAKE_LOG": str(log)})
+            self.assertEqual(d["meta"]["mode"], "api", remote)
+            calls = helpers.cli_calls(log)
+            self.assertGreater(len(calls), 1)
+            for c in calls:
+                argv = c["argv"]
+                self.assertEqual(argv[0], "api")
+                self.assertIn(argv[argv.index("--hostname") + 1], ("github.com", "gitlab.com"))
+                self.assertIn("--include", argv)
+                if c["tool"] == "glab":
+                    self.assertEqual(argv[argv.index("--method") + 1], "GET")
+                else:
+                    self.assertEqual(argv[1], "graphql")
+                    query = next(a for a in argv if a.startswith("query="))[len("query="):]
+                    self.assertTrue(rs.READ_ONLY_GRAPHQL.match(query))
+                self.assertEqual(Path(c["cwd"]).resolve(), Path(tempfile.gettempdir()).resolve())
+
+    def test_cli_environment_has_no_telemetry_or_debug_switches(self) -> None:
+        """glab runs with telemetry off, and neither CLI gets request-dumping debug flags."""
+        r = api_repo("git@gitlab.com:grp/sub/proj.git")
+        log = tmpdir() / "cli.log"
+        noisy = {"GH_DEBUG": "api", "DEBUG": "1", "GLAB_DEBUG": "true", "GLAB_DEBUG_HTTP": "true"}
+        with ms.MockServer(ms.gitlab_handler(*gitlab_fixture(r), page_size=50)) as srv:
+            collect(r, "--fake-api", srv.url, env={"GITLAB_TOKEN": FAKE, "REPO_STATS_FAKE_LOG": str(log), **noisy})
+        calls = helpers.cli_calls(log)
+        self.assertTrue(calls)
+        for c in calls:
+            self.assertEqual(c["env"].get("GLAB_SEND_TELEMETRY"), "false")
+            for k in noisy:
+                self.assertNotIn(k, c["env"])
+            self.assertEqual(c["env"].get("GITLAB_TOKEN"), FAKE, "the CLI keeps its own login variables")
+
+    def test_lookalike_remote_never_starts_a_cli(self) -> None:
+        """A lookalike or unknown remote host starts no gh/glab process at all."""
+        for url in ("https://github.evil.com/acme/widgets.git", "git@gitlab.evil.example:a/b.git",
+                    "https://github.com.evil.example/a/b.git"):
+            r = fixtures.merge_workflow_repo()
+            add_remote(r, url)
+            log = tmpdir() / "cli.log"
+            d, _ = collect(r, env={"GITHUB_TOKEN": FAKE, "GITLAB_TOKEN": FAKE, "REPO_STATS_FAKE_LOG": str(log)})
+            self.assertEqual(d["meta"]["mode"], "git", url)
+            self.assertEqual(helpers.cli_calls(log), [], url)
+
+    def test_ci_server_host_is_trusted_only_when_it_matches(self) -> None:
+        """In GitLab CI, a remote on CI_SERVER_HOST uses glab without --hostname; any other host does not."""
+        r = api_repo("https://git.corp.example/grp/proj.git")
+        mrs, commits, notes = gitlab_fixture(r)
+        ci = {"GITLAB_CI": "true", "GITLAB_TOKEN": FAKE}
+        with ms.MockServer(ms.gitlab_handler(mrs, commits, notes, page_size=50)) as srv:
+            d, _ = collect(r, "--fake-api", srv.url, env={**ci, "CI_SERVER_HOST": "git.corp.example"})
+            self.assertEqual(d["meta"]["mode"], "api")
+            self.assertEqual(d["meta"]["provider"], "gitlab")
+            n = len(srv.requests)
+            d, _ = collect(r, "--fake-api", srv.url, env={**ci, "CI_SERVER_HOST": "other.example"})
+            self.assertEqual(d["meta"]["mode"], "git")
+            d, _ = collect(r, "--fake-api", srv.url, env={"GITLAB_TOKEN": FAKE, "CI_SERVER_HOST": "git.corp.example"})
+            self.assertEqual(d["meta"]["mode"], "git", "CI_SERVER_HOST counts only inside GitLab CI")
+            self.assertEqual(len(srv.requests), n)
+
+    def test_git_never_sees_credential_variables(self) -> None:
+        """git, and anything it runs, gets an environment without the credential variables."""
+        r = fixtures.merge_workflow_repo()
+        creds = {name: f"secret-{i}" for i, name in enumerate(rs.CREDENTIAL_VARS)}
+        with mock.patch.dict(os.environ, {**creds, "REPO_STATS_CANARY": "kept"}):
+            out = rs.run_git(str(r.path), "-c", "alias.envdump=!env", "envdump")
+            streamed = "".join(rs.stream_git(str(r.path), "-c", "alias.envdump=!env", "envdump"))
+        for text in (out, streamed):
+            self.assertIn("REPO_STATS_CANARY=kept", text)
+            for name, value in creds.items():
+                self.assertNotIn(value, text, name)
+
+    def test_parse_cli_response(self) -> None:
+        """--include output splits into status, lower-cased headers and body, with CRLF or LF."""
+        st, h, body = rs.parse_cli_response(b"HTTP/2.0 200 OK\r\nX-Next-Page: 2\r\nLink: <a>; rel=next\r\n\r\n[1, 2]")
+        self.assertEqual((st, h["x-next-page"], h["link"], json.loads(body)), (200, "2", "<a>; rel=next", [1, 2]))
+        st, h, body = rs.parse_cli_response(b"HTTP/1.1 404 Not Found\nContent-Type: application/json\n\n{\"message\": \"x\"}")
+        self.assertEqual((st, h["content-type"], body), (404, "application/json", b'{"message": "x"}'))
+        self.assertEqual(rs.parse_cli_response(b"HTTP/2.0 204 No Content\r\n\r\n")[::2], (204, b""))
+        self.assertEqual(rs.parse_cli_response(b"error connecting to api.github.com")[0], None)
+        self.assertEqual(rs.parse_cli_response(b"")[0], None)
+
+
+class G2_GitLabJobToken(unittest.TestCase):
+    """A login that cannot read MR commits (a GitLab CI job token) degrades to local commits, once."""
+
+    def test_refused_commits_use_local_merge_commits(self) -> None:
+        """One refused probe stops all commit lookups; merge-commit MRs get first-commit times from git."""
+        r = api_repo("git@gitlab.com:grp/sub/proj.git")
+        mrs, commits, notes = gitlab_fixture(r)
+        inner = ms.gitlab_handler(mrs, commits, notes, page_size=50)
+
+        def h(req: ms.Request) -> ms.Response:
+            """Refuse every commits request with 403, as GitLab does for a job token; serve the rest."""
+            if req["path"].endswith("/commits"):
+                return 403, {}, {"message": "403 Forbidden"}
+            return inner(req)
+
+        with ms.MockServer(h) as srv:
+            d, _ = collect(r, "--fake-api", srv.url, env={"GITLAB_TOKEN": FAKE})
+            commit_calls = [q for q in srv.requests if q["path"].endswith("/commits")]
+        self.assertEqual(d["meta"]["mode"], "api")
+        self.assertEqual(len(commit_calls), 1, "after one refusal, no more commit lookups")
+        self.assertTrue(any("cannot read merge request commits" in w for w in d["meta"]["warnings"]))
+        self.assertFalse(any("lookups fail" in w for w in d["meta"]["warnings"]))
+        p1 = by_number(d)[1]  # merged with a local merge commit: first commit comes from the branch
+        self.assertIsNotNone(p1["first_commit"])
+        self.assertLessEqual(p1["first_commit"], p1["merged"])
+        self.assertIn("lead", p1["inferred"])
+        self.assertIn("coding", p1["inferred"])
+        self.assertTrue(p1["reviewed"])  # notes still work with a job token
+        self.assertIsNone(by_number(d)[4]["first_commit"])  # open, no local commit: stays unknown
+
+    def test_job_token_autologin_reaches_the_api(self) -> None:
+        """With GLAB_ENABLE_CI_AUTOLOGIN in GitLab CI, glab authenticates with CI_JOB_TOKEN by itself."""
+        r = api_repo("git@gitlab.com:grp/sub/proj.git")
+        mrs, commits, notes = gitlab_fixture(r)
+        inner = ms.gitlab_handler(mrs, commits, notes, page_size=50)
+        seen = []
+
+        def h(req: ms.Request) -> ms.Response:
+            """Accept JOB-TOKEN like GitLab does; refuse commits, which a job token cannot read."""
+            seen.append(req["headers"].get("job-token"))
+            if req["path"].endswith("/commits"):
+                return 403, {}, {"message": "403 Forbidden"}
+            return inner({**req, "headers": {**req["headers"], "private-token": req["headers"].get("job-token")}})
+
+        env = {"GITLAB_CI": "true", "GLAB_ENABLE_CI_AUTOLOGIN": "true", "CI_JOB_TOKEN": "job-tok-123"}
+        with ms.MockServer(h) as srv:
+            d, _ = collect(r, "--fake-api", srv.url, env=env)
+        self.assertEqual(d["meta"]["mode"], "api")
+        self.assertEqual(set(seen), {"job-tok-123"})
+
+
+if __name__ == "__main__":
+    unittest.main()

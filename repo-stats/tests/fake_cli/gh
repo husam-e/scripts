@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""Fake `gh` for the repo-stats tests: see _fake.py."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _fake  # noqa: E402
+
+sys.exit(_fake.main("gh", sys.argv[1:]))
