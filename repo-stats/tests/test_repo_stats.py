@@ -2971,6 +2971,126 @@ class I1_SecurityHardening(unittest.TestCase):
             os.chdir(old)
         self.assertTrue(os.path.isabs(rs.git_cmd(".")[0]))
 
+    # -- N1: no user info from a remote URL reaches a name or an output
+
+    def test_parse_remote_drops_user_info(self) -> None:
+        """Credentials in a remote URL never end up in the host or path, also without a path."""
+        cases = {
+            "https://user:SECRET@github.com": None,
+            "https://user:SECRET@github.com/": None,
+            "https://SECRET@github.com/acme/widgets.git": ("github.com", "acme/widgets"),
+            "https://u:p@ss@git.corp.example/a/b.git": ("git.corp.example", "a/b"),
+            "https://github.com@evil.example/o/r": ("evil.example", "o/r"),
+            "ssh://git@github.com:evil/o/r": None,
+        }
+        for url, want in cases.items():
+            got = rs.parse_remote(url)
+            self.assertEqual(got, want, url)
+            self.assertNotIn("SECRET", repr(got), url)
+
+    def test_token_in_pathless_remote_is_not_in_the_output(self) -> None:
+        """A path-less https remote with a token gives no API and no name from the remote."""
+        r = fixtures.merge_workflow_repo()
+        add_remote(r, "https://user:SECRET-TOKEN@github.com")
+        d, _ = collect(r)
+        self.assertEqual(d["meta"]["mode"], "git")
+        self.assertNotIn("SECRET-TOKEN", json.dumps(d))
+
+    # -- N2, N3: anchored regexes, no dot segments
+
+    def test_security_regexes_match_the_whole_string(self) -> None:
+        """A trailing newline, an empty label, dot segments and non-ASCII digits are all rejected."""
+        for bad in ("ghe.example.com\n", "a..b", "ghe..example.com"):
+            self.assertIsNone(rs.HOSTNAME_RE.match(bad), repr(bad))
+        self.assertIsNotNone(rs.HOSTNAME_RE.match("ghe.example.com"))
+        for bad in ("projects/g%2Fp/merge_requests\n", "projects/../merge_requests", "projects/./merge_requests",
+                    "projects/../merge_requests/1/notes", "projects/g%2Fp/merge_requests/\u0661/notes"):
+            self.assertIsNone(rs.GITLAB_READ_ENDPOINT.match(bad), repr(bad))
+        for good in ("projects/g%2Fp/merge_requests", "projects/g%2Fp/merge_requests/12/commits", "projects/...x/merge_requests"):
+            self.assertIsNotNone(rs.GITLAB_READ_ENDPOINT.match(good), good)
+        log = tmpdir() / "cli.log"
+        cli = self._cli("glab", "gitlab.com", helpers.clean_env({"REPO_STATS_FAKE_LOG": str(log)}))
+        with self.assertRaises(rs.ApiError):
+            cli.get("projects/../merge_requests", {})
+        self.assertEqual(helpers.cli_calls(log), [])
+        with self.assertRaises(rs.ToolError):
+            collect(api_repo(), "--provider", "github", "--hostname", "ghe.example.com\n")
+
+    # -- N4: paging is capped and validated
+
+    def test_next_page_must_be_a_plain_increasing_number(self) -> None:
+        """X-Next-Page must be a plain positive integer above the current page."""
+        self.assertEqual(rs.next_page("2", 1), 2)
+        for bad in ("-1", "+4", "1_0", "0", "1", "abc", "\u0662", "2.0", "99999999999"):
+            with self.assertRaises(rs.ApiError, msg=bad):
+                rs.next_page(bad, 1)
+
+    def test_gitlab_repeating_next_page_stops(self) -> None:
+        """A server that always answers X-Next-Page: 1 fails the fetch instead of looping forever."""
+        def h(req: ms.Request) -> ms.Response:
+            """Return one MR per page and always point back at page 1."""
+            return 200, {"X-Next-Page": "1"}, [{"iid": 1, "title": "t", "state": "opened", "created_at": "2024-01-01T00:00:00Z"}]
+
+        with ms.MockServer(h) as srv:
+            cli = self._cli("glab", "gitlab.com", helpers.clean_env({"REPO_STATS_FAKE_URL": srv.url, "GITLAB_TOKEN": FAKE}))
+            with self.assertRaises(rs.ApiError):
+                rs.fetch_gitlab(cli, "g/p", None, "main", True, None, False, progress=lambda m: None)
+            self.assertEqual(len(srv.requests), 1)
+
+    def test_github_repeating_cursor_and_page_cap(self) -> None:
+        """A repeating GraphQL cursor fails the fetch, and an endless one stops at MAX_LIST_PAGES."""
+        counter = [0]
+
+        def h(repeat: bool) -> ms.Handler:
+            """A GraphQL handler that always has a next page, with a fixed or ever-changing cursor."""
+            def inner(req: ms.Request) -> ms.Response:
+                """Answer with no PRs and another page."""
+                counter[0] += 1
+                cursor = "same" if repeat else f"c{counter[0]}"
+                return 200, {}, {"data": {"repository": {"pullRequests": {
+                    "pageInfo": {"hasNextPage": True, "endCursor": cursor}, "nodes": []}}}}
+            return inner
+
+        env = {"GH_TOKEN": FAKE}
+        with ms.MockServer(h(True)) as srv:
+            cli = self._cli("gh", "github.com", helpers.clean_env({**env, "REPO_STATS_FAKE_URL": srv.url}))
+            with self.assertRaisesRegex(rs.ApiError, "repeating"):
+                rs.fetch_github(cli, "o", "r", None, "main", True, None, progress=lambda m: None)
+            self.assertEqual(len(srv.requests), 2)
+        with ms.MockServer(h(False)) as srv, mock.patch.object(rs, "MAX_LIST_PAGES", 3):
+            cli = self._cli("gh", "github.com", helpers.clean_env({**env, "REPO_STATS_FAKE_URL": srv.url}))
+            with self.assertRaisesRegex(rs.ApiError, "Stopped after 3 pages"):
+                rs.fetch_github(cli, "o", "r", None, "main", True, None, progress=lambda m: None)
+            self.assertEqual(len(srv.requests), 3)
+
+    # -- N7: --serve headers
+
+    def test_serve_sends_framing_and_cross_origin_headers(self) -> None:
+        """--serve forbids framing in the header CSP and sends same-origin CORP and COOP."""
+        out = tmpdir()
+        proc = subprocess.Popen([sys.executable, SCRIPT, str(merge_repo().path), "-o", str(out / "o.html"),
+                                 "--serve", "0", "--no-open"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                text=True, env=helpers.clean_env())
+        try:
+            url = None
+            for line in proc.stderr:  # pyright: ignore[reportOptionalIterable]
+                m = re.search(r"Serving (\S+)", line)
+                if m:
+                    url = m.group(1)
+                    break
+            self.assertIsNotNone(url)
+            status, _, headers = E2_Serve()._get(url)  # pyright: ignore[reportArgumentType]
+            self.assertEqual(status, 200)
+            self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+            self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
+            self.assertEqual(headers["Cross-Origin-Resource-Policy"], "same-origin")
+            self.assertEqual(headers["Cross-Origin-Opener-Policy"], "same-origin")
+        finally:
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=10)
+            if proc.stderr:
+                proc.stderr.close()
+
     # -- S5, S6: git hardening and partial clones
 
     def test_git_argv_is_hardened(self) -> None:
@@ -3028,3 +3148,13 @@ class I1_SecurityHardening(unittest.TestCase):
         # And the real git accepts the argv repo-stats builds.
         out = rs.run_git(str(merge_repo().path), "rev-parse", "--verify", "-q", *rs.revs("main^{commit}"))
         self.assertRegex(out.strip(), r"^[0-9a-f]{40}$")
+
+    def test_pr_number_is_escaped_in_regex(self) -> None:
+        """A PR number is matched literally in a squash subject, never as a regex."""
+        c = {"sha": "abc", "parents": ["p"], "subject": "fix: thing (#11)"}
+        self.assertIsNone(rs.local_summary({"number": "1+", "sha": "abc"}, {"abc": c}))  # as a regex, 1+ matches 11
+        self.assertIs(rs.local_summary({"number": 11, "sha": "abc"}, {"abc": c}), c)
+
+
+if __name__ == "__main__":
+    unittest.main()

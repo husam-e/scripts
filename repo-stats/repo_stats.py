@@ -386,11 +386,16 @@ def strip_remote_prefix(repo: str, branch: str) -> str:
 
 
 def parse_remote(url: str) -> Optional[Tuple[str, str]]:
-    """Return (host, path) from an https, ssh or scp-style git remote URL, or None."""
+    """Return (host, path) from an https, ssh or scp-style git remote URL, or None.
+
+    Any user name or token before the host is dropped. A URL with a scheme but no path gives None: it is
+    never read as scp-style, which would put the user info into the path (and so into the dashboard name).
+    """
     url = url.strip()
-    m = re.match(r"^[\w.+-]+://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(.+?)(?:\.git)?/?$", url)
-    if not m:
-        m = re.match(r"^(?:[^@/]+@)?([^/:]+):(.+?)(?:\.git)?/?$", url)
+    if "://" in url:
+        m = re.match(r"[\w.+-]+://(?:[^/]*@)?([^/:@]+)(?::\d+)?/(.+?)(?:\.git)?/?\Z", url)
+    else:
+        m = re.match(r"(?:[^@/]+@)?([^/:@]+):(.+?)(?:\.git)?/?\Z", url)
     if not m:
         return None
     return m.group(1).lower(), m.group(2)
@@ -880,12 +885,14 @@ CLI_ENV_SET = {
 }
 CLI_TIMEOUT = 120
 CLI_RETRIES = 4
-HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+HOSTNAME_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\Z")
 # The read-only allowlist. A GraphQL query cannot change anything (only a mutation can), and the GitLab
 # endpoints are the three list endpoints repo-stats reads, always with GET.
 READ_ONLY_GRAPHQL = re.compile(r"^\s*query\b")
 WRITE_GRAPHQL = re.compile(r"\b(?:mutation|subscription)\b")
-GITLAB_READ_ENDPOINT = re.compile(r"^projects/[^/?#\s]+/merge_requests(?:/\d+/(?:commits|notes))?$")
+GITLAB_READ_ENDPOINT = re.compile(r"^projects/(?!\.\.?/)[^/?#\s]+/merge_requests(?:/[0-9]+/(?:commits|notes))?\Z")
+# Upper bound on top-level list pages (50 PRs or 100 MRs each), so a broken API cannot page forever.
+MAX_LIST_PAGES = 2000
 
 
 def _backoff(seconds: float) -> None:
@@ -928,6 +935,14 @@ def parse_cli_response(out: bytes) -> Tuple[Optional[int], Dict[str, str], bytes
         if colon:
             headers[name.strip().lower()] = value.strip()
     return int(m.group(1)), headers, body
+
+
+def next_page(value: str, page: int) -> int:
+    """Return GitLab's X-Next-Page as an int; raise ApiError unless it is a plain number above `page`."""
+    value = value.strip()
+    if not re.fullmatch(r"[1-9][0-9]{0,8}", value) or int(value) <= page:
+        raise ApiError(f"GitLab returned an invalid next page {value[:20]!r} after page {page}")
+    return int(value)
 
 
 class Cli:
@@ -1087,7 +1102,7 @@ def fetch_github(cli: Cli, owner: str, name: str, since: Optional[int], base_bra
     prs: list[PR] = []
     seen = 0
     cursor = None
-    while True:
+    for _ in range(MAX_LIST_PAGES):
         data = cli.graphql(GITHUB_QUERY, {"owner": owner, "name": name, "cursor": cursor})
         if not isinstance(data, dict):
             raise ApiError("GitHub returned an unexpected response")
@@ -1119,7 +1134,12 @@ def fetch_github(cli: Cli, owner: str, name: str, since: Optional[int], base_bra
         info_page = page.get("pageInfo") or {}
         if stop or not info_page.get("hasNextPage"):
             break
-        cursor = info_page.get("endCursor")
+        nxt = info_page.get("endCursor")
+        if not isinstance(nxt, str) or not nxt or nxt == cursor:
+            raise ApiError("GitHub returned an invalid or repeating page cursor")
+        cursor = nxt
+    else:
+        raise ApiError(f"Stopped after {MAX_LIST_PAGES} pages of pull requests; use --since or --max-prs")
     if info is not None:
         info["seen"] = seen
     return prs
@@ -1218,7 +1238,7 @@ def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch:
     base = f"projects/{urllib.parse.quote(project_path, safe='')}/merge_requests"
     mrs: list[dict[str, Any]] = []
     page = 1
-    while True:
+    for _ in range(MAX_LIST_PAGES):
         q: dict[str, Any] = {"state": "all", "scope": "all", "order_by": "updated_at", "sort": "desc", "per_page": 100, "page": page}
         if since:
             # updated_after, not created_after: an MR opened before the cutoff but merged after it still counts.
@@ -1233,7 +1253,9 @@ def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch:
         nxt = hdrs.get("x-next-page")
         if not data or not nxt or (max_prs and len(mrs) >= max_prs):
             break
-        page = int(nxt)
+        page = next_page(nxt, page)
+    else:
+        raise ApiError(f"Stopped after {MAX_LIST_PAGES} pages of merge requests; use --since or --max-prs")
     if max_prs:
         mrs = mrs[:max_prs]
     if info is not None:
@@ -1252,7 +1274,7 @@ def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch:
             nxt = hdrs.get("x-next-page")
             if not data or not nxt:
                 return
-            page = int(nxt)
+            page = next_page(nxt, page)
 
     def mr_commits(iid: Any) -> List[Dict[str, Any]]:
         """Return every commit of one MR (GitLab lists them newest first, so all pages are needed)."""
@@ -1393,7 +1415,7 @@ def local_summary(pr: PR, fp_by_sha: Dict[str, Commit]) -> Optional[Commit]:
         return None
     if len(c["parents"]) >= 2 or (pr.get("squash_sha") and pr["squash_sha"] == c["sha"]):
         return c
-    if pr["number"] is not None and re.search(rf"\(#{pr['number']}\)\s*$", c["subject"]):
+    if pr["number"] is not None and re.search(rf"\(#{re.escape(str(pr['number']))}\)\s*$", c["subject"]):
         return c
     return None
 
@@ -1898,6 +1920,8 @@ def build_parser() -> argparse.ArgumentParser:
 # Same policy as the template's meta tag: inline script and style only, no network access at all.
 CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; "
        "base-uri 'none'; form-action 'none'")
+# --serve adds frame-ancestors, which only works in a header (a meta tag CSP ignores it): no framing.
+SERVE_CSP = CSP + "; frame-ancestors 'none'"
 
 
 def serve(path: Path, port: int, open_browser: bool) -> None:
@@ -1931,8 +1955,10 @@ def serve(path: Path, port: int, open_browser: bool) -> None:
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Content-Security-Policy", CSP)
+            self.send_header("Content-Security-Policy", SERVE_CSP)
             self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.send_header("Cross-Origin-Opener-Policy", "same-origin")
             self.end_headers()
             if not head_only:
                 self.wfile.write(body)
