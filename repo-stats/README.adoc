@@ -2,7 +2,7 @@
 
 Generate a self-contained HTML dashboard of code statistics for any git repository.
 
-* Lines of code over time, in total and by language, plus monthly churn.
+* Lines of code over time, in total, by language and split into test and non-test code, plus monthly churn.
 * Pull request (or merge request) volume per day, week and month.
 * PR size: lines, files and commits.
 * PR type, read from Conventional Commit titles.
@@ -229,6 +229,7 @@ The dashboard has a Methodology section that prints the rules it used. The defau
 Lines of code::
 Net lines added minus deleted along the first-parent history of the branch, for text files.
 Lockfiles, vendored, build output and minified files are excluded.
+Test lines are those in test paths (`tests/`, `spec/`, `test_*`, `*_test.*`, `*.spec.*` and similar); everything else is non-test.
 Use `--exclude REGEX` to add paths, or `--no-default-excludes` to count everything.
 
 PR type::

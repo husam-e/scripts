@@ -698,7 +698,7 @@ function renderKpis(app, sel) {
     kpi("Releases", fmtInt(deploys.length), deploys.length ? `${fmtNum(freq * 7)} per week` : "no release tags matched", deploys.length ? band("freq", freq) : null),
     kpi("Change failure rate", fmtPct(cfr), `${fails} revert/hotfix PRs`, band("cfr", cfr)),
     kpi("High or critical risk", fmtPct(hiRisk), "share of merged PRs"),
-    kpi("Lines of code", locEnd ? fmtCompact(locEnd[1]) : "–", locEnd ? "at end of range" : ""),
+    kpi("Lines of code", locEnd ? fmtCompact(locEnd[1]) : "–", locEnd ? `at end of range · ${fmtPct(locEnd[1] > 0 ? Math.max(0, locEnd[4]) / locEnd[1] : null)} test` : ""),
   ));
 }
 
@@ -718,6 +718,9 @@ function renderLoc(app, sel) {
     const total = idx.map((i) => mode.code ? sum(names.map((l) => langs[l][i])) : days[i][1]);
     if (mode.view === "total") {
       lineChart(c.body, { xs, series: [{ name: mode.code ? "Code lines" : "All text lines", color: css("--c1"), ys: total }], step: true, label: "Lines of code over time", table: c.table });
+    } else if (mode.view === "test") {
+      const test = idx.map((i) => Math.max(0, days[i][mode.code ? 5 : 4]));
+      lineChart(c.body, { xs, series: [{ name: "Non-test", color: css("--c1"), ys: total.map((t, k) => Math.max(0, t - test[k])) }, { name: "Test", color: css("--c2"), ys: test }], stacked: true, label: "Lines of code: test vs non-test", table: c.table });
     } else {
       const ranked = names.slice().sort((a, b) => Math.max(...langs[b]) - Math.max(...langs[a]));
       const pal = SERIES();
@@ -727,7 +730,7 @@ function renderLoc(app, sel) {
       lineChart(c.body, { xs, series: sers.reverse(), stacked: true, label: "Lines of code by language", table: c.table });
     }
   };
-  const seg = h("span", { class: "seg" }, [["total", "Total"], ["lang", "By language"]].map(([k, label]) =>
+  const seg = h("span", { class: "seg" }, [["total", "Total"], ["lang", "By language"], ["test", "Test vs non-test"]].map(([k, label]) =>
     h("button", { type: "button", "aria-pressed": String(mode.view === k), onclick: (e) => { mode.view = k; seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === e.currentTarget))); draw(); } }, label)));
   const codeBtn = h("button", { type: "button", "aria-pressed": "false", title: "Count only source code languages, not docs, data or config", onclick: (e) => { mode.code = !mode.code; e.currentTarget.setAttribute("aria-pressed", String(mode.code)); draw(); } }, "Code only");
   ctl.append(seg, " ", codeBtn);
@@ -1050,7 +1053,7 @@ function renderMethod(app) {
   const src = card(grid, "Where the data comes from", { wide: true });
   src.body.append(h("dl", { class: "method" },
     h("dt", null, "PR data"), h("dd", null, META.mode === "api" ? `The ${META.provider} API. Open, review and merge times are exact.` : "Inferred from git history. A PR is a merge commit on the branch, or a squash commit whose subject ends in (#123) or whose body names a merge request. Open and review times do not exist in git."),
-    h("dt", null, "Lines of code"), h("dd", null, `Net lines added minus deleted along the first-parent history of ${META.branch}, text files only. Paths matching these patterns are ignored: `, META.excludes.length ? META.excludes.map((e) => h("code", { style: "display:block" }, e)) : "none"),
+    h("dt", null, "Lines of code"), h("dd", null, `Net lines added minus deleted along the first-parent history of ${META.branch}, text files only. Test lines are those in paths matching `, h("code", null, "/" + META.heuristics.test_path + "/"), `. Paths matching these patterns are ignored: `, META.excludes.length ? META.excludes.map((e) => h("code", { style: "display:block" }, e)) : "none"),
     h("dt", null, "Direct commits"), h("dd", null, META.mode === "git" ? `${fmtInt(META.direct_commits)} commit(s) landed on the branch with no PR reference and are not counted as PRs.` : "Not applicable when PR data comes from the API."),
     h("dt", null, "Statistics"), h("dd", null, "Percentiles use linear interpolation between ranks. Standard deviation is the sample deviation. Bins in distributions are log-spaced when values span more than one order of magnitude."),
     h("dt", null, "Time zone"), h("dd", null, "Days, weeks (Monday start) and months are UTC.")));

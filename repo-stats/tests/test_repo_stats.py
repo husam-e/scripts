@@ -340,6 +340,18 @@ class A7_LocSeries(unittest.TestCase):
         self.assertEqual(full["loc"]["days"][-1][1], 610)
         self.assertEqual(dflt["loc"]["days"][-1][1], 10)
 
+    def test_test_vs_non_test_split(self) -> None:
+        """Each day carries cumulative test lines, for all languages and for code languages only."""
+        r = Repo()
+        r.commit("chore: init", {"src/a.py": lines(10), "tests/test_a.py": lines(4), "tests/data.json": lines(3)})
+        r.advance(DAY)
+        r.commit("test: more", {"tests/test_a.py": lines(6), "b_test.go": lines(5), "README.md": lines(2)})
+        r.advance(DAY)
+        r.git("rm", "-q", "tests/data.json")
+        r.commit("test: drop data", {"tests/test_a.py": lines(1)})
+        d = self._check(r.path)
+        self.assertEqual([day[4:] for day in d["loc"]["days"]], [[7, 4], [14, 11], [6, 6]])
+
 
 class A8_Excludes(unittest.TestCase):
     """Path excludes for PR sizes and LOC."""

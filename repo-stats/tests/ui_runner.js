@@ -177,10 +177,12 @@ async function applyStep(page, st) {
       const issues = [];
       const check = async (label) => { const t = await textIssues(page); if (t.length) issues.push({ label, t }); };
       await check('initial');
-      for (const label of ['By language', 'Total']) { await page.click(`button:has-text("${label}")`).catch(() => {}); await check('loc ' + label); }
+      for (const label of ['By language', 'Test vs non-test', 'Total']) { await page.click(`button:has-text("${label}")`).catch(() => {}); await check('loc ' + label); }
       await page.click('button:has-text("By language")').catch(() => {});
       await page.click('button:has-text("Code only")').catch(() => {});
       await check('loc lang + code only');
+      await page.click('button:has-text("Test vs non-test")').catch(() => {});
+      await check('loc test + code only');
       await page.click('button:has-text("Total")').catch(() => {});
       await check('loc total + code only');
       const opts = await page.$$eval('select[aria-label="Duration metric"] option', (o) => o.map((x) => x.value)).catch(() => []);
