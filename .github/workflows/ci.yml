@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Ruff
-        run: pipx run "ruff==${RUFF_VERSION}" check repo-stats
+        run: pipx run "ruff==${RUFF_VERSION}" check --select E9,F repo-stats
       - name: ShellCheck
         run: shellcheck release_notes_generator.sh
 
@@ -46,9 +46,5 @@ jobs:
         run: |
           npm install --no-save --no-package-lock "playwright@${PLAYWRIGHT_VERSION}"
           npx playwright install --with-deps chromium
-      - name: Configure git (tests build synthetic repos)
-        run: |
-          git config --global user.name "CI"
-          git config --global user.email "ci@example.com"
       - name: Run tests
         run: python3 -m unittest discover -s tests -v

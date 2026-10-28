@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence, cast
 
 import helpers
-from helpers import add_remote, collect, rs
+from helpers import collect, rs
 import fixtures
 from fixtures import DAY, Repo, lines
 import mock_servers as ms
@@ -242,7 +242,6 @@ def build_api_data() -> dict[str, Any]:
         created = merged - int(rnd.lognormvariate(10.5, 1.0))
         first_commit = created - int(rnd.uniform(600, 90000))
         ready = created + int(rnd.choice([0, 0, 0, 1800, 20000]))
-        state = "MERGED"
         author, atype = "alice", "User"
         if i % 10 == 3:
             author, atype = "dependabot[bot]", "Bot"
