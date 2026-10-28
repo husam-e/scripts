@@ -259,10 +259,21 @@ For reverts that name the commit they undo: the time from the reverted change's 
 
 Review cycles (API only)::
 One round of review on one version of the PR, by anyone but the author and bots, before the merge.
-Approved on first look is 1 cycle; changes requested, a fix pushed and an approval is 2.
-Several reviewers on the same version are one cycle, and a push nobody reviews before the merge adds none.
++
+[cols="3,1"]
+|===
+| Scenario | Cycles
+
+| Merged with no review | 0
+| Approved on first look | 1
+| Changes requested, author pushes a fix, approved | 2
+| Three reviewers comment on the same commit, then approval after one push | 2
+| Author pushes again after approval, then merges with no re-review | 2 (an unreviewed push is not a cycle)
+|===
++
 On GitHub, each review names the commit it was made against, so a review of a new commit (including after a force-push) starts a new cycle.
-On GitLab, comments and approvals by others are reviews and "added N commits" system notes are pushes; a cycle is the reviews between two pushes. All of an MR's notes are read, up to 50 cycles.
+On GitLab, comments and approvals by others are reviews and "added N commits" system notes are pushes; a cycle is the reviews between two pushes.
+All of an MR's notes are read, up to 50 cycles.
 The dashboard shows the statistics without unreviewed PRs, with them counted as 0, and the number of PRs merged with no review.
 Git history has no reviews, so in git mode cycles are empty, never guessed.
 
