@@ -63,6 +63,7 @@ Repositories that rebase-merge with no PR number in the message show few or no P
 
 Lines of code, churn and release data always come from the local clone.
 A shallow clone gives incomplete history, and the dashboard warns about it. Run `git fetch --unshallow` first.
+repo-stats never downloads missing objects of a partial clone (`--filter`, or the `filter` input of `actions/checkout`), so on such a clone it warns, and stops if the history it needs is not local. Clone without a filter.
 
 == Time window
 
@@ -130,20 +131,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          path: repo                              # the repository to analyse
           fetch-depth: 0                          # full history and tags
+          persist-credentials: false              # keep the job token out of repo/.git/config
       - uses: actions/checkout@v4
         with:
           repository: husam-e/scripts
           ref: <full commit SHA>                  # pin a commit you have reviewed: it runs next to the token
           path: tools
-      - run: python3 tools/repo-stats/repo_stats.py . -o repo-stats.html
+          persist-credentials: false
+      - run: python3 tools/repo-stats/repo_stats.py repo -o "$RUNNER_TEMP/repo-stats.html"
         env:
           GH_TOKEN: ${{ github.token }}           # read by gh only; expires when the job ends
       - uses: actions/upload-artifact@v4
         with:
           name: repo-stats
-          path: repo-stats.html
+          path: ${{ runner.temp }}/repo-stats.html
 ----
+
+* Update the pinned `ref:` on purpose, after reading the changes. For stricter pinning, also pin `actions/checkout` and `actions/upload-artifact` to commit SHAs.
+* `persist-credentials: false` stops `actions/checkout` from saving the job token in the checkout's git config, where any later process could read it.
+* The analysed repository is checked out in its own directory (`repo`), and the dashboard is written to `$RUNNER_TEMP`, outside it.
+  Never write outputs into a checkout you do not trust: it could contain a symlink at the output path. (repo-stats refuses to write through a symlink, but the safest output is one outside the checkout.)
 
 Set `GH_TOKEN` on this step only, so other steps never see it.
 On GitHub Enterprise Server, set `GH_ENTERPRISE_TOKEN: ${{ github.token }}` instead; `gh` ignores `GH_TOKEN` there.
@@ -154,7 +163,8 @@ To analyse another private repository, use a GitHub App installation token (for 
 [source,yaml]
 ----
 repo-stats:
-  image: registry.gitlab.com/gitlab-org/cli:v1.124.0    # glab and git; pin a version
+  # glab and git. Replace <digest> with the image's digest (see below), so the tag cannot be moved under you.
+  image: registry.gitlab.com/gitlab-org/cli:v1.124.0@sha256:<digest>
   variables:
     GIT_DEPTH: 0                                        # full history
     GLAB_ENABLE_CI_AUTOLOGIN: "true"                    # glab signs in with the job's CI_JOB_TOKEN
@@ -164,10 +174,15 @@ repo-stats:
     - git init -q /tmp/tools
     - git -C /tmp/tools fetch -q --depth 1 https://github.com/husam-e/scripts.git "$REPO_STATS_SHA"
     - git -C /tmp/tools checkout -q FETCH_HEAD
-    - python3 /tmp/tools/repo-stats/repo_stats.py . -o repo-stats.html
+    - mkdir repo-stats-out                              # new directory: fails if the repository has this path
+    - python3 /tmp/tools/repo-stats/repo_stats.py . -o repo-stats-out/repo-stats.html
   artifacts:
-    paths: [repo-stats.html]
+    paths: [repo-stats-out/repo-stats.html]
 ----
+
+* Get the image digest with `docker buildx imagetools inspect registry.gitlab.com/gitlab-org/cli:v1.124.0` (or `crane digest`), and update tag and digest together.
+* GitLab collects artifacts only from inside the project directory, so the dashboard goes into a directory the job creates.
+  `mkdir` fails if the analysed repository already contains that path, for example as a symlink.
 
 The job token expires when the job ends. It can list merge requests and read their comments, but not their commits.
 repo-stats then takes first-commit times from local merge commits and says so on the dashboard; squash-merged MRs have no coding time.
@@ -195,7 +210,8 @@ Avoid `gh auth login` and `glab auth login` on servers: with no keychain, they s
 repo-stats only reads:
 
 * API requests go through `gh api` and `glab api` and pass a fixed allowlist: GraphQL queries only (never a mutation) for GitHub, and `GET` on the merge request list, commits and notes endpoints for GitLab. Anything else is refused before a process starts.
-* git is run only with read commands (`log`, `rev-parse`, `for-each-ref`, `symbolic-ref`, `remote get-url`).
+* git is run only with read commands (`log`, `rev-parse`, `for-each-ref`, `symbolic-ref`, `remote get-url`, `config --get-regexp`).
+  It never fetches: missing objects of a partial clone are not downloaded (`GIT_NO_LAZY_FETCH=1`, and `protocol.allow=never` for older git).
 * The tests enforce both rules.
 
 Only a read-only token makes this a guarantee: with a `gh auth login` or `glab auth login` token, the rules protect against bugs, not against a modified copy of the script.
@@ -205,12 +221,18 @@ repo-stats never handles a credential:
 * It never reads a token variable. `gh` and `glab` read their own.
 * The API host is `github.com` or `gitlab.com` from the remote, or the `--hostname` you pass. It is never taken from any other remote, because `gh` and `glab` send environment tokens to whatever host they are given. A lookalike remote such as `github.evil.example` starts no CLI at all.
 * The CLI always gets `--hostname` and runs from a new, empty, private temporary directory (mode 0700), never the analysed repository or the shared temp directory, so `glab` cannot pick up a host or config from a repository's `.git`. glab telemetry (which sends its own request with the credential) and the CLIs' request-logging debug switches are turned off for these calls.
-* git runs without the credential variables (`GH_TOKEN`, `GITLAB_TOKEN`, `CI_JOB_TOKEN` and the like), so hooks or filters in the analysed repository cannot read them.
+* The CLI gets an allowlisted environment: its login variables, config and keyring locations, GitLab CI autologin, proxy and TLS settings, and basics such as `PATH`, `HOME` and the locale.
+  Host and repository overrides (`GH_HOST`, `GH_REPO`, `GITLAB_HOST`, `GL_HOST`, `GITLAB_URI`, `GITLAB_API_HOST`, `GLAB_API_PROTOCOL` and the like) are not passed, so the token goes only to the `--hostname` host.
+  Telemetry (glab's sends its own request with the credential), update checks, prompts and the request-logging debug switches are turned off.
+* git, `gh` and `glab` are run by absolute path, found on `PATH` without the current directory or relative entries (on Windows, a bare program name would also run `gh.exe` from the current directory, which is often the checkout).
+* git gets an allowlisted environment without any credential variable (`GH_TOKEN`, `GITLAB_TOKEN`, `CI_JOB_TOKEN` and the like), and without `GIT_DIR`, `GIT_WORK_TREE` or injected configuration. This stops accidental leaks to programs that git runs; it is not a boundary against them, because a program running as you can read the environment of repo-stats itself. Prefer read-only, short-lived tokens.
+* git runs with `core.fsmonitor` off and without textconv or external diff drivers, so the analysed repository's configuration cannot start them for `log --numstat`.
 * No token is written to any output.
 
 Other protections:
 
-* `--serve` binds to 127.0.0.1, serves only the dashboard file, and rejects any request whose Host header is not `127.0.0.1` or `localhost` on the serving port.
+* `--serve` binds to 127.0.0.1, serves only the dashboard file, and rejects any request whose Host header is not `127.0.0.1` or `localhost` on the serving port. It forbids framing (`frame-ancestors 'none'`) and sets same-origin resource and opener policies.
+* Output files are written to a new temp file and then moved into place, and repo-stats refuses to write to a path that is a symlink, so a symlink in an untrusted checkout cannot redirect the write.
 * The dashboard carries a Content-Security-Policy that allows no network access, so it cannot send data anywhere even when opened from a mail attachment.
 * Commit messages are read in a separate, NUL-delimited git call, so their text cannot change diff statistics.
 * If a GitLab per-MR lookup fails, the review status and timings for that MR are left empty and the dashboard warns; they are never counted as "unreviewed".

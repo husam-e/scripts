@@ -16,6 +16,7 @@ import argparse
 import calendar
 import collections
 import concurrent.futures
+import contextlib
 import csv
 import datetime as dt
 import email.utils
@@ -23,7 +24,6 @@ import http.server
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,7 +32,7 @@ import time
 import urllib.parse
 import webbrowser
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, TypedDict, cast
+from typing import IO, Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, TypedDict, cast
 
 __version__ = "0.1.0"
 
@@ -223,21 +223,99 @@ def language_of(path: str) -> Tuple[str, str]:
 # Git access
 # ---------------------------------------------------------------------------
 
-# Names of variables that may hold an API credential. repo-stats never reads their values. It removes them
-# from git's environment, because git needs none of them, so hooks, filters and textconv drivers that git
-# runs inside the analysed repository cannot read them.
+# Names of variables that may hold an API credential. repo-stats never reads their values. git gets none of
+# them (its environment is built from GIT_ENV_ALLOW, which lists none), so they do not leak to git by
+# accident. This is not a boundary against code that git runs: a program running as the same user can read
+# the parent process's environment.
 CREDENTIAL_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GITLAB_TOKEN",
                    "GITLAB_ACCESS_TOKEN", "GITLAB_PRIVATE_TOKEN", "OAUTH_TOKEN", "CI_JOB_TOKEN")
 
+# What any child process needs: the search path, home and user, locale, temp dirs, and Windows essentials.
+BASE_ENV_ALLOW = {
+    "PATH", "HOME", "USER", "LOGNAME", "USERNAME", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TMP", "TEMP",
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+}
+# git also reads its own config files. GIT_DIR, GIT_WORK_TREE, GIT_CONFIG_PARAMETERS and the like are left
+# out on purpose: they would override `-C repo` or inject configuration.
+GIT_ENV_ALLOW = BASE_ENV_ALLOW | {"XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"}
+
+
+def allowed_env(environ: Mapping[str, str], names: Set[str], prefixes: Tuple[str, ...] = ()) -> Dict[str, str]:
+    """Return the variables of environ whose upper-cased name is in `names` or starts with one of `prefixes`."""
+    prefixes = ("LC_",) + prefixes
+    return {k: v for k, v in environ.items() if k.upper() in names or k.upper().startswith(prefixes)}
+
 
 def git_env() -> Dict[str, str]:
-    """Return os.environ without the credential variables, for git subprocesses."""
-    return {k: v for k, v in os.environ.items() if k not in CREDENTIAL_VARS}
+    """Return the environment for git subprocesses: an allowlist of os.environ, never a credential.
+
+    Missing objects of a partial clone are never fetched (GIT_NO_LAZY_FETCH, git 2.44+; protocol.allow=never
+    in git_cmd also blocks the fetch on older versions), and git never prompts.
+    """
+    env = allowed_env(os.environ, GIT_ENV_ALLOW)
+    env.update({"GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0"})
+    if os.name == "nt":
+        env["NoDefaultCurrentDirectoryInExePath"] = "1"  # child processes never run programs from the cwd
+    return env
+
+
+def find_executable(name: str, path: Optional[str] = None) -> Optional[str]:
+    """Return the absolute path of program `name` on `path` (default: os.environ's PATH), or None.
+
+    Unlike shutil.which, never looks in the current directory, which is often the analysed checkout: empty,
+    "." and other relative PATH entries are skipped. (On Windows, CreateProcess with a bare name and
+    shutil.which before Python 3.12 both search the current directory first.)
+    """
+    if path is None:
+        path = os.environ.get("PATH", os.defpath)
+    exts = [""]
+    if os.name == "nt" and not os.path.splitext(name)[1]:
+        exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+    for d in path.split(os.pathsep):
+        if not d or not os.path.isabs(d):
+            continue
+        for ext in exts:
+            cand = os.path.join(d, name + ext)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+    return None
+
+
+def git_exe() -> str:
+    """Return the absolute path of git, or raise ToolError."""
+    git = find_executable("git")
+    if not git:
+        raise ToolError("git was not found on PATH (relative PATH entries are ignored)")
+    return git
 
 
 def git_cmd(repo: str, *args: str) -> List[str]:
-    """Build a git argv for `repo` with stable, unquoted path output."""
-    return ["git", "-C", repo, "-c", "core.quotepath=off", "-c", "log.showSignature=false", *args]
+    """Build a git argv for `repo` with stable, unquoted path output and no fsmonitor or fetch."""
+    return [git_exe(), "-C", os.path.abspath(repo), "-c", "core.quotepath=off", "-c", "log.showSignature=false",
+            "-c", "core.fsmonitor=false", "-c", "protocol.allow=never", *args]
+
+
+_git_version: Optional[Tuple[int, int]] = None
+
+
+def git_version() -> Tuple[int, int]:
+    """Return git's (major, minor) version, or (0, 0) if it cannot be read. Cached."""
+    global _git_version
+    if _git_version is None:
+        p = subprocess.run([git_exe(), "--version"], capture_output=True, text=True, env=git_env())
+        m = re.search(r"(\d+)\.(\d+)", p.stdout)
+        _git_version = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+    return _git_version
+
+
+def revs(*names: str) -> List[str]:
+    """Return revision arguments for `git log` / `git rev-parse`, after --end-of-options where supported.
+
+    rev-parse accepts --end-of-options from git 2.30 (log from 2.24). On older git, collect() still refuses
+    a branch that starts with "-", so a revision can never be read as an option.
+    """
+    return (["--end-of-options"] if git_version() >= (2, 30) else []) + list(names)
 
 
 def run_git(repo: str, *args: str, check: bool = True) -> str:
@@ -272,10 +350,25 @@ def detect_branch(repo: str, remote: str = "origin") -> str:
     if head:
         return head
     for cand in (f"{remote}/main", f"{remote}/master", "main", "master"):
-        if run_git(repo, "rev-parse", "--verify", "-q", cand + "^{commit}", check=False).strip():
+        if run_git(repo, "rev-parse", "--verify", "-q", *revs(cand + "^{commit}"), check=False).strip():
             return cand
     # Fall back to the checked-out branch (e.g. "trunk"), or HEAD when detached.
     return run_git(repo, "symbolic-ref", "--short", "-q", "HEAD", check=False).strip() or "HEAD"
+
+
+PARTIAL_CLONE_HINT = ("This is a partial clone (made with --filter, or actions/checkout's `filter`). repo-stats "
+                      "never downloads missing objects, so history that needs them cannot be read. Clone without "
+                      "a filter for full results.")
+
+
+def is_partial_clone(repo: str) -> bool:
+    """Return True if the repository has a promisor remote, i.e. objects that git would fetch on demand."""
+    out = run_git(repo, "config", "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor)$", check=False)
+    for line in out.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "extensions.partialclone" or value.strip().lower() in ("true", "yes", "on", "1"):
+            return True
+    return False
 
 
 def strip_remote_prefix(repo: str, branch: str) -> str:
@@ -294,11 +387,16 @@ def strip_remote_prefix(repo: str, branch: str) -> str:
 
 
 def parse_remote(url: str) -> Optional[Tuple[str, str]]:
-    """Return (host, path) from an https, ssh or scp-style git remote URL, or None."""
+    """Return (host, path) from an https, ssh or scp-style git remote URL, or None.
+
+    Any user name or token before the host is dropped. A URL with a scheme but no path gives None: it is
+    never read as scp-style, which would put the user info into the path (and so into the dashboard name).
+    """
     url = url.strip()
-    m = re.match(r"^[\w.+-]+://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(.+?)(?:\.git)?/?$", url)
-    if not m:
-        m = re.match(r"^(?:[^@/]+@)?([^/:]+):(.+?)(?:\.git)?/?$", url)
+    if "://" in url:
+        m = re.match(r"[\w.+-]+://(?:[^/]*@)?([^/:@]+)(?::\d+)?/(.+?)(?:\.git)?/?\Z", url)
+    else:
+        m = re.match(r"(?:[^@/]+@)?([^/:@]+):(.+?)(?:\.git)?/?\Z", url)
     if not m:
         return None
     return m.group(1).lower(), m.group(2)
@@ -496,7 +594,7 @@ class Scanner:
         meta_fmt = "%H%x00%P%x00%at%x00%ct%x00%an%x00%s%x00%b"
         commits: list[Commit] = []
         by_sha: dict[str, Commit] = {}
-        fields = run_git(repo, "log", "-z", "--first-parent", "--reverse", f"--format={meta_fmt}", branch).split("\0")
+        fields = run_git(repo, "log", "-z", "--first-parent", "--reverse", f"--format={meta_fmt}", *revs(branch)).split("\0")
         n = 7
         for i in range(0, len(fields) - n + 1, n):
             sha, parents, at, ct, author, subject, body = fields[i:i + n]
@@ -511,8 +609,8 @@ class Scanner:
         # %x00 cannot appear in a path or in git's numstat output, so it safely marks each commit header.
         stats: dict[str, list[str]] = {}
         cur: Optional[list[str]] = None
-        for line in stream_git(repo, "log", "--first-parent", "-m", "--numstat", "--no-renames",
-                               "--format=%x00%H", branch):
+        for line in stream_git(repo, "log", "--first-parent", "-m", "--numstat", "--no-renames", "--no-textconv",
+                               "--no-ext-diff", "--format=%x00%H", *revs(branch)):
             if line.startswith("\0"):
                 cur = stats.setdefault(line[1:].strip(), [])
             elif cur is not None:
@@ -529,7 +627,7 @@ class Scanner:
 def load_graph(repo: str, branch: str) -> Graph:
     """Return sha -> (parents, author time, committer time) for every commit reachable from branch."""
     graph: Graph = {}
-    for line in stream_git(repo, "log", "--format=%H %P|%at|%ct", branch):
+    for line in stream_git(repo, "log", "--format=%H %P|%at|%ct", *revs(branch)):
         left, at, ct = line.rstrip("\n").split("|")
         parts = left.split()
         graph[parts[0]] = (tuple(parts[1:]), int(at), int(ct))
@@ -539,7 +637,7 @@ def load_graph(repo: str, branch: str) -> Graph:
 def load_reverts(repo: str, branch: str) -> Dict[str, str]:
     """Return sha -> sha (or prefix) of the commit it reverts, from 'This reverts commit' lines."""
     out: dict[str, str] = {}
-    text = run_git(repo, "log", "--format=%x1e%H%x1f%b", "--grep=This reverts commit", branch, check=False)
+    text = run_git(repo, "log", "--format=%x1e%H%x1f%b", "--grep=This reverts commit", *revs(branch), check=False)
     for rec in text.split("\x1e"):
         if "\x1f" not in rec:
             continue
@@ -761,16 +859,41 @@ def ci_login_hint(tool: str, host: str) -> str:
     return "GH_TOKEN" if host == "github.com" or host.endswith(".ghe.com") else "GH_ENTERPRISE_TOKEN"
 
 
-# Debug switches that make the CLIs dump requests to stderr, which repo-stats may quote in an error.
-CLI_DEBUG_VARS = ("GH_DEBUG", "DEBUG", "GLAB_DEBUG", "GLAB_DEBUG_HTTP")
+# The gh/glab environment is an allowlist: what they need to find their login (token variables, config and
+# keyring locations, GitLab CI autologin), reach the API (proxy and TLS settings) and run. Host and repo
+# overrides (GH_HOST, GH_REPO, GITLAB_HOST, GL_HOST, GITLAB_URI, GITLAB_API_HOST, GLAB_API_PROTOCOL, ...),
+# TLS-verification switches and request-dumping debug switches (GH_DEBUG, DEBUG, GLAB_DEBUG, GLAB_DEBUG_HTTP)
+# are left out, so the API host is always the --hostname that repo-stats passes.
+# Sources: `gh help environment` and https://docs.gitlab.com/cli/configuration/#environment-variables
+CLI_ENV_ALLOW = BASE_ENV_ALLOW | {
+    "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+    "GITLAB_TOKEN", "GITLAB_ACCESS_TOKEN", "OAUTH_TOKEN",
+    "GLAB_ENABLE_CI_AUTOLOGIN", "GITLAB_CI", "CI_JOB_TOKEN",
+    "GH_CONFIG_DIR", "GLAB_CONFIG_DIR", "GLAB_USE_KEYRING", "USE_KEYRING", "DBUS_SESSION_BUS_ADDRESS",
+    "GITLAB_SUBFOLDER",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "GLAB_PROXY", "PROXY",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "GLAB_CA_CERT", "CA_CERT", "GLAB_CLIENT_CERT", "CLIENT_CERT",
+    "GLAB_CLIENT_KEY", "CLIENT_KEY",
+}
+# CI_SERVER_* for glab's CI autologin; XDG_* for config and keyring locations. REPO_STATS_FAKE_* is read
+# only by the test suite's fake gh/glab (tests/fake_cli), which needs its mock server URL and call log
+# passed through this allowlist; the real CLIs ignore it.
+CLI_ENV_PREFIXES = ("CI_SERVER_", "XDG_", "REPO_STATS_FAKE_")
+# Set for every call: no prompts, no update checks or telemetry (extra requests, glab's with the credential).
+CLI_ENV_SET = {
+    "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "GH_TELEMETRY": "false",
+    "GLAB_NO_PROMPT": "true", "GLAB_CHECK_UPDATE": "false", "GLAB_SEND_TELEMETRY": "false",
+}
 CLI_TIMEOUT = 120
 CLI_RETRIES = 4
-HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+HOSTNAME_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\Z")
 # The read-only allowlist. A GraphQL query cannot change anything (only a mutation can), and the GitLab
 # endpoints are the three list endpoints repo-stats reads, always with GET.
 READ_ONLY_GRAPHQL = re.compile(r"^\s*query\b")
 WRITE_GRAPHQL = re.compile(r"\b(?:mutation|subscription)\b")
-GITLAB_READ_ENDPOINT = re.compile(r"^projects/[^/?#\s]+/merge_requests(?:/\d+/(?:commits|notes))?$")
+GITLAB_READ_ENDPOINT = re.compile(r"^projects/(?!\.\.?/)[^/?#\s]+/merge_requests(?:/[0-9]+/(?:commits|notes))?\Z")
+# Upper bound on top-level list pages (50 PRs or 100 MRs each), so a broken API cannot page forever.
+MAX_LIST_PAGES = 2000
 
 
 def _backoff(seconds: float) -> None:
@@ -815,25 +938,42 @@ def parse_cli_response(out: bytes) -> Tuple[Optional[int], Dict[str, str], bytes
     return int(m.group(1)), headers, body
 
 
+def next_page(value: str, page: int) -> int:
+    """Return GitLab's X-Next-Page as an int; raise ApiError unless it is a plain number above `page`."""
+    value = value.strip()
+    if not re.fullmatch(r"[1-9][0-9]{0,8}", value) or int(value) <= page:
+        raise ApiError(f"GitLab returned an invalid next page {value[:20]!r} after page {page}")
+    return int(value)
+
+
 class Cli:
     """Read-only access to one GitHub or GitLab host through `gh api` or `glab api`.
 
     Every request passes the read-only allowlist, gets an explicit --hostname, runs from a private temp
-    directory (removed by close() or at the end of a `with` block), and runs without debug switches and
-    (for glab) without telemetry, which would send its own request with the credential.
+    directory (removed by close() or at the end of a `with` block) with an allowlisted environment, and runs
+    without debug switches, update checks and telemetry (glab's would send its own request with the credential).
     """
 
     def __init__(self, tool: str, host: str, environ: Optional[Mapping[str, str]] = None) -> None:
         """Find the CLI on PATH and prepare its environment; raise CliUnavailable if it is not installed."""
-        env = {k: v for k, v in (os.environ if environ is None else environ).items() if k not in CLI_DEBUG_VARS}
-        env["GLAB_SEND_TELEMETRY"] = "false"
-        exe = shutil.which(tool, path=env.get("PATH", os.defpath))
+        env = allowed_env(os.environ if environ is None else environ, CLI_ENV_ALLOW, CLI_ENV_PREFIXES)
+        env.update(CLI_ENV_SET)
+        if tool == "glab":
+            # glab sends an environment token only to the host named by GITLAB_HOST (or its config), so name
+            # the same host as --hostname. Any GITLAB_HOST from the caller was dropped above.
+            env["GITLAB_HOST"] = host
+        if os.name == "nt":
+            env["NoDefaultCurrentDirectoryInExePath"] = "1"
+        exe = find_executable(tool, env.get("PATH", os.defpath))
         if not exe:
             raise CliUnavailable(f"{tool} is not installed. Install it from {CLI_INSTALL[tool]} for exact PR data.")
         self.tool, self.host, self.exe, self.env = tool, host, exe, env
         self.hint = f"Run `{tool} auth login --hostname {host}`, or in CI set {ci_login_hint(tool, host)}."
         # Mode 0700 and empty: no .git or CLI config of the analysed repository or of another local user.
         self._cwd = tempfile.TemporaryDirectory(prefix="repo-stats-cli-")
+        # git (which the CLIs may run) stops looking for a repository at the temp dir, so it cannot find a
+        # .git that another user planted in a shared /tmp either.
+        self.env["GIT_CEILING_DIRECTORIES"] = os.path.dirname(self._cwd.name)
 
     def close(self) -> None:
         """Remove the private working directory."""
@@ -963,7 +1103,7 @@ def fetch_github(cli: Cli, owner: str, name: str, since: Optional[int], base_bra
     prs: list[PR] = []
     seen = 0
     cursor = None
-    while True:
+    for _ in range(MAX_LIST_PAGES):
         data = cli.graphql(GITHUB_QUERY, {"owner": owner, "name": name, "cursor": cursor})
         if not isinstance(data, dict):
             raise ApiError("GitHub returned an unexpected response")
@@ -995,7 +1135,12 @@ def fetch_github(cli: Cli, owner: str, name: str, since: Optional[int], base_bra
         info_page = page.get("pageInfo") or {}
         if stop or not info_page.get("hasNextPage"):
             break
-        cursor = info_page.get("endCursor")
+        nxt = info_page.get("endCursor")
+        if not isinstance(nxt, str) or not nxt or nxt == cursor:
+            raise ApiError("GitHub returned an invalid or repeating page cursor")
+        cursor = nxt
+    else:
+        raise ApiError(f"Stopped after {MAX_LIST_PAGES} pages of pull requests; use --since or --max-prs")
     if info is not None:
         info["seen"] = seen
     return prs
@@ -1094,7 +1239,7 @@ def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch:
     base = f"projects/{urllib.parse.quote(project_path, safe='')}/merge_requests"
     mrs: list[dict[str, Any]] = []
     page = 1
-    while True:
+    for _ in range(MAX_LIST_PAGES):
         q: dict[str, Any] = {"state": "all", "scope": "all", "order_by": "updated_at", "sort": "desc", "per_page": 100, "page": page}
         if since:
             # updated_after, not created_after: an MR opened before the cutoff but merged after it still counts.
@@ -1109,7 +1254,9 @@ def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch:
         nxt = hdrs.get("x-next-page")
         if not data or not nxt or (max_prs and len(mrs) >= max_prs):
             break
-        page = int(nxt)
+        page = next_page(nxt, page)
+    else:
+        raise ApiError(f"Stopped after {MAX_LIST_PAGES} pages of merge requests; use --since or --max-prs")
     if max_prs:
         mrs = mrs[:max_prs]
     if info is not None:
@@ -1128,7 +1275,7 @@ def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch:
             nxt = hdrs.get("x-next-page")
             if not data or not nxt:
                 return
-            page = int(nxt)
+            page = next_page(nxt, page)
 
     def mr_commits(iid: Any) -> List[Dict[str, Any]]:
         """Return every commit of one MR (GitLab lists them newest first, so all pages are needed)."""
@@ -1269,7 +1416,7 @@ def local_summary(pr: PR, fp_by_sha: Dict[str, Commit]) -> Optional[Commit]:
         return None
     if len(c["parents"]) >= 2 or (pr.get("squash_sha") and pr["squash_sha"] == c["sha"]):
         return c
-    if pr["number"] is not None and re.search(rf"\(#{pr['number']}\)\s*$", c["subject"]):
+    if pr["number"] is not None and re.search(rf"\(#{re.escape(str(pr['number']))}\)\s*$", c["subject"]):
         return c
     return None
 
@@ -1441,13 +1588,44 @@ def render_html(data: Dict[str, Any]) -> str:
     return template.replace(marker, embed_json(data), 1)
 
 
+def write_output(path: str, write: Callable[[IO[str]], None]) -> None:
+    """Write a text output file atomically, and never through a symbolic link.
+
+    The text goes to a new temp file in the same directory, which then replaces `path` (os.replace swaps
+    the directory entry and never follows a link), so a symlink planted at the output path in an untrusted
+    checkout cannot redirect the write. An existing symlink is refused outright. Characters that cannot be
+    encoded (lone surrogates from API text) are written as backslash escapes, which inside the dashboard's
+    JSON decode back to the same string.
+    """
+    if os.path.islink(path):
+        raise ToolError(f"Refusing to write {path}: it is a symbolic link")
+    directory = os.path.dirname(os.path.abspath(path))
+    try:
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix="." + os.path.basename(path) + ".", suffix=".tmp")
+    except OSError as e:  # report the output path, not the temp name
+        raise OSError(e.errno, e.strerror, path) from None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace", newline="") as f:
+            write(f)
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp, 0o666 & ~umask)  # mkstemp creates 0600; give the usual permissions of a new file
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def write_csv(path: str, records: Iterable[Record]) -> None:
     """Write one row per PR record to a CSV file, guarding against spreadsheet formula injection."""
     cols = ["id", "title", "type", "scope", "breaking", "state", "bot", "created", "first_commit", "first_review",
             "merged", "additions", "deletions", "files", "commits", "risk", "risk_level", "kind",
             "coding", "pickup", "review", "open_to_merge", "lead", "deployed", "deploy_wait", "lead_to_deploy",
             "restore", "review_cycles", "changes_requested", "reviewers", "source"]
-    with open(path, "w", newline="", encoding="utf-8") as f:
+
+    def write(f: IO[str]) -> None:
+        """Write the header and one guarded row per record to f."""
         w = csv.writer(f)
         w.writerow(cols)
         for r in records:
@@ -1458,6 +1636,8 @@ def write_csv(path: str, records: Iterable[Record]) -> None:
                     v = "'" + v  # neutralise spreadsheet formula injection, also after leading spaces
                 row.append("" if v is None else v)
             w.writerow(row)
+
+    write_output(path, write)
 
 
 WHEN_DATE = re.compile(r"^\d{4}(?:-\d{2}(?:-\d{2})?)?$")
@@ -1519,13 +1699,18 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
             and run_git(repo, "rev-parse", "--is-bare-repository", check=False).strip() != "true":
         raise ToolError(f"{repo} is not a git repository")
     branch = args.branch or detect_branch(repo, args.remote)
-    if not run_git(repo, "rev-parse", "--verify", "-q", branch + "^{commit}", check=False).strip():
+    if branch.startswith("-"):  # never let a ref (possibly from a crafted repository) be read as an option
+        raise ToolError(f"Branch or ref '{branch}' starts with '-'; pass another --branch.")
+    if not run_git(repo, "rev-parse", "--verify", "-q", *revs(branch + "^{commit}"), check=False).strip():
         raise ToolError(f"Branch or ref '{branch}' not found. Pass --branch.")
     short_branch = strip_remote_prefix(repo, branch)
     warnings: list[str] = []
     if run_git(repo, "rev-parse", "--is-shallow-repository", check=False).strip() == "true":
         warnings.append("This is a shallow clone. History, lines of code over time and timings are incomplete. "
                         "Run `git fetch --unshallow` for full results.")
+    partial = is_partial_clone(repo)
+    if partial:
+        log(f"warning: {PARTIAL_CLONE_HINT}")
     since = parse_when(args.since, "--since", end=False)
     until = parse_when(args.until, "--until", end=True)  # exclusive: the first moment after the period
     if since is not None and until is not None and since >= until:
@@ -1539,7 +1724,12 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
 
     log(f"Scanning history of {branch} ...")
     scanner = Scanner(excludes, sensitive_re)
-    first_parent = scanner.scan(repo, branch)
+    try:
+        first_parent = scanner.scan(repo, branch)
+    except ToolError as e:
+        if partial:
+            raise ToolError(f"{e}\n{PARTIAL_CLONE_HINT}")
+        raise
     if not first_parent:
         raise ToolError(f"No commits found on {branch}")
     graph = load_graph(repo, branch)
@@ -1559,7 +1749,7 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
 
     # Decide where PR data comes from.
     env = os.environ if environ is None else environ
-    remote = run_git(repo, "remote", "get-url", args.remote, check=False).strip()
+    remote = run_git(repo, "remote", "get-url", "--", args.remote, check=False).strip()
     parsed = parse_remote(remote) if remote else None
     host_provider = detect_provider(parsed[0]) if parsed else None
     ci = ci_server(env)
@@ -1764,6 +1954,8 @@ def build_parser() -> argparse.ArgumentParser:
 # Same policy as the template's meta tag: inline script and style only, no network access at all.
 CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; "
        "base-uri 'none'; form-action 'none'")
+# --serve adds frame-ancestors, which only works in a header (a meta tag CSP ignores it): no framing.
+SERVE_CSP = CSP + "; frame-ancestors 'none'"
 
 
 def serve(path: Path, port: int, open_browser: bool) -> None:
@@ -1797,8 +1989,10 @@ def serve(path: Path, port: int, open_browser: bool) -> None:
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Content-Security-Policy", CSP)
+            self.send_header("Content-Security-Policy", SERVE_CSP)
             self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.send_header("Cross-Origin-Opener-Policy", "same-origin")
             self.end_headers()
             if not head_only:
                 self.wfile.write(body)
@@ -1835,9 +2029,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         data = collect(args)
         out = Path(args.out)
-        out.write_text(render_html(data), encoding="utf-8")
+        html = render_html(data)
+        write_output(args.out, lambda f: f.write(html))
         if args.json:
-            Path(args.json).write_text(json.dumps(data, indent=1), encoding="utf-8")
+            write_output(args.json, lambda f: f.write(json.dumps(data, indent=1)))
         if args.csv:
             write_csv(args.csv, data["prs"])
     except ToolError as e:

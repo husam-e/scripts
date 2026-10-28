@@ -2518,7 +2518,9 @@ class G1_ReadOnlyCli(unittest.TestCase):
         for word in ('"POST"', '"PUT"', '"PATCH"', '"DELETE"', '"-X"', '"-F"', '"--field"', '"--input"', '"--form"'):
             self.assertNotIn(word, src, word)
         git_subcommands = set(re.findall(r'run_git\(repo, "([a-z-]+)"', src) + re.findall(r'stream_git\(repo, "([a-z-]+)"', src))
-        self.assertLessEqual(git_subcommands, {"log", "rev-parse", "for-each-ref", "symbolic-ref", "remote"}, git_subcommands)
+        self.assertLessEqual(git_subcommands, {"log", "rev-parse", "for-each-ref", "symbolic-ref", "remote", "config"},
+                             git_subcommands)
+        self.assertEqual(re.findall(r'run_git\(repo, "config", "([^"]+)"', src), ["--get-regexp"], "git config only reads")
 
     def test_bad_hostnames_rejected(self) -> None:
         """--hostname must be a plain host name: no ports, schemes, paths, spaces or leading dashes."""
@@ -2564,6 +2566,7 @@ class G1_ReadOnlyCli(unittest.TestCase):
             # One private directory per run, and it is gone afterwards.
             self.assertEqual(len({c["cwd"] for c in calls}), 1)
             self.assertFalse(Path(calls[0]["cwd"]).exists())
+            self.assertEqual(calls[0]["env"]["GIT_CEILING_DIRECTORIES"], tempfile.gettempdir())
 
     def test_cli_working_directory_is_private_and_empty(self) -> None:
         """The CLI's working directory is new, empty and mode 0700, so nobody can plant a .git in it."""
@@ -2617,16 +2620,27 @@ class G1_ReadOnlyCli(unittest.TestCase):
             self.assertEqual(len(srv.requests), n)
 
     def test_git_never_sees_credential_variables(self) -> None:
-        """git, and anything it runs, gets an environment without the credential variables."""
+        """git, and anything it runs, gets an allowlisted environment: no credentials, no unknown variables."""
         r = fixtures.merge_workflow_repo()
         creds = {name: f"secret-{i}" for i, name in enumerate(rs.CREDENTIAL_VARS)}
-        with mock.patch.dict(os.environ, {**creds, "REPO_STATS_CANARY": "kept"}):
+        extra = {"REPO_STATS_CANARY": "dropped", "ACTIONS_RUNTIME_TOKEN": "secret-actions", "LC_ALL": "C",
+                 "GIT_DIR": "/nonexistent", "GIT_WORK_TREE": "/nonexistent", "GIT_CONFIG_PARAMETERS": "'x.y'='z'"}
+        with mock.patch.dict(os.environ, {**creds, **extra}):
             out = rs.run_git(str(r.path), "-c", "alias.envdump=!env", "envdump")
             streamed = "".join(rs.stream_git(str(r.path), "-c", "alias.envdump=!env", "envdump"))
         for text in (out, streamed):
-            self.assertIn("REPO_STATS_CANARY=kept", text)
+            env = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+            self.assertTrue(env.get("PATH", "").endswith(os.environ["PATH"]))  # git may prepend its exec dir
+            self.assertEqual(env.get("LC_ALL"), "C")
+            self.assertEqual(env.get("GIT_NO_LAZY_FETCH"), "1")
+            for name in ("REPO_STATS_CANARY", "ACTIONS_RUNTIME_TOKEN", "GIT_WORK_TREE"):
+                self.assertNotIn(name, env)
+            # git exports its own -c options to the alias; the caller's injected ones must not be there.
+            self.assertNotIn("'x.y'", env.get("GIT_CONFIG_PARAMETERS", ""))
+            self.assertNotEqual(env.get("GIT_DIR"), "/nonexistent", "GIT_DIR from the caller must not reach git")
             for name, value in creds.items():
                 self.assertNotIn(value, text, name)
+        self.assertFalse(set(rs.CREDENTIAL_VARS) & rs.GIT_ENV_ALLOW)
 
     def test_parse_cli_response(self) -> None:
         """--include output splits into status, lower-cased headers and body, with CRLF or LF."""
@@ -2877,6 +2891,328 @@ class H1_ReviewCycles(unittest.TestCase):
             rows = list(csv.DictReader(f))
         self.assertEqual([(r["review_cycles"], r["changes_requested"], r["reviewers"]) for r in rows],
                          [("2", "1", "2"), ("", "", "")])
+
+
+# =====================================================================================================
+# I. Security hardening: outputs, environments, executables, parsing and paging
+# =====================================================================================================
+
+class I1_SecurityHardening(unittest.TestCase):
+    """Regression tests for the findings of the security review."""
+
+    def _cli(self, tool: str, host: str, environ: Mapping[str, str]) -> rs.Cli:
+        """A Cli whose private directory is removed after the test."""
+        cli = rs.Cli(tool, host, environ)
+        self.addCleanup(cli.close)
+        return cli
+
+    # -- S1: outputs are written atomically and never through a symlink
+
+    def test_write_output_refuses_symlinks(self) -> None:
+        """An existing or dangling symlink at the output path is refused; its target is never touched."""
+        d = tmpdir()
+        victim = d / "victim.txt"
+        victim.write_text("keep")
+        (d / "link.html").symlink_to(victim)
+        (d / "dangling.html").symlink_to(d / "created-by-attack")
+        for name in ("link.html", "dangling.html"):
+            with self.assertRaises(rs.ToolError, msg=name):
+                rs.write_output(str(d / name), lambda f: f.write("pwned"))
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertFalse((d / "created-by-attack").exists())
+        self.assertEqual(sorted(p.name for p in d.iterdir()), ["dangling.html", "link.html", "victim.txt"])
+
+    def test_write_output_is_atomic(self) -> None:
+        """A write replaces the file in one step, leaves no temp file, and a failed write keeps the old file."""
+        d = tmpdir()
+        out = d / "o.html"
+        out.write_text("old")
+        rs.write_output(str(out), lambda f: f.write("new"))
+        self.assertEqual(out.read_text(), "new")
+
+        def boom(f: Any) -> None:
+            """Write part of the output, then fail."""
+            f.write("partial")
+            raise RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            rs.write_output(str(out), boom)
+        self.assertEqual(out.read_text(), "new")
+        self.assertEqual([p.name for p in d.iterdir()], ["o.html"], "no temp file is left behind")
+
+    def test_cli_refuses_symlinked_outputs(self) -> None:
+        """-o, --json and --csv pointing at a symlink exit 1 with a clear error and leave the target alone."""
+        for flag in ("-o", "--json", "--csv"):
+            d = tmpdir()
+            victim = d / "victim.txt"
+            victim.write_text("keep")
+            (d / "out.x").symlink_to(victim)
+            args = [merge_repo().path, "-o", d / "real.html"] if flag != "-o" else [merge_repo().path]
+            p = run_cli([*args, flag, d / "out.x"])
+            self.assertEqual(p.returncode, 1, flag)
+            self.assertIn("symbolic link", p.stderr, flag)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertEqual(victim.read_text(), "keep", flag)
+
+    # -- N5: lone surrogates in API text cannot crash a write
+
+    def test_lone_surrogates_are_written(self) -> None:
+        """A lone surrogate is written as an escape: the dashboard JSON still decodes to the same string."""
+        d = tmpdir()
+        data = {"title": "a\ud800b"}
+        rs.write_output(str(d / "x.html"), lambda f: f.write(rs.embed_json(data)))
+        self.assertEqual(json.loads((d / "x.html").read_text(encoding="utf-8")), data)
+        rs.write_csv(str(d / "x.csv"), [{"id": 1, "title": "t\udfffx"}])
+        self.assertIn("\\udfff", (d / "x.csv").read_text(encoding="utf-8"))
+
+    # -- S4, N9: the gh/glab environment is an allowlist
+
+    def test_cli_environment_is_an_allowlist(self) -> None:
+        """Host overrides, TLS switches and unknown variables are dropped; login, CI, proxy and config stay."""
+        keep = {"GITLAB_TOKEN": FAKE, "GH_TOKEN": FAKE, "GH_ENTERPRISE_TOKEN": FAKE, "CI_JOB_TOKEN": "job",
+                "GLAB_ENABLE_CI_AUTOLOGIN": "true", "GITLAB_CI": "true", "CI_SERVER_FQDN": "gitlab.com",
+                "HOME": "/home/u", "XDG_CONFIG_HOME": "/home/u/.config", "GH_CONFIG_DIR": "/c/gh",
+                "GLAB_CONFIG_DIR": "/c/glab", "https_proxy": "http://proxy:3128", "SSL_CERT_FILE": "/ca.pem",
+                "LANG": "C.UTF-8", "LC_ALL": "C", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/x"}
+        drop = {"GITLAB_HOST": "evil.example", "GL_HOST": "evil.example", "GITLAB_URI": "evil.example",
+                "GITLAB_API_HOST": "evil.example", "GLAB_API_PROTOCOL": "http", "API_PROTOCOL": "http",
+                "GH_HOST": "evil.example", "GH_REPO": "evil/repo", "GLAB_SKIP_TLS_VERIFY": "true",
+                "GH_DEBUG": "api", "GLAB_DEBUG_HTTP": "true", "AWS_SECRET_ACCESS_KEY": "s", "GIT_DIR": "/x",
+                "GLAB_CHECK_UPDATE": "true"}
+        for tool, host in (("glab", "gitlab.com"), ("gh", "github.com")):
+            env = self._cli(tool, host, helpers.clean_env({**keep, **drop})).env
+            for k, v in keep.items():
+                self.assertEqual(env.get(k), v, (tool, k))
+            for k in drop:
+                if k not in ("GITLAB_HOST", "GLAB_CHECK_UPDATE"):
+                    self.assertNotIn(k, env, (tool, k))
+            self.assertEqual(env["GH_NO_UPDATE_NOTIFIER"], "1")
+            self.assertEqual(env["GLAB_CHECK_UPDATE"], "false")
+            self.assertEqual(env["GLAB_SEND_TELEMETRY"], "false")
+            self.assertEqual(env["GH_TELEMETRY"], "false")
+        self.assertEqual(self._cli("glab", "git.corp.example", helpers.clean_env(drop)).env["GITLAB_HOST"],
+                         "git.corp.example", "glab's GITLAB_HOST is always the --hostname host")
+        self.assertNotIn("GITLAB_HOST", self._cli("gh", "github.com", helpers.clean_env(drop)).env)
+
+    def test_cli_never_sees_host_overrides_end_to_end(self) -> None:
+        """A real run with GITLAB_API_HOST and friends set still sends glab only the trusted host."""
+        r = api_repo("git@gitlab.com:grp/sub/proj.git")
+        log = tmpdir() / "cli.log"
+        evil = {"GITLAB_API_HOST": "evil.example", "GL_HOST": "evil.example", "GITLAB_URI": "evil.example"}
+        with ms.MockServer(ms.gitlab_handler(*gitlab_fixture(r), page_size=50)) as srv:
+            d, _ = collect(r, "--fake-api", srv.url, env={"GITLAB_TOKEN": FAKE, "REPO_STATS_FAKE_LOG": str(log), **evil})
+        self.assertEqual(d["meta"]["mode"], "api")
+        calls = helpers.cli_calls(log)
+        self.assertTrue(calls)
+        for c in calls:
+            for k in evil:
+                self.assertNotIn(k, c["env"])
+            self.assertEqual(c["env"]["GITLAB_HOST"], "gitlab.com")
+
+    # -- S2: executables are found by absolute path, never in the current directory
+
+    def test_find_executable_skips_current_and_relative_dirs(self) -> None:
+        """A `gh` in the current directory is never used through an empty, "." or relative PATH entry."""
+        d = tmpdir()
+        (d / "sub").mkdir()
+        for p in (d / "gh", d / "sub" / "gh"):
+            p.write_text("#!/bin/sh\necho planted\n")
+            p.chmod(0o755)
+        old = os.getcwd()
+        os.chdir(d)
+        try:
+            for path in ("", ".", "sub", os.pathsep.join(["", ".", "sub", "./sub"])):
+                self.assertIsNone(rs.find_executable("gh", path), repr(path))
+            with self.assertRaises(rs.CliUnavailable):
+                rs.Cli("gh", "github.com", {"PATH": os.pathsep.join([".", "sub"])})
+            self.assertEqual(rs.find_executable("gh", os.pathsep.join([".", str(d / "sub")])), str(d / "sub" / "gh"))
+        finally:
+            os.chdir(old)
+        self.assertTrue(os.path.isabs(rs.git_cmd(".")[0]))
+
+    # -- N1: no user info from a remote URL reaches a name or an output
+
+    def test_parse_remote_drops_user_info(self) -> None:
+        """Credentials in a remote URL never end up in the host or path, also without a path."""
+        cases = {
+            "https://user:SECRET@github.com": None,
+            "https://user:SECRET@github.com/": None,
+            "https://SECRET@github.com/acme/widgets.git": ("github.com", "acme/widgets"),
+            "https://u:p@ss@git.corp.example/a/b.git": ("git.corp.example", "a/b"),
+            "https://github.com@evil.example/o/r": ("evil.example", "o/r"),
+            "ssh://git@github.com:evil/o/r": None,
+        }
+        for url, want in cases.items():
+            got = rs.parse_remote(url)
+            self.assertEqual(got, want, url)
+            self.assertNotIn("SECRET", repr(got), url)
+
+    def test_token_in_pathless_remote_is_not_in_the_output(self) -> None:
+        """A path-less https remote with a token gives no API and no name from the remote."""
+        r = fixtures.merge_workflow_repo()
+        add_remote(r, "https://user:SECRET-TOKEN@github.com")
+        d, _ = collect(r)
+        self.assertEqual(d["meta"]["mode"], "git")
+        self.assertNotIn("SECRET-TOKEN", json.dumps(d))
+
+    # -- N2, N3: anchored regexes, no dot segments
+
+    def test_security_regexes_match_the_whole_string(self) -> None:
+        """A trailing newline, an empty label, dot segments and non-ASCII digits are all rejected."""
+        for bad in ("ghe.example.com\n", "a..b", "ghe..example.com"):
+            self.assertIsNone(rs.HOSTNAME_RE.match(bad), repr(bad))
+        self.assertIsNotNone(rs.HOSTNAME_RE.match("ghe.example.com"))
+        for bad in ("projects/g%2Fp/merge_requests\n", "projects/../merge_requests", "projects/./merge_requests",
+                    "projects/../merge_requests/1/notes", "projects/g%2Fp/merge_requests/\u0661/notes"):
+            self.assertIsNone(rs.GITLAB_READ_ENDPOINT.match(bad), repr(bad))
+        for good in ("projects/g%2Fp/merge_requests", "projects/g%2Fp/merge_requests/12/commits", "projects/...x/merge_requests"):
+            self.assertIsNotNone(rs.GITLAB_READ_ENDPOINT.match(good), good)
+        log = tmpdir() / "cli.log"
+        cli = self._cli("glab", "gitlab.com", helpers.clean_env({"REPO_STATS_FAKE_LOG": str(log)}))
+        with self.assertRaises(rs.ApiError):
+            cli.get("projects/../merge_requests", {})
+        self.assertEqual(helpers.cli_calls(log), [])
+        with self.assertRaises(rs.ToolError):
+            collect(api_repo(), "--provider", "github", "--hostname", "ghe.example.com\n")
+
+    # -- N4: paging is capped and validated
+
+    def test_next_page_must_be_a_plain_increasing_number(self) -> None:
+        """X-Next-Page must be a plain positive integer above the current page."""
+        self.assertEqual(rs.next_page("2", 1), 2)
+        for bad in ("-1", "+4", "1_0", "0", "1", "abc", "\u0662", "2.0", "99999999999"):
+            with self.assertRaises(rs.ApiError, msg=bad):
+                rs.next_page(bad, 1)
+
+    def test_gitlab_repeating_next_page_stops(self) -> None:
+        """A server that always answers X-Next-Page: 1 fails the fetch instead of looping forever."""
+        def h(req: ms.Request) -> ms.Response:
+            """Return one MR per page and always point back at page 1."""
+            return 200, {"X-Next-Page": "1"}, [{"iid": 1, "title": "t", "state": "opened", "created_at": "2024-01-01T00:00:00Z"}]
+
+        with ms.MockServer(h) as srv:
+            cli = self._cli("glab", "gitlab.com", helpers.clean_env({"REPO_STATS_FAKE_URL": srv.url, "GITLAB_TOKEN": FAKE}))
+            with self.assertRaises(rs.ApiError):
+                rs.fetch_gitlab(cli, "g/p", None, "main", True, None, False, progress=lambda m: None)
+            self.assertEqual(len(srv.requests), 1)
+
+    def test_github_repeating_cursor_and_page_cap(self) -> None:
+        """A repeating GraphQL cursor fails the fetch, and an endless one stops at MAX_LIST_PAGES."""
+        counter = [0]
+
+        def h(repeat: bool) -> ms.Handler:
+            """A GraphQL handler that always has a next page, with a fixed or ever-changing cursor."""
+            def inner(req: ms.Request) -> ms.Response:
+                """Answer with no PRs and another page."""
+                counter[0] += 1
+                cursor = "same" if repeat else f"c{counter[0]}"
+                return 200, {}, {"data": {"repository": {"pullRequests": {
+                    "pageInfo": {"hasNextPage": True, "endCursor": cursor}, "nodes": []}}}}
+            return inner
+
+        env = {"GH_TOKEN": FAKE}
+        with ms.MockServer(h(True)) as srv:
+            cli = self._cli("gh", "github.com", helpers.clean_env({**env, "REPO_STATS_FAKE_URL": srv.url}))
+            with self.assertRaisesRegex(rs.ApiError, "repeating"):
+                rs.fetch_github(cli, "o", "r", None, "main", True, None, progress=lambda m: None)
+            self.assertEqual(len(srv.requests), 2)
+        with ms.MockServer(h(False)) as srv, mock.patch.object(rs, "MAX_LIST_PAGES", 3):
+            cli = self._cli("gh", "github.com", helpers.clean_env({**env, "REPO_STATS_FAKE_URL": srv.url}))
+            with self.assertRaisesRegex(rs.ApiError, "Stopped after 3 pages"):
+                rs.fetch_github(cli, "o", "r", None, "main", True, None, progress=lambda m: None)
+            self.assertEqual(len(srv.requests), 3)
+
+    # -- N7: --serve headers
+
+    def test_serve_sends_framing_and_cross_origin_headers(self) -> None:
+        """--serve forbids framing in the header CSP and sends same-origin CORP and COOP."""
+        out = tmpdir()
+        proc = subprocess.Popen([sys.executable, SCRIPT, str(merge_repo().path), "-o", str(out / "o.html"),
+                                 "--serve", "0", "--no-open"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                text=True, env=helpers.clean_env())
+        try:
+            url = None
+            for line in proc.stderr:  # pyright: ignore[reportOptionalIterable]
+                m = re.search(r"Serving (\S+)", line)
+                if m:
+                    url = m.group(1)
+                    break
+            self.assertIsNotNone(url)
+            status, _, headers = E2_Serve()._get(url)  # pyright: ignore[reportArgumentType]
+            self.assertEqual(status, 200)
+            self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+            self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
+            self.assertEqual(headers["Cross-Origin-Resource-Policy"], "same-origin")
+            self.assertEqual(headers["Cross-Origin-Opener-Policy"], "same-origin")
+        finally:
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=10)
+            if proc.stderr:
+                proc.stderr.close()
+
+    # -- S5, S6: git hardening and partial clones
+
+    def test_git_argv_is_hardened(self) -> None:
+        """Every git call disables fsmonitor and fetching; the numstat log disables textconv and ext diff."""
+        argv = rs.git_cmd("/r", "log")
+        for opt in ("core.fsmonitor=false", "protocol.allow=never"):
+            self.assertEqual(argv[argv.index(opt) - 1], "-c", opt)
+        src = (ROOT / "repo_stats.py").read_text()
+        m = re.search(r'stream_git\(repo, "log", "--first-parent", "-m", "--numstat".*?\)', src, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn('"--no-textconv"', m.group(0))  # pyright: ignore[reportOptionalMemberAccess]
+        self.assertIn('"--no-ext-diff"', m.group(0))  # pyright: ignore[reportOptionalMemberAccess]
+
+    def test_partial_clone_warns_and_never_fetches(self) -> None:
+        """A blobless clone is detected; the run warns, fetches nothing, and fails with a clear hint."""
+        src = merge_repo().path
+        dest = tmpdir() / "partial"
+        subprocess.run(["git", "clone", "-q", "--filter=blob:none", "--upload-pack",
+                        "git -c uploadpack.allowFilter=true upload-pack", f"file://{src}", str(dest)],
+                       check=True, capture_output=True)
+
+        def missing() -> int:
+            """Count objects the partial clone does not have."""
+            out = git_out(dest, "rev-list", "--objects", "--missing=print", "--all")
+            return sum(1 for line in out.splitlines() if line.startswith("?"))
+
+        before = missing()
+        self.assertGreater(before, 0)
+        self.assertTrue(rs.is_partial_clone(str(dest)))
+        self.assertFalse(rs.is_partial_clone(str(src)))
+        p = run_cli([dest, "-o", tmpdir() / "o.html"])
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("warning: This is a partial clone", p.stderr)
+        self.assertIn("Clone without a filter", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(missing(), before, "no missing object may be fetched")
+
+    # -- N6, N11: refs and PR numbers are never options or regex syntax
+
+    def test_refs_starting_with_dash_are_refused(self) -> None:
+        """A branch that looks like an option is refused before git sees it; no file is created."""
+        d = tmpdir()
+        p = run_cli([merge_repo().path, "-o", d / "o.html", "--branch=--output=pwned.txt"], cwd=d)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("starts with '-'", p.stderr)
+        self.assertFalse((d / "pwned.txt").exists())
+
+    def test_end_of_options_depends_on_git_version(self) -> None:
+        """--end-of-options is used from git 2.30 (rev-parse support) and left out before."""
+        with mock.patch.object(rs, "_git_version", (2, 30)):
+            self.assertEqual(rs.revs("main"), ["--end-of-options", "main"])
+        with mock.patch.object(rs, "_git_version", (2, 29)):
+            self.assertEqual(rs.revs("main"), ["main"])
+        self.assertGreaterEqual(rs.git_version(), (2, 0))
+        # And the real git accepts the argv repo-stats builds.
+        out = rs.run_git(str(merge_repo().path), "rev-parse", "--verify", "-q", *rs.revs("main^{commit}"))
+        self.assertRegex(out.strip(), r"^[0-9a-f]{40}$")
+
+    def test_pr_number_is_escaped_in_regex(self) -> None:
+        """A PR number is matched literally in a squash subject, never as a regex."""
+        c = {"sha": "abc", "parents": ["p"], "subject": "fix: thing (#11)"}
+        self.assertIsNone(rs.local_summary({"number": "1+", "sha": "abc"}, {"abc": c}))  # as a regex, 1+ matches 11
+        self.assertIs(rs.local_summary({"number": 11, "sha": "abc"}, {"abc": c}), c)
 
 
 if __name__ == "__main__":
