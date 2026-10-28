@@ -1248,7 +1248,7 @@ class B2_GitLab(unittest.TestCase):
                 return 500, {}, {"message": "boom"}
             return ms.gitlab_handler(self.mrs, self.commits, self.notes, page_size=50)(req)
 
-        with mock.patch.object(rs.time, "sleep", lambda s: None), ms.MockServer(h) as srv:
+        with mock.patch.object(rs, "_backoff", lambda s: None), ms.MockServer(h) as srv:
             d, _ = collect(self.r, "--fake-api", srv.url, env={"GITLAB_TOKEN": FAKE})
         self.assertEqual(d["meta"]["mode"], "api")
 
@@ -1347,6 +1347,34 @@ class B3_CliLogin(unittest.TestCase):
         self.assertIn("gh auth login --hostname github.com", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
+    def test_login_hint_names_the_variable_gh_reads_for_the_host(self) -> None:
+        """github.com needs GH_TOKEN; GitHub Enterprise Server needs GH_ENTERPRISE_TOKEN, and GH_TOKEN is not enough."""
+        self.assertEqual(rs.ci_login_hint("gh", "github.com"), "GH_TOKEN")
+        self.assertEqual(rs.ci_login_hint("gh", "acme.ghe.com"), "GH_TOKEN")
+        self.assertEqual(rs.ci_login_hint("gh", "ghe.corp.example"), "GH_ENTERPRISE_TOKEN")
+        self.assertIn("GITLAB_TOKEN", rs.ci_login_hint("glab", "gitlab.com"))
+        r = api_repo("https://ghe.corp.example/acme/widgets.git")
+        d, _ = collect(r, "--provider", "github", "--hostname", "ghe.corp.example", env={"GH_TOKEN": FAKE})
+        self.assertEqual(d["meta"]["mode"], "git")
+        self.assertTrue(any("not logged in to ghe.corp.example" in w and "set GH_ENTERPRISE_TOKEN" in w
+                            for w in d["meta"]["warnings"]), d["meta"]["warnings"])
+
+    def test_glab_without_login_falls_back_with_the_login_command(self) -> None:
+        """glab with no login sends an anonymous request; the 401 falls back to git and names `glab auth login`."""
+        r = api_repo("git@gitlab.com:grp/proj.git")
+        mrs, commits, notes = gitlab_fixture(r)
+        with ms.MockServer(ms.gitlab_handler(mrs, commits, notes, page_size=50)) as srv:
+            d, _ = collect(r, "--fake-api", srv.url)
+            self.assertTrue(srv.requests)
+            self.assertTrue(all("private-token" not in q["headers"] for q in srv.requests))
+        self.assertEqual(d["meta"]["mode"], "git")
+        self.assertTrue(any("401" in w and "glab auth login --hostname gitlab.com" in w for w in d["meta"]["warnings"]),
+                        d["meta"]["warnings"])
+        with ms.MockServer(ms.gitlab_handler(mrs, commits, notes, page_size=50)) as srv:
+            with self.assertRaises(rs.ApiError) as cm:
+                collect(r, "--fake-api", srv.url, "--source", "api")
+        self.assertIn("glab auth login", str(cm.exception))
+
     def test_missing_cli_falls_back_or_errors(self) -> None:
         """Without gh installed, auto mode uses git and says where to get it; --source api is an error."""
         r = api_repo()
@@ -1361,8 +1389,10 @@ class B3_CliLogin(unittest.TestCase):
         """Without gh on PATH, the run prints a warning, uses local git history and says so."""
         r = api_repo()
         empty = tmpdir()
-        git_dir = Path(subprocess.run(["sh", "-c", "command -v git"], capture_output=True, text=True).stdout.strip()).parent
-        p = run_cli([r.path, "-o", tmpdir() / "o.html"], env={"PATH": os.pathsep.join([str(empty), str(git_dir)])})
+        # Only git on PATH: the directory git lives in may also hold a real gh, which must never run here.
+        git = subprocess.run(["sh", "-c", "command -v git"], capture_output=True, text=True).stdout.strip()
+        os.symlink(git, empty / "git")
+        p = run_cli([r.path, "-o", tmpdir() / "o.html"], env={"PATH": str(empty)})
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("warning: gh is not installed", p.stderr)
         self.assertIn("PRs are inferred from git history", p.stderr)
@@ -1426,7 +1456,7 @@ class B4_Failures(unittest.TestCase):
     def test_500_retries_then_falls_back(self) -> None:
         """Server errors are retried with exponential back-off, then fall back."""
         sleeps = []
-        with mock.patch.object(rs.time, "sleep", sleeps.append), self._srv(500) as srv:
+        with mock.patch.object(rs, "_backoff", sleeps.append), self._srv(500) as srv:
             d, _ = collect(self.r, "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
             self.assertEqual(len(srv.requests), 5)
         self.assertEqual(sleeps, [2, 4, 8, 16])
@@ -1434,7 +1464,7 @@ class B4_Failures(unittest.TestCase):
 
     def test_500_with_source_api_raises(self) -> None:
         """--source api raises ToolError after repeated 500s."""
-        with mock.patch.object(rs.time, "sleep", lambda s: None), self._srv(500) as srv:
+        with mock.patch.object(rs, "_backoff", lambda s: None), self._srv(500) as srv:
             with self.assertRaises(rs.ToolError) as cm:
                 collect(self.r, "--fake-api", srv.url, "--source", "api", env={"GITHUB_TOKEN": FAKE})
         self.assertIn("500", str(cm.exception))
@@ -1446,7 +1476,7 @@ class B4_Failures(unittest.TestCase):
         port = s.getsockname()[1]
         s.close()
         sleeps = []
-        with mock.patch.object(rs.time, "sleep", sleeps.append):
+        with mock.patch.object(rs, "_backoff", sleeps.append):
             d, _ = collect(self.r, "--fake-api", f"http://127.0.0.1:{port}", env={"GITHUB_TOKEN": FAKE})
             self.assertEqual(d["meta"]["mode"], "git")
             self.assertTrue(any("Could not reach" in w for w in d["meta"]["warnings"]))
@@ -1469,7 +1499,7 @@ class B4_Failures(unittest.TestCase):
             return inner(req)
 
         sleeps = []
-        with mock.patch.object(rs.time, "sleep", sleeps.append), ms.MockServer(h) as srv:
+        with mock.patch.object(rs, "_backoff", sleeps.append), ms.MockServer(h) as srv:
             d, _ = collect(self.r, "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
         self.assertEqual(sleeps, [3])
         self.assertEqual(d["meta"]["mode"], "api")
@@ -1487,7 +1517,7 @@ class B4_Failures(unittest.TestCase):
                 return 429, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}, {"message": "slow down"}
             return inner(req)
 
-        with mock.patch.object(rs.time, "sleep", lambda s: None), ms.MockServer(h) as srv:
+        with mock.patch.object(rs, "_backoff", lambda s: None), ms.MockServer(h) as srv:
             d, _ = collect(self.r, "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
         self.assertEqual(d["meta"]["mode"], "api")
 
@@ -2277,9 +2307,9 @@ class F2_GitLabDetailErrors(unittest.TestCase):
         """Run fetch_gitlab against `handler` and return (raw PRs, info)."""
         info: dict[str, int] = {}
         env = helpers.clean_env({"GITLAB_TOKEN": FAKE})
-        with mock.patch.object(rs.time, "sleep", lambda s: None), ms.MockServer(handler) as srv:
-            cli = rs.Cli("glab", "gitlab.com", {**env, "REPO_STATS_FAKE_URL": srv.url})
-            prs = rs.fetch_gitlab(cli, "g/p", None, "main", False, None, True, progress=lambda m: None, info=info)
+        with mock.patch.object(rs, "_backoff", lambda s: None), ms.MockServer(handler) as srv:
+            with rs.Cli("glab", "gitlab.com", {**env, "REPO_STATS_FAKE_URL": srv.url}) as cli:
+                prs = rs.fetch_gitlab(cli, "g/p", None, "main", False, None, True, progress=lambda m: None, info=info)
         return prs, info
 
     def test_notes_failure_is_not_unreviewed(self) -> None:
@@ -2310,7 +2340,7 @@ class F2_GitLabDetailErrors(unittest.TestCase):
             """Fail every notes request with 500."""
             return (500, {}, {"message": "boom"}) if req["path"].endswith("/notes") else base(req)
 
-        with mock.patch.object(rs.time, "sleep", lambda s: None), ms.MockServer(h) as srv:
+        with mock.patch.object(rs, "_backoff", lambda s: None), ms.MockServer(h) as srv:
             d, _ = collect(r, "--fake-api", srv.url, env={"GITLAB_TOKEN": FAKE})
         self.assertTrue(any("lookups fail" in w for w in d["meta"]["warnings"]))
         self.assertTrue(all(p["reviewed"] is None for p in d["prs"]))
@@ -2437,9 +2467,11 @@ class G1_ReadOnlyCli(unittest.TestCase):
     """Every API request is a read-only gh/glab call to an explicit host, from outside the repository."""
 
     def _cli(self, tool: str, url: str = "http://127.0.0.1:1", **extra: str) -> rs.Cli:
-        """A Cli for `tool` that uses the fake CLIs and the mock server at `url`."""
-        return rs.Cli(tool, "github.com" if tool == "gh" else "gitlab.com",
-                      helpers.clean_env({"REPO_STATS_FAKE_URL": url, **extra}))
+        """A Cli for `tool` that uses the fake CLIs and the mock server at `url`; closed after the test."""
+        cli = rs.Cli(tool, "github.com" if tool == "gh" else "gitlab.com",
+                     helpers.clean_env({"REPO_STATS_FAKE_URL": url, **extra}))
+        self.addCleanup(cli.close)
+        return cli
 
     def test_graphql_refuses_mutations(self) -> None:
         """Mutations, subscriptions and anything that is not a query are refused before gh runs."""
@@ -2491,7 +2523,7 @@ class G1_ReadOnlyCli(unittest.TestCase):
         self.assertTrue(any("needs --provider" in w for w in d["meta"]["warnings"]))
 
     def test_every_call_is_read_only_explicit_host_and_outside_the_repo(self) -> None:
-        """Each gh/glab call has --hostname and --include, no write flags, and runs from the system temp dir."""
+        """Each gh/glab call has --hostname and --include, no write flags, and runs from a private temp dir."""
         for remote, provider_env, handler_for in (
                 ("https://github.com/acme/widgets.git", "GITHUB_TOKEN",
                  lambda r: ms.github_handler(desc_nodes(github_nodes(r)), page_size=3)),
@@ -2515,7 +2547,20 @@ class G1_ReadOnlyCli(unittest.TestCase):
                     self.assertEqual(argv[1], "graphql")
                     query = next(a for a in argv if a.startswith("query="))[len("query="):]
                     self.assertTrue(rs.READ_ONLY_GRAPHQL.match(query))
-                self.assertEqual(Path(c["cwd"]).resolve(), Path(tempfile.gettempdir()).resolve())
+                self.assertEqual(Path(c["cwd"]).resolve().parent, Path(tempfile.gettempdir()).resolve())
+                self.assertTrue(Path(c["cwd"]).name.startswith("repo-stats-cli-"), c["cwd"])
+            # One private directory per run, and it is gone afterwards.
+            self.assertEqual(len({c["cwd"] for c in calls}), 1)
+            self.assertFalse(Path(calls[0]["cwd"]).exists())
+
+    def test_cli_working_directory_is_private_and_empty(self) -> None:
+        """The CLI's working directory is new, empty and mode 0700, so nobody can plant a .git in it."""
+        with rs.Cli("gh", "github.com", helpers.clean_env()) as cli:
+            cwd = Path(cli._cwd.name)
+            self.assertEqual(list(cwd.iterdir()), [])
+            if os.name == "posix":
+                self.assertEqual(cwd.stat().st_mode & 0o777, 0o700)
+        self.assertFalse(cwd.exists())
 
     def test_cli_environment_has_no_telemetry_or_debug_switches(self) -> None:
         """glab runs with telemetry off, and neither CLI gets request-dumping debug flags."""
@@ -2612,6 +2657,31 @@ class G2_GitLabJobToken(unittest.TestCase):
         self.assertTrue(p1["reviewed"])  # notes still work with a job token
         self.assertIsNone(by_number(d)[4]["first_commit"])  # open, no local commit: stays unknown
 
+    def test_404_on_the_probed_mr_does_not_stop_other_lookups(self) -> None:
+        """A 404 on one MR's commits is about that MR, not the login: the other MRs still get commit data."""
+        r = api_repo("git@gitlab.com:grp/sub/proj.git")
+        mrs, commits, notes = gitlab_fixture(r)
+        inner = ms.gitlab_handler(mrs, commits, notes, page_size=50)
+        first: list[str] = []
+
+        def h(req: ms.Request) -> ms.Response:
+            """Answer 404 for the commits of the first MR asked about; serve everything else."""
+            if req["path"].endswith("/commits"):
+                if not first:
+                    first.append(req["path"])
+                if req["path"] == first[0]:
+                    return 404, {}, {"message": "404 Not Found"}
+            return inner(req)
+
+        with ms.MockServer(h) as srv:
+            d, _ = collect(r, "--fake-api", srv.url, env={"GITLAB_TOKEN": FAKE})
+            commit_paths = {q["path"] for q in srv.requests if q["path"].endswith("/commits")}
+        self.assertEqual(d["meta"]["mode"], "api")
+        self.assertGreater(len(commit_paths), 1, "lookups continue after a 404")
+        self.assertFalse(any("cannot read merge request commits" in w for w in d["meta"]["warnings"]))
+        self.assertTrue(any("1 merge request(s) had commit or review lookups fail" in w for w in d["meta"]["warnings"]),
+                        d["meta"]["warnings"])
+
     def test_job_token_autologin_reaches_the_api(self) -> None:
         """With GLAB_ENABLE_CI_AUTOLOGIN in GitLab CI, glab authenticates with CI_JOB_TOKEN by itself."""
         r = api_repo("git@gitlab.com:grp/sub/proj.git")
@@ -2648,8 +2718,8 @@ class H1_ReviewCycles(unittest.TestCase):
         mr = ms.gl_mr(1, "feat: x", BASE, merged=merged)
         env = helpers.clean_env({"GITLAB_TOKEN": FAKE})
         with ms.MockServer(ms.gitlab_handler([mr], {1: [ms.gl_commit(BASE)]}, {1: list(notes)})) as srv:
-            cli = rs.Cli("glab", "gitlab.com", {**env, "REPO_STATS_FAKE_URL": srv.url})
-            return rs.fetch_gitlab(cli, "g/p", None, "main", False, None, want_reviews, progress=lambda m: None)[0]
+            with rs.Cli("glab", "gitlab.com", {**env, "REPO_STATS_FAKE_URL": srv.url}) as cli:
+                return rs.fetch_gitlab(cli, "g/p", None, "main", False, None, want_reviews, progress=lambda m: None)[0]
 
     # -- the counting rule
 

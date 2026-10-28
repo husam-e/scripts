@@ -98,6 +98,8 @@ Both options are optional, and you can use either one alone.
 
 repo-stats never reads, stores or sends a token. `gh` and `glab` find their own login, in this order: an environment variable (`GH_TOKEN`, `GITLAB_TOKEN`), then the login saved by `gh auth login` or `glab auth login` (in the OS keychain where there is one).
 
+NOTE: `gh` reads `GH_TOKEN` only for github.com and `*.ghe.com`. For GitHub Enterprise Server, name the variable `GH_ENTERPRISE_TOKEN` instead.
+
 === On your machine
 
 Use the login you already have, or run `gh auth login` / `glab auth login` once. Nothing else is needed.
@@ -132,6 +134,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: husam-e/scripts
+          ref: <full commit SHA>                  # pin a commit you have reviewed: it runs next to the token
           path: tools
       - run: python3 tools/repo-stats/repo_stats.py . -o repo-stats.html
         env:
@@ -143,6 +146,7 @@ jobs:
 ----
 
 Set `GH_TOKEN` on this step only, so other steps never see it.
+On GitHub Enterprise Server, set `GH_ENTERPRISE_TOKEN: ${{ github.token }}` instead; `gh` ignores `GH_TOKEN` there.
 To analyse another private repository, use a GitHub App installation token (for example from `actions/create-github-app-token`), not a personal token.
 
 === GitLab CI
@@ -154,9 +158,12 @@ repo-stats:
   variables:
     GIT_DEPTH: 0                                        # full history
     GLAB_ENABLE_CI_AUTOLOGIN: "true"                    # glab signs in with the job's CI_JOB_TOKEN
+    REPO_STATS_SHA: "<full commit SHA>"                 # pin a commit you have reviewed: it runs next to the token
   script:
     - apk add --no-cache python3
-    - git clone --depth 1 https://github.com/husam-e/scripts.git /tmp/tools
+    - git init -q /tmp/tools
+    - git -C /tmp/tools fetch -q --depth 1 https://github.com/husam-e/scripts.git "$REPO_STATS_SHA"
+    - git -C /tmp/tools checkout -q FETCH_HEAD
     - python3 /tmp/tools/repo-stats/repo_stats.py . -o repo-stats.html
   artifacts:
     paths: [repo-stats.html]
@@ -197,7 +204,7 @@ repo-stats never handles a credential:
 
 * It never reads a token variable. `gh` and `glab` read their own.
 * The API host is `github.com` or `gitlab.com` from the remote, or the `--hostname` you pass. It is never taken from any other remote, because `gh` and `glab` send environment tokens to whatever host they are given. A lookalike remote such as `github.evil.example` starts no CLI at all.
-* The CLI always gets `--hostname` and runs from the system temp directory, never the analysed repository, so `glab` cannot pick up a host from the repository's remote. glab telemetry (which sends its own request with the credential) and the CLIs' request-logging debug switches are turned off for these calls.
+* The CLI always gets `--hostname` and runs from a new, empty, private temporary directory (mode 0700), never the analysed repository or the shared temp directory, so `glab` cannot pick up a host or config from a repository's `.git`. glab telemetry (which sends its own request with the credential) and the CLIs' request-logging debug switches are turned off for these calls.
 * git runs without the credential variables (`GH_TOKEN`, `GITLAB_TOKEN`, `CI_JOB_TOKEN` and the like), so hooks or filters in the analysed repository cannot read them.
 * No token is written to any output.
 
