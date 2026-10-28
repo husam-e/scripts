@@ -970,24 +970,28 @@ def count_review_cycles(events: Iterable[Tuple[int, str, Optional[str]]], cap: i
     """Count review cycles from (time, kind, version) events; return (cycles, capped).
 
     kind is "review" or "push". A cycle starts at the first review of a version that no earlier review
-    covered: when the reviewed version (a commit oid) differs from the previous review's, or, for events
-    without a version, at the first review after a push. Reviews of the same version are one cycle, and a
-    push that nobody reviews before the merge starts none. Counting stops at `cap` (capped is then True).
+    covered: a version (a commit oid) not seen in any earlier review, or, for events without a version, the
+    first review after a push. Reviews of an already reviewed version are part of an earlier cycle (on
+    GitHub, a reply to an old review thread is a new review of the old commit), and a push that nobody
+    reviews before the merge starts none. Counting stops at `cap` (capped is then True).
     """
     cycles = 0
-    fresh = True  # the next review sees a version that no review has covered yet
-    last_version: Optional[str] = None
+    fresh = True  # the next version-less review sees code that no review has covered yet
+    seen: set[str] = set()
     for _, kind, version in sorted(events, key=lambda e: (e[0], e[1] != "push")):
         if kind == "push":
             fresh = True
             continue
-        if fresh or (version is not None and last_version is not None and version != last_version):
+        if version is not None:
+            new = version not in seen
+            seen.add(version)
+        else:
+            new = fresh
+        fresh = False
+        if new:
             cycles += 1
             if cycles >= cap:
                 return cap, True
-        fresh = False
-        if version is not None:
-            last_version = version
     return cycles, False
 
 

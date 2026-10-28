@@ -1066,7 +1066,7 @@ function renderMethod(app) {
   const rv = card(grid, "Review cycles", { wide: true, note: "API data only. Reviews by the author, by bots, still pending, or submitted after the merge are ignored." });
   rv.body.append(h("dl", { class: "method" },
     h("dt", null, "Cycle"), h("dd", null, "One round of review on one version of the PR. A PR approved on first look has 1 cycle; changes requested, a fix pushed and an approval make 2. Several reviewers on the same version are one cycle, and a push nobody reviewed before the merge adds none."),
-    h("dt", null, "GitHub"), h("dd", null, "Each review names the head commit it was made against. A review of a different commit from the previous review starts a new cycle, so force-pushes and rebases count correctly."),
+    h("dt", null, "GitHub"), h("dd", null, "Each review names the head commit it was made against. The first review of a commit no earlier review covered starts a new cycle, so force-pushes and rebases count correctly, and replies to an older review thread (filed against the older commit) do not add cycles."),
     h("dt", null, "GitLab"), h("dd", null, "From the merge request's notes: comments and approvals by other people are reviews, and \"added N commits\" system notes are pushes. A cycle is the reviews between two pushes. GitLab gives no changes-requested count."),
     h("dt", null, "Unreviewed"), h("dd", null, "Merged PRs with 0 cycles. Statistics are shown both without them (reviewed PRs only) and with them counted as 0, and their number is shown on its own."),
     h("dt", null, "Limits"), h("dd", null, `Counting stops at ${META.heuristics.review_cycle_cap} cycles, and GitHub returns at most 100 reviews per PR; such values are lower bounds.`)));

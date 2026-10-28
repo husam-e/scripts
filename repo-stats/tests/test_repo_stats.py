@@ -2664,6 +2664,17 @@ class H1_ReviewCycles(unittest.TestCase):
         self.assertEqual(c([(1, "review", None), (2, "push", None)]), (1, False))  # unreviewed final push
         self.assertEqual(c([(3, "review", None), (1, "review", None), (2, "push", None)]), (2, False))  # any order
         self.assertEqual(c([(1, "review", "a"), (2, "review", None), (3, "review", "a")]), (1, False))  # unknown oid
+        # Replies to an older review thread are reviews of the older commit: A, B, A, B is two versions.
+        self.assertEqual(c([(1, "review", "a"), (2, "review", "b"), (3, "review", "a"), (4, "review", "b")]), (2, False))
+        self.assertEqual(c([(1, "review", "a"), (2, "review", "b"), (3, "review", "a"), (4, "review", "c")]), (3, False))
+
+    def test_github_replies_to_old_threads_add_no_cycles(self) -> None:
+        """A real pattern (googleapis/librarian#7469): ten reviews of f4b2, then replies alternating with 91bc."""
+        b, h = BASE, self.H
+        oids = ["f4b2"] * 10 + ["91bc", "91bc", "f4b2", "91bc", "f4b2", "91bc"]
+        p = self._gh([("bob" if i % 2 else "carol", "User", "COMMENTED", b + i * 60, oid) for i, oid in enumerate(oids)]
+                     + [("bob", "User", "APPROVED", b + h, "91bc")])
+        self.assertEqual(p["review_cycles"], 2)
 
     def test_cap(self) -> None:
         """Counting stops at the cap and says so."""
