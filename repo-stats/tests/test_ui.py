@@ -253,6 +253,10 @@ def build_api_data() -> dict[str, Any]:
             gap = max(1, (approved - ready - 60) // (rounds + 1))
             reviews = [("carol", "User", "CHANGES_REQUESTED", approved - gap * (rounds - k), f"v{k}") for k in range(rounds)]
             reviews.append(("bob", "User", "APPROVED", approved, f"v{rounds}"))
+        elif i % 3 == 0:
+            reviews = [(author, atype, "COMMENTED", merged - 120, "s1"), (author, atype, "COMMENTED", merged - 60, "s2")]  # self only
+        elif i % 3 == 1:
+            reviews = [("helper[bot]", "Bot", "COMMENTED", merged - 60, "b1")]  # bot only
         title = p["title"]
         if i == 7:
             title = "feat!: " + EVIL
@@ -683,7 +687,8 @@ class UiTests(unittest.TestCase):
         self.assertAlmostEqual(cast(float, parse_num(k["Median review cycles"]["value"])), cast(float, percentile(reviewed, 50)), delta=0.051)
         self.assertEqual(int(k["Merged without review"]["value"]), len(known) - len(reviewed))
         rows = {r[0]: r for r in snap["cycles"]}
-        for label, vals in (("Review cycles, reviewed PRs only", reviewed), ("Review cycles, unreviewed PRs counted as 0", known)):
+        for label, vals in (("Review cycles by others, PRs reviewed by others only", reviewed),
+                            ("Review cycles by others, other PRs counted as 0", known)):
             want = cast(dict, stat_row(vals))
             for i, col in enumerate(COLS):
                 with self.subTest(label, col=col):

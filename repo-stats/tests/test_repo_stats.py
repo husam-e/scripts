@@ -544,6 +544,14 @@ class A11_Options(unittest.TestCase):
         self.assertEqual([p["number"] for p in d["prs"]], [1, 2])
         self.assertEqual([x["name"] for x in d["deploys"]], ["v1.0.0"])
 
+    def test_window_is_recorded_in_meta(self) -> None:
+        """The --since / --until window is in meta, so the dashboard clamps its date range to it."""
+        d, _ = collect(merge_repo(), "--since", "2022-01-05", "--until", "2022-01-06")
+        self.assertEqual((d["meta"]["since"], d["meta"]["until"]), (T0 + 4 * DAY, T0 + 6 * DAY))
+        self.assertLess(d["loc"]["days"][0][0], d["meta"]["since"])  # lines of code still cover the whole history
+        d, _ = collect(merge_repo())
+        self.assertEqual((d["meta"]["since"], d["meta"]["until"]), (None, None))
+
     def test_until_is_inclusive_of_that_day_only(self) -> None:
         """--until includes its whole day and nothing after it."""
         r = Repo()
@@ -2811,6 +2819,56 @@ class H1_ReviewCycles(unittest.TestCase):
         p = self._gh([("bob", "User", "APPROVED", BASE + self.H, "c1")], review_total=150)
         self.assertIn("review_cycles", p["inferred"])
 
+    # -- self and bot reviews
+
+    def test_github_review_status(self) -> None:
+        """A merged PR takes its strongest pre-merge review: others > self > bot > none."""
+        b, h = BASE, self.H
+        mine, bot, bob = ("alice", "User", "COMMENTED"), ("ci[bot]", "Bot", "COMMENTED"), ("bob", "User", "APPROVED")
+        self.assertEqual(self._gh([(*bot, b + h, "c1"), (*mine, b + 2 * h, "c1"), (*bob, b + 3 * h, "c1")])["review_status"], "others")
+        self.assertEqual(self._gh([(*bot, b + h, "c1"), (*mine, b + 2 * h, "c1")])["review_status"], "self")
+        self.assertEqual(self._gh([(*bot, b + h, "c1"), (*bob, b + 30 * h, "c1")])["review_status"], "bot")  # bob after merge
+        self.assertEqual(self._gh([("carol", "User", "PENDING", b + h, "c1")])["review_status"], "none")
+        self.assertIsNone(rs.github_pr(ms.gh_node(1, "feat: x", BASE, reviews=[(*bob, b + h, "c1")]))["review_status"])  # open
+
+    def test_github_self_and_bot_cycles_group_by_version(self) -> None:
+        """A batch, single comments and replies on one version are one cycle per reviewer kind."""
+        b, h = BASE, self.H
+        p = self._gh([("ci[bot]", "Bot", "COMMENTED", b + h, "c1"),                       # agent review of v1
+                      ("alice", "User", "COMMENTED", b + h + 60, "c1"),                     # author replies, one by one,
+                      ("alice", "User", "COMMENTED", b + h + 120, "c1"),                    # to the bot's threads
+                      ("alice", "User", "COMMENTED", b + 2 * h, "c2"),                      # self-review of v2 ...
+                      ("alice", "User", "COMMENTED", b + 2 * h + 60, "c2"),                 # ... in several comments
+                      ("ci[bot]", "Bot", "COMMENTED", b + 3 * h, "c3"),                     # agent re-review of v3
+                      ("ci[bot]", "Bot", "COMMENTED", b + 3 * h + 60, "c3")])
+        self.assertEqual((p["review_cycles"], p["self_review_cycles"], p["bot_review_cycles"]), (0, 2, 2))
+        self.assertEqual((p["review_status"], p["reviewed"], p["first_review"], p["reviewers"]), ("self", False, None, 0))
+        self.assertEqual(p["inferred"], [])
+
+    def test_self_review_does_not_clear_unreviewed_risk(self) -> None:
+        """Self and bot reviews keep the unreviewed risk factor, and its detail says why."""
+        _, _, factors = rs.risk_for({"type": "fix", "breaking": False, "reviewed": False, "review_status": "self"})
+        self.assertEqual([f["detail"] for f in factors if f["name"] == "unreviewed"],
+                         ["merged with no review from another person (self-review only)"])
+        _, _, factors = rs.risk_for({"type": "fix", "breaking": False, "reviewed": False, "review_status": "bot"})
+        self.assertIn("(bot review only)", [f["detail"] for f in factors if f["name"] == "unreviewed"][0])
+
+    def test_gitlab_self_and_bot_cycles(self) -> None:
+        """GitLab author notes and self-approvals are self-reviews and bot notes are bot reviews, split by pushes."""
+        b, h = BASE, self.H
+        p = self._gl([ms.gl_note("ci-bot", b + h, bot=True), ms.gl_note("alice", b + h + 60), ms.gl_note("alice", b + h + 90),
+                      ms.gl_push("alice", b + 2 * h), ms.gl_note("ci-bot", b + 3 * h, bot=True),
+                      ms.gl_approval("alice", b + 3 * h + 60)])
+        self.assertEqual((p["review_cycles"], p["self_review_cycles"], p["bot_review_cycles"]), (0, 2, 2))
+        self.assertEqual((p["review_status"], p["reviewed"]), ("self", False))
+        p = self._gl([ms.gl_note("ci-bot", b + h, bot=True)])
+        self.assertEqual((p["review_status"], p["bot_review_cycles"], p["self_review_cycles"]), ("bot", 1, 0))
+        p = self._gl([ms.gl_note("alice", b + h), ms.gl_note("bob", b + 2 * h)])
+        self.assertEqual((p["review_status"], p["review_cycles"], p["self_review_cycles"]), ("others", 1, 1))
+        p = self._gl([ms.gl_note("bob", BASE + self.H)], want_reviews=False)
+        self.assertIsNone(p["review_status"])
+        self.assertIsNone(p["self_review_cycles"])
+
     def test_github_query_asks_for_review_commits(self) -> None:
         """The GraphQL query requests the reviewed commit and the review total, and stays read-only."""
         self.assertIn("commit{oid}", rs.GITHUB_QUERY)
@@ -2825,6 +2883,9 @@ class H1_ReviewCycles(unittest.TestCase):
             d, _ = collect(r, "--fake-api", srv.url, env={"GITHUB_TOKEN": FAKE})
         prs = by_number(d)
         self.assertEqual((prs[1]["review_cycles"], prs[1]["reviewers"]), (1, 1))
+        self.assertEqual((prs[1]["review_status"], prs[1]["self_review_cycles"], prs[1]["bot_review_cycles"]), ("others", 1, 1))
+        self.assertEqual((prs[10]["review_status"], prs[10]["self_review_cycles"]), ("self", 1))
+        self.assertIsNone(prs[6]["review_status"])
         self.assertEqual(prs[3]["changes_requested"], 1)
         self.assertEqual(prs[10]["review_cycles"], 0)
         self.assertFalse(prs[10]["reviewed"])

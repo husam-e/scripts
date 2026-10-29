@@ -236,6 +236,10 @@ const allTimes = [].concat(PRS.map((p) => p.merged || p.created), PRS.map((p) =>
 let DATA_LO = Infinity, DATA_HI = -Infinity;
 for (const t of allTimes) { if (t < DATA_LO) DATA_LO = t; if (t > DATA_HI) DATA_HI = t; } // no Math.min(...big array)
 if (!isFinite(DATA_LO)) { DATA_LO = DATA_HI = Math.floor(Date.now() / 1000); }
+// With --since / --until, lines of code still cover the whole history (so totals are right): clamp to the window.
+if (META.since != null) DATA_LO = Math.max(DATA_LO, META.since);
+if (META.until != null) DATA_HI = Math.min(DATA_HI, META.until - 1);
+if (DATA_LO > DATA_HI) DATA_LO = DATA_HI;
 const TYPE_GROUPS = ["feat", "fix", "refactor", "docs", "test", "chore", "perf", "other"];
 const GROUP_OF = { style: "chore", build: "chore", ci: "chore", revert: "other" };
 const groupOf = (t) => TYPE_GROUPS.includes(t) ? t : (GROUP_OF[t] || "other");
@@ -662,6 +666,15 @@ function cycleSplit(prs) {
   const unreviewed = known.filter((p) => p.review_cycles === 0);
   return { known, reviewed, unreviewed, stReviewed: stats(reviewed.map((p) => p.review_cycles)), stAll: stats(known.map((p) => p.review_cycles)) };
 }
+/** Review status of a merged PR, strongest first (REVIEW_STATUSES in repo_stats.py): [key, label, color var, meaning]. */
+const REVIEW_CATS = [
+  ["others", "Reviewed (by others)", "--c1", "a review from a person other than the author"],
+  ["self", "Reviewed (self)", "--c3", "reviews only from the author's own account, including agents acting with the author's credentials"],
+  ["bot", "Reviewed (bot)", "--c7", "reviews only from bot accounts"],
+  ["none", "Unreviewed", "--st-crit", "no review before merge"],
+];
+/** A PR's review status; "others" whenever it has a review cycle by others. */
+const statusOf = (p) => p.review_cycles > 0 ? "others" : (p.review_status && p.review_status !== "others" ? p.review_status : "none");
 
 /* ------------------------------------------------------------------ sections */
 const METRICS = [
@@ -694,7 +707,7 @@ function renderKpis(app, sel) {
     kpi("Median PR size", merged.length ? fmtInt(size.median) : "–", `lines changed · p90 ${fmtInt(size.p90)}`),
     kpi("Median lead time", fmtDur(lead.median), `${lm.label} · p90 ${fmtDur(lead.p90)}`, band("lead", lead.median)),
     kpi("Median review cycles", cyc.reviewed.length ? fmtNum(cyc.stReviewed.median) : "–", cyc.known.length ? `reviewed PRs · p90 ${fmtNum(cyc.stReviewed.p90)} · ${fmtNum(cyc.stAll.median)} incl. unreviewed` : noCyc),
-    kpi("Merged without review", cyc.known.length ? fmtInt(cyc.unreviewed.length) : "–", cyc.known.length ? `${fmtPct(cyc.unreviewed.length / cyc.known.length)} of merged PRs` : noCyc),
+    kpi("Merged without review", cyc.known.length ? fmtInt(cyc.unreviewed.length) : "–", cyc.known.length ? `${fmtPct(cyc.unreviewed.length / cyc.known.length)} of merged PRs · ${fmtInt(cyc.unreviewed.filter((p) => statusOf(p) === "self").length)} self-reviewed · ${fmtInt(cyc.unreviewed.filter((p) => statusOf(p) === "bot").length)} bot only` : noCyc),
     kpi("Releases", fmtInt(deploys.length), deploys.length ? `${fmtNum(freq * 7)} per week` : "no release tags matched", deploys.length ? band("freq", freq) : null),
     kpi("Change failure rate", fmtPct(cfr), `${fails} revert/hotfix PRs`, band("cfr", cfr)),
     kpi("High or critical risk", fmtPct(hiRisk), "share of merged PRs"),
@@ -928,7 +941,7 @@ function renderTime(app, sel) {
 }
 
 function renderReviews(app, sel) {
-  sectionHead(app, "reviews", "Review cycles", "How many rounds of review each merged PR went through. A cycle starts when someone other than the author reviews a version of the code that no earlier review covered.");
+  sectionHead(app, "reviews", "Review cycles", "How many rounds of review each merged PR went through. A cycle starts when a reviewer looks at a version of the code that no earlier review of theirs covered, so a batch of comments, a run of single comments or replies, and several reviews of one version all count once. Cycles by others, self-review cycles and bot cycles are counted separately.");
   const grid = h("div", { class: "grid" });
   app.append(grid);
   const cyc = cycleSplit(sel.merged);
@@ -941,35 +954,46 @@ function renderReviews(app, sel) {
   }
   const lowerBound = inferredShare(prs, "review_cycles");
   const t = card(grid, "Review cycle statistics", { wide: true });
+  const ownCycles = (key) => prs.filter((p) => p[key] > 0).map((p) => p[key]);
   const rows = [
-    { key: "review_cycles", label: "Review cycles, reviewed PRs only", st: cyc.stReviewed, fmt: fmtNum },
-    { key: "review_cycles", label: "Review cycles, unreviewed PRs counted as 0", st: cyc.stAll, fmt: fmtNum },
+    { key: "review_cycles", label: "Review cycles by others, PRs reviewed by others only", st: cyc.stReviewed, fmt: fmtNum },
+    { key: "review_cycles", label: "Review cycles by others, other PRs counted as 0", st: cyc.stAll, fmt: fmtNum },
+    { key: "self_review_cycles", label: "Self-review cycles, self-reviewed PRs only", st: stats(ownCycles("self_review_cycles")), fmt: fmtNum },
+    { key: "bot_review_cycles", label: "Bot review cycles, bot-reviewed PRs only", st: stats(ownCycles("bot_review_cycles")), fmt: fmtNum },
     { key: "changes_requested", label: "Changes-requested reviews per PR", st: stats(prs.map((p) => p.changes_requested)), fmt: fmtNum },
-    { key: "reviewers", label: "Reviewers per PR", st: stats(prs.map((p) => p.reviewers)), fmt: fmtNum },
+    { key: "reviewers", label: "Reviewers per PR (others)", st: stats(prs.map((p) => p.reviewers)), fmt: fmtNum },
   ];
   t.body.append(statsTable(rows, [{ name: "Source", value: (r) => {
     if (!r.st.n) return r.key === "changes_requested" ? "GitHub only" : "n/a";
-    return r.key === "review_cycles" && lowerBound ? fmtPct(lowerBound) + " lower bound" : "exact";
+    const lb = r.key.endsWith("review_cycles") ? inferredShare(prs, r.key) : null;
+    return lb ? fmtPct(lb) + " lower bound" : "exact";
   } }]));
   const missing = sel.merged.length - prs.length;
-  t.body.append(h("p", { class: "note" }, `${fmtInt(cyc.unreviewed.length)} of ${fmtInt(prs.length)} merged PRs (${fmtPct(cyc.unreviewed.length / prs.length)}) were merged with no review from anyone but the author.`
+  const byStatus = groupBy(prs, statusOf);
+  const n = (k) => (byStatus.get(k) || []).length;
+  t.body.append(h("p", { class: "note" }, `${fmtInt(cyc.unreviewed.length)} of ${fmtInt(prs.length)} merged PRs (${fmtPct(cyc.unreviewed.length / prs.length)}) were merged with no review from anyone but the author: ${fmtInt(n("self"))} self-reviewed, ${fmtInt(n("bot"))} reviewed only by bots and ${fmtInt(n("none"))} with no review at all.`
     + (missing ? ` ${fmtInt(missing)} merged PR(s) have no review data and are left out.` : "")
     + (lowerBound ? " A lower bound means the PR had more reviews than one API page returns, or reached the counting cap." : "")));
 
   const B = META.heuristics.review_cycle_buckets, top = B[B.length - 1];
   const bucketOf = (v) => Math.min(v, top);
-  const bc = card(grid, "PRs by number of review cycles", { note: `The last bar is ${top} or more cycles. 0 means merged with no review.` });
+  const bc = card(grid, "PRs by number of review cycles by others", { note: `The last bar is ${top} or more cycles. PRs with 0 cycles by others are split by who else reviewed them.` });
   barChart(bc.body, { cats: B.map((b) => ({ short: b === top ? b + "+" : String(b), long: (b === top ? b + " or more" : String(b)) + (b === 1 ? " cycle" : " cycles") })),
-    series: [{ name: "Unreviewed", color: css("--st-crit"), vals: B.map((b) => b === 0 ? cyc.unreviewed.length : 0) },
-      { name: "Reviewed", color: css("--c1"), vals: B.map((b) => b === 0 ? 0 : cyc.reviewed.filter((p) => bucketOf(p.review_cycles) === b).length) }],
+    series: REVIEW_CATS.map(([k, label, color]) => ({ name: label, color: css(color),
+      vals: B.map((b) => k === "others" ? (b === 0 ? 0 : cyc.reviewed.filter((p) => bucketOf(p.review_cycles) === b).length) : (b === 0 ? n(k) : 0)) })),
     stacked: true, label: "PRs by number of review cycles", table: bc.table, catName: "Review cycles" });
 
-  const uc = card(grid, "Reviewed and unreviewed PRs by month", { note: "Merged PRs with review data, stacked." });
+  const uc = card(grid, "Review status by month", { note: "Merged PRs with review data, stacked. Each PR counts once, under the strongest review it got: " + REVIEW_CATS.map(([, l, , d]) => `${l}, ${d}`).join("; ") + "." });
   const months = countBuckets([], "month", sel.r.lo, sel.r.hi).map((b) => b.t);
   barChart(uc.body, { cats: months.map((m) => ({ short: bucketLabel(m, "month"), long: bucketLabel(m, "month") })),
-    series: [{ name: "Reviewed", color: css("--c1"), vals: months.map((m) => cyc.reviewed.filter((p) => bucketStart(p.merged, "month") === m).length) },
-      { name: "Unreviewed", color: css("--st-crit"), vals: months.map((m) => cyc.unreviewed.filter((p) => bucketStart(p.merged, "month") === m).length) }],
-    stacked: true, label: "Reviewed and unreviewed PRs by month", table: uc.table, catName: "Month" });
+    series: REVIEW_CATS.map(([k, label, color]) => ({ name: label, color: css(color), vals: months.map((m) => (byStatus.get(k) || []).filter((p) => bucketStart(p.merged, "month") === m).length) })),
+    stacked: true, label: "Review status by month", table: uc.table, catName: "Month" });
+
+  const kc = card(grid, "Review cycles by reviewer", { wide: true, note: `PRs by number of cycles from each kind of reviewer. A PR can appear in more than one series, for example with 1 bot cycle, 2 self-review cycles and 1 cycle by others. The last bar is ${top} or more.` });
+  const kinds = [["review_cycles", ...REVIEW_CATS[0].slice(1, 3)], ["self_review_cycles", ...REVIEW_CATS[1].slice(1, 3)], ["bot_review_cycles", ...REVIEW_CATS[2].slice(1, 3)]];
+  barChart(kc.body, { cats: B.filter((b) => b > 0).map((b) => ({ short: b === top ? b + "+" : String(b), long: (b === top ? b + " or more" : String(b)) + (b === 1 ? " cycle" : " cycles") })),
+    series: kinds.map(([key, label, color]) => ({ name: label, color: css(color), vals: B.filter((b) => b > 0).map((b) => prs.filter((p) => p[key] > 0 && bucketOf(p[key]) === b).length) })),
+    label: "PRs by number of review cycles, by reviewer", table: kc.table, catName: "Review cycles" });
 
   const tc = card(grid, "Review cycles over time", { wide: true, note: "Median and p90 of reviewed PRs, and the mean with unreviewed PRs counted as 0, by month. Months with no reviewed PR are skipped." });
   const byM = groupBy(prs, (p) => bucketStart(p.merged, "month"));
@@ -1066,12 +1090,14 @@ function renderMethod(app) {
     h("dt", null, "Time to restore"), h("dd", null, "For reverts whose message says \"This reverts commit <sha>\": time from the reverted change's merge to the revert's merge."),
     h("dt", null, "Performance bands"), h("dd", null, "Elite, High, Medium and Low use rounded thresholds from published DORA reports: frequency ≥ daily / ≥ weekly / ≥ monthly; lead time < 1 day / < 1 week / < 1 month; failure rate ≤ 5% / 10% / 15%; restore < 1 hour / < 1 day / < 1 week. DORA revises its definitions, so treat bands as rough.")));
 
-  const rv = card(grid, "Review cycles", { wide: true, note: "API data only. Reviews by the author, by bots, still pending, or submitted after the merge are ignored." });
+  const rv = card(grid, "Review cycles", { wide: true, note: "API data only. Reviews still pending or submitted after the merge are ignored." });
   rv.body.append(h("dl", { class: "method" },
-    h("dt", null, "Cycle"), h("dd", null, "One round of review on one version of the PR. A PR approved on first look has 1 cycle; changes requested, a fix pushed and an approval make 2. Several reviewers on the same version are one cycle, and a push nobody reviewed before the merge adds none."),
-    h("dt", null, "GitHub"), h("dd", null, "Each review names the head commit it was made against. The first review of a commit no earlier review covered starts a new cycle, so force-pushes and rebases count correctly, and replies to an older review thread (filed against the older commit) do not add cycles."),
-    h("dt", null, "GitLab"), h("dd", null, "From the merge request's notes: comments and approvals by other people are reviews, and \"added N commits\" system notes are pushes. A cycle is the reviews between two pushes. GitLab gives no changes-requested count."),
-    h("dt", null, "Unreviewed"), h("dd", null, "Merged PRs with 0 cycles. Statistics are shown both without them (reviewed PRs only) and with them counted as 0, and their number is shown on its own."),
+    h("dt", null, "Cycle"), h("dd", null, "One round of review on one version of the PR. A PR approved on first look has 1 cycle; changes requested, a fix pushed and an approval make 2. Several reviewers on the same version are one cycle, and a push nobody reviewed before the merge adds none. A batched review, a run of single comments, replies and several reviews of one version all fall in the same cycle."),
+    h("dt", null, "Who reviewed"), h("dd", null, "Each review is classified by its account. The PR author's own account is a self-review, including agents that post with the author's credentials, which the API cannot tell apart from the author. A bot account (a GitHub App, or a login ending in [bot] or -bot) is a bot review. Anyone else is a review by others. Cycles are counted separately for each; the headline cycle count, pickup time and review time use reviews by others only."),
+    h("dt", null, "Review status"), h("dd", null, "Each merged PR counts once, under the strongest review it got: by others, then self, then bot, then unreviewed."),
+    h("dt", null, "GitHub"), h("dd", null, "Each review names the head commit it was made against. The first review of a commit no earlier review covered starts a new cycle, so force-pushes and rebases count correctly, and replies to an older review thread (filed against the older commit) do not add cycles. Every inline comment or reply that is not part of a batched review is its own review object, so it counts as review activity."),
+    h("dt", null, "GitLab"), h("dd", null, "From the merge request's notes: comments and approvals are reviews, and \"added N commits\" system notes are pushes. A cycle is the reviews between two pushes. GitLab gives no changes-requested count."),
+    h("dt", null, "Unreviewed"), h("dd", null, "Merged PRs with 0 cycles by others. Statistics are shown both without them and with them counted as 0, and their number is shown on its own, split into self-reviewed, bot-reviewed and not reviewed at all."),
     h("dt", null, "Limits"), h("dd", null, `Counting stops at ${META.heuristics.review_cycle_cap} cycles, and GitHub returns at most 100 reviews per PR; such values are lower bounds.`)));
 
   const rk = card(grid, "Risk score rules", { wide: true, note: "Points add up and are capped at " + R.cap + ". Rules that need data the source lacks are skipped, never guessed." });
@@ -1083,7 +1109,7 @@ function renderMethod(app) {
     h("dt", null, "Breaking change"), h("dd", null, `+${R.breaking} when the title has ! after the type or says BREAKING CHANGE.`),
     h("dt", null, "Sensitive paths"), h("dd", null, `+${R.sensitive_paths} when any changed path looks like migrations, auth, security, payments, infra, CI or container files. Needs the merge commit locally. `, h("details", null, h("summary", null, "Show the pattern"), h("code", null, "/" + META.heuristics.sensitive + "/i"))),
     h("dt", null, "No tests"), h("dd", null, `+${R.no_tests} when ${R.no_tests_min_code_lines}+ lines of non-test, non-doc source changed and no test file did.`),
-    h("dt", null, "Unreviewed"), h("dd", null, `+${R.unreviewed} when merged with no review from anyone other than the author. API data only.`),
+    h("dt", null, "Unreviewed"), h("dd", null, `+${R.unreviewed} when merged with no review from anyone other than the author. Self-reviews and bot reviews do not clear it. API data only.`),
     h("dt", null, "Levels"), h("dd", null, R.levels.map(([lim, n], i) => `${n} ${lim == null ? "≥ " + R.levels[i - 1][0] : "< " + lim}`).join(", "))));
 }
 
