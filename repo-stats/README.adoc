@@ -8,7 +8,7 @@ Generate a self-contained HTML dashboard of code statistics for any git reposito
 * PR type, read from Conventional Commit titles.
 * A transparent risk score for each PR.
 * Time per PR: coding, pickup, review, open to merge, lead time and merge to release.
-* Review cycles per PR, and how many PRs were merged with no review (API data).
+* Review cycles per PR, and how many PRs were merged with no review (API data). Reviews by others, self-reviews and bot reviews are counted and colored separately.
 * DORA metrics: deployment frequency, lead time for changes, change failure rate and time to restore.
 
 Every metric shows count, mean, median, p75, p90, p95, p99, min, max and standard deviation.
@@ -288,7 +288,8 @@ Time to restore::
 For reverts that name the commit they undo: the time from the reverted change's merge to the revert's merge.
 
 Review cycles (API only)::
-One round of review on one version of the PR, by anyone but the author and bots, before the merge.
+One round of review on one version of the PR, before the merge.
+A batched review, a run of single comments, replies to threads and several reviews of the same version all fall in one cycle.
 +
 [cols="3,1"]
 |===
@@ -299,13 +300,25 @@ One round of review on one version of the PR, by anyone but the author and bots,
 | Changes requested, author pushes a fix, approved | 2
 | Three reviewers comment on the same commit, then approval after one push | 2
 | Author pushes again after approval, then merges with no re-review | 2 (an unreviewed push is not a cycle)
+| Reviewer leaves five single comments, then submits a review, all on one commit | 1
 |===
 +
 On GitHub, each review names the commit it was made against, so a review of a new commit (including after a force-push) starts a new cycle.
-On GitLab, comments and approvals by others are reviews and "added N commits" system notes are pushes; a cycle is the reviews between two pushes.
+On GitLab, comments and approvals are reviews and "added N commits" system notes are pushes; a cycle is the reviews between two pushes.
 All of an MR's notes are read, up to 50 cycles.
 The dashboard shows the statistics without unreviewed PRs, with them counted as 0, and the number of PRs merged with no review.
 Git history has no reviews, so in git mode cycles are empty, never guessed.
+
+Who reviewed (API only)::
+Each review is classified by the account that posted it, and cycles are counted separately for each kind:
++
+* *By others*: a person other than the PR author. The headline cycle count, reviewers, pickup and review time use only these.
+* *Self*: the PR author's own account. An agent that posts with the author's credentials (for example through `gh`) is the author as far as the API can tell, so it counts here.
+* *Bot*: a bot account that is not the author (a GitHub App, or a login ending in `[bot]` or `-bot`).
++
+Each merged PR also gets one review status, the strongest it earned: *Reviewed (by others)*, *Reviewed (self)*, *Reviewed (bot)* or *Unreviewed*.
+The dashboard colors them separately, and the CSV has `review_status`, `self_review_cycles` and `bot_review_cycles` columns.
+Self and bot reviews do not clear the unreviewed risk factor.
 
 Performance bands::
 The Elite, High, Medium and Low bands use rounded thresholds from published DORA reports. Treat them as rough.

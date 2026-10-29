@@ -115,6 +115,10 @@ SIZE_BUCKETS = [[10, "XS"], [100, "S"], [500, "M"], [1000, "L"], [None, "XL"]]
 REVIEW_CYCLE_BUCKETS = [0, 1, 2, 3, 4, 5]
 # Counting stops here (the value is then marked inferred). Real PRs very rarely go past a handful.
 REVIEW_CYCLE_CAP = 50
+# Review status of a merged PR, strongest first. A PR takes the first status any of its pre-merge reviews
+# earns: "others" (a person who is not the author), "self" (the author's own account, including agents that
+# act with the author's credentials) or "bot" (a bot account that is not the author); else "none".
+REVIEW_STATUSES = ["others", "self", "bot"]
 # GitLab system notes that mark a push to the MR branch, an approval and a change request.
 GITLAB_PUSH_NOTE = re.compile(r"^\s*(?:added \d+ (?:new )?commits?|force-pushed)\b", re.I)
 GITLAB_REVIEW_NOTE = re.compile(r"^\s*(?:approved this merge request|requested changes)\b", re.I)
@@ -1151,6 +1155,24 @@ def _is_bot(login: Optional[str], typename: Optional[str] = None) -> bool:
     return bool(typename == "Bot" or (login and (login.endswith("[bot]") or login.endswith("-bot"))))
 
 
+def reviewer_kind(pr_author: Optional[str], login: Optional[str], is_bot: bool) -> str:
+    """Classify one reviewer of a PR as "self" (the PR author's own account), "bot" or "others".
+
+    The author check comes first: an agent that posts with the author's credentials is the author as far
+    as the API can tell, so its reviews are self-reviews. Bot accounts (GitHub Apps, *[bot], -bot) that
+    are not the author are "bot"; everyone else is "others".
+    """
+    if login and pr_author and login == pr_author:
+        return "self"
+    return "bot" if is_bot else "others"
+
+
+def review_status(kinds: Iterable[str]) -> str:
+    """Return the strongest review a PR received: others > self > bot > none."""
+    present = set(kinds)
+    return next((k for k in REVIEW_STATUSES if k in present), "none")
+
+
 def count_review_cycles(events: Iterable[Tuple[int, str, Optional[str]]], cap: int = REVIEW_CYCLE_CAP) -> Tuple[int, bool]:
     """Count review cycles from (time, kind, version) events; return (cycles, capped).
 
@@ -1193,15 +1215,26 @@ def github_pr(n: Dict[str, Any]) -> PR:
     merged_at = parse_iso(n.get("mergedAt"))
     review_page = n.get("reviews") or {}
     review_nodes = [r for r in review_page.get("nodes") or [] if r]
-    reviews = [r for r in review_nodes
-               if r.get("submittedAt") and r["state"] != "PENDING"
-               and (merged_at is None or cast(int, parse_iso(r["submittedAt"])) <= merged_at)  # post-merge reviews do not count
-               and (r.get("author") or {}).get("login") != login
-               and not _is_bot((r.get("author") or {}).get("login"), (r.get("author") or {}).get("__typename"))]
+    # Every submitted review before the merge, by reviewer kind; post-merge reviews do not count.
+    by_kind: dict[str, list[dict[str, Any]]] = {k: [] for k in REVIEW_STATUSES}
+    for r in review_nodes:
+        if not r.get("submittedAt") or r.get("state") == "PENDING":
+            continue
+        if merged_at is not None and cast(int, parse_iso(r["submittedAt"])) > merged_at:
+            continue
+        ra = r.get("author") or {}
+        by_kind[reviewer_kind(login, ra.get("login"), _is_bot(ra.get("login"), ra.get("__typename")))].append(r)
+    reviews = by_kind["others"]
     first_review = min((cast(int, parse_iso(r["submittedAt"])) for r in reviews), default=None)
+
+    def cycles_of(rs_: List[Dict[str, Any]]) -> Tuple[int, bool]:
+        """Count review cycles over these reviews; each names the head commit it was made against."""
+        return count_review_cycles((cast(int, parse_iso(r["submittedAt"])), "review", (r.get("commit") or {}).get("oid")) for r in rs_)
+
     # Each review names the head commit it was made against, so a new oid is a new version under review.
-    cycles, capped = count_review_cycles(
-        (cast(int, parse_iso(r["submittedAt"])), "review", (r.get("commit") or {}).get("oid")) for r in reviews)
+    cycles, capped = cycles_of(reviews)
+    self_cycles, self_capped = cycles_of(by_kind["self"])
+    bot_cycles, bot_capped = cycles_of(by_kind["bot"])
     truncated = (review_page.get("totalCount") or 0) > len(review_nodes)
     commits = n.get("commits") or {}
     first_commit = None
@@ -1219,9 +1252,13 @@ def github_pr(n: Dict[str, Any]) -> PR:
         "labels": [l["name"] for l in (n.get("labels") or {}).get("nodes", []) if l],
         "reviewed": first_review is not None if state == "merged" else None,
         "review_cycles": cycles,
+        "self_review_cycles": self_cycles, "bot_review_cycles": bot_cycles,
+        "review_status": review_status(k for k, v in by_kind.items() if v) if state == "merged" else None,
         "changes_requested": sum(1 for r in reviews if r["state"] == "CHANGES_REQUESTED"),
         "reviewers": len({(r.get("author") or {}).get("login") for r in reviews}),
-        "source": "api", "inferred": ["review_cycles"] if truncated or capped else [], "local": None,
+        "source": "api", "local": None,
+        "inferred": [k for k, hit_cap in (("review_cycles", capped), ("self_review_cycles", self_capped),
+                                          ("bot_review_cycles", bot_capped)) if truncated or hit_cap],
     }
 
 
@@ -1315,7 +1352,8 @@ def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch:
                 me = (mr.get("author") or {}).get("username")
                 merged_at = parse_iso(mr.get("merged_at"))
                 # Pushes come from system notes ("added 2 commits"), stamped when pushed, not when authored.
-                events: list[tuple[int, str, Optional[str]]] = []
+                pushes: list[tuple[int, str, Optional[str]]] = []
+                events: dict[str, list[tuple[int, str, Optional[str]]]] = {k: [] for k in REVIEW_STATUSES}
                 reviewers: set[str] = set()
                 first_review: Optional[int] = None
                 for note in pages(f"{base}/{int(iid)}/notes", {"sort": "asc", "order_by": "created_at"}):
@@ -1325,20 +1363,24 @@ def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch:
                         continue  # comments after the merge are not a review
                     body = note.get("body") or ""
                     if note.get("system") and GITLAB_PUSH_NOTE.match(body):
-                        events.append((t, "push", None))
+                        pushes.append((t, "push", None))
                         continue
                     if note.get("system") and not GITLAB_REVIEW_NOTE.match(body):
                         continue
-                    if a.get("username") == me or _is_bot(a.get("username"), "Bot" if a.get("bot") else None):
+                    kind = reviewer_kind(me, a.get("username"), _is_bot(a.get("username"), "Bot" if a.get("bot") else None))
+                    events[kind].append((t, "review", None))
+                    if kind != "others":
                         continue
-                    events.append((t, "review", None))
                     reviewers.add(str(a.get("username")))
                     if first_review is None:
                         first_review = t
-                    if len(events) % 100 == 0 and count_review_cycles(events)[1]:
+                    if len(events["others"]) % 100 == 0 and count_review_cycles(pushes + events["others"])[1]:
                         break  # REVIEW_CYCLE_CAP cycles is far past anything useful: stop paging
                 out["first_review"] = first_review
-                out["review_cycles"], out["cycles_capped"] = count_review_cycles(events)
+                out["review_cycles"], out["cycles_capped"] = count_review_cycles(pushes + events["others"])
+                out["self_review_cycles"], out["self_cycles_capped"] = count_review_cycles(pushes + events["self"])
+                out["bot_review_cycles"], out["bot_cycles_capped"] = count_review_cycles(pushes + events["bot"])
+                out["review_status"] = review_status(k for k, v in events.items() if v)
                 out["reviewers"] = len(reviewers)
             except (ApiError, ValueError, KeyError, TypeError, AttributeError) as e:
                 out["review_error"] = str(e)
@@ -1367,9 +1409,14 @@ def fetch_gitlab(cli: Cli, project_path: str, since: Optional[int], base_branch:
             "reviewed": (ex["first_review"] is not None) if (state == "merged" and review_known) else None,
             # Older GitLab versions record no "requested changes" event, so a 0 could mislead: leave it unknown.
             "review_cycles": ex["review_cycles"] if review_known else None, "changes_requested": None,
+            "self_review_cycles": ex.get("self_review_cycles") if review_known else None,
+            "bot_review_cycles": ex.get("bot_review_cycles") if review_known else None,
+            "review_status": ex.get("review_status") if (state == "merged" and review_known) else None,
             "reviewers": ex["reviewers"] if review_known else None,
             "source": "api", "inferred": ["ready"] + ([] if review_known else ["first_review"])
-                                         + (["review_cycles"] if ex["cycles_capped"] else []),
+                                         + (["review_cycles"] if ex["cycles_capped"] else [])
+                                         + (["self_review_cycles"] if ex.get("self_cycles_capped") else [])
+                                         + (["bot_review_cycles"] if ex.get("bot_cycles_capped") else []),
             "squash_sha": mr.get("squash_commit_sha"), "local": None, "commits_refused": commits_refused,
         })
     return result
@@ -1401,7 +1448,8 @@ def risk_for(pr: Dict[str, Any]) -> Tuple[int, str, List[RiskFactor]]:
     if pr.get("tests") is False and (pr.get("code_lines") or 0) >= RISK["no_tests_min_code_lines"]:
         add("no tests", RISK["no_tests"], f"{pr['code_lines']} code lines, no test files")
     if pr.get("reviewed") is False:
-        add("unreviewed", RISK["unreviewed"], "merged with no review from another person")
+        only = {"self": " (self-review only)", "bot": " (bot review only)"}.get(pr.get("review_status") or "", "")
+        add("unreviewed", RISK["unreviewed"], "merged with no review from another person" + only)
     score = min(RISK["cap"], sum(f["points"] for f in factors))
     level = tier(score, [[limit - 1 if limit else None, name] for limit, name in RISK["levels"]])
     return score, level, factors
@@ -1494,6 +1542,8 @@ def build_records(prs: List[PR], ctx: Dict[str, Any]) -> List[Record]:
             # None when unknown: git mode, GitLab with --no-reviews, or a failed review lookup.
             "review_cycles": pr.get("review_cycles"), "changes_requested": pr.get("changes_requested"),
             "reviewers": pr.get("reviewers"),
+            "self_review_cycles": pr.get("self_review_cycles"), "bot_review_cycles": pr.get("bot_review_cycles"),
+            "review_status": pr.get("review_status"),
         }
         sensitive = tests = code_lines = None
         if c is not None:
@@ -1622,7 +1672,8 @@ def write_csv(path: str, records: Iterable[Record]) -> None:
     cols = ["id", "title", "type", "scope", "breaking", "state", "bot", "created", "first_commit", "first_review",
             "merged", "additions", "deletions", "files", "commits", "risk", "risk_level", "kind",
             "coding", "pickup", "review", "open_to_merge", "lead", "deployed", "deploy_wait", "lead_to_deploy",
-            "restore", "review_cycles", "changes_requested", "reviewers", "source"]
+            "restore", "review_cycles", "changes_requested", "reviewers", "source",
+            "review_status", "self_review_cycles", "bot_review_cycles"]
 
     def write(f: IO[str]) -> None:
         """Write the header and one guarded row per record to f."""
