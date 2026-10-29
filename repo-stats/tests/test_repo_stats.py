@@ -544,6 +544,14 @@ class A11_Options(unittest.TestCase):
         self.assertEqual([p["number"] for p in d["prs"]], [1, 2])
         self.assertEqual([x["name"] for x in d["deploys"]], ["v1.0.0"])
 
+    def test_window_is_recorded_in_meta(self) -> None:
+        """The --since / --until window is in meta, so the dashboard clamps its date range to it."""
+        d, _ = collect(merge_repo(), "--since", "2022-01-05", "--until", "2022-01-06")
+        self.assertEqual((d["meta"]["since"], d["meta"]["until"]), (T0 + 4 * DAY, T0 + 6 * DAY))
+        self.assertLess(d["loc"]["days"][0][0], d["meta"]["since"])  # lines of code still cover the whole history
+        d, _ = collect(merge_repo())
+        self.assertEqual((d["meta"]["since"], d["meta"]["until"]), (None, None))
+
     def test_until_is_inclusive_of_that_day_only(self) -> None:
         """--until includes its whole day and nothing after it."""
         r = Repo()

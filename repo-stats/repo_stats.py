@@ -1916,6 +1916,9 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
     name = args.title or (parsed[1].rsplit("/", 1)[-1] if parsed else os.path.basename(repo))
     meta = {
         "name": name, "branch": branch, "generated": int(time.time()), "version": __version__,
+        # The --since / --until window (Unix seconds, until exclusive), or None. Lines of code keep the whole
+        # history so the totals are right, so the dashboard clamps its date range to this window.
+        "since": since, "until": until,
         "mode": mode, "provider": provider if mode == "api" else None,
         "warnings": warnings, "commits": len(graph), "direct_commits": direct, "sync_merges": sync,
         "deploy_source": args.deploy_source, "tag_pattern": args.tag_pattern,

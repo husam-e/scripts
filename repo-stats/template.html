@@ -236,6 +236,10 @@ const allTimes = [].concat(PRS.map((p) => p.merged || p.created), PRS.map((p) =>
 let DATA_LO = Infinity, DATA_HI = -Infinity;
 for (const t of allTimes) { if (t < DATA_LO) DATA_LO = t; if (t > DATA_HI) DATA_HI = t; } // no Math.min(...big array)
 if (!isFinite(DATA_LO)) { DATA_LO = DATA_HI = Math.floor(Date.now() / 1000); }
+// With --since / --until, lines of code still cover the whole history (so totals are right): clamp to the window.
+if (META.since != null) DATA_LO = Math.max(DATA_LO, META.since);
+if (META.until != null) DATA_HI = Math.min(DATA_HI, META.until - 1);
+if (DATA_LO > DATA_HI) DATA_LO = DATA_HI;
 const TYPE_GROUPS = ["feat", "fix", "refactor", "docs", "test", "chore", "perf", "other"];
 const GROUP_OF = { style: "chore", build: "chore", ci: "chore", revert: "other" };
 const groupOf = (t) => TYPE_GROUPS.includes(t) ? t : (GROUP_OF[t] || "other");
