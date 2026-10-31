@@ -650,16 +650,14 @@ const kpiBand = (v, elite, good, mid, higherGood) => {
     : (v <= elite ? ["Elite", "elite"] : v <= good ? ["Low", "good"] : v <= mid ? ["Medium", "neutral"] : ["High", "bad"]);
   return h("span", { class: "band " + cls, title: "Approximate heuristic band (see Methodology)" }, label);
 };
-function band(kind, value) {
-  const b = {
-    freq: [1, 1 / 7, 1 / 30, true],
-    lead: [DAY, 7 * DAY, 30 * DAY, false],
-    cfr: [0.05, 0.10, 0.15, false],
-    restore: [3600, DAY, 7 * DAY, false],
-  }[kind];
-  const el = b ? kpiBand(value, ...b) : null;
-  return el ? el.textContent : null;
-}
+const DORA_TIERS = {
+  freq: [1, 1 / 7, 1 / 30, true],
+  lead: [DAY, 7 * DAY, 30 * DAY, false],
+  cfr: [0.05, 0.10, 0.15, false],
+  restore: [3600, DAY, 7 * DAY, false],
+};
+const doraBand = (kind, v) => DORA_TIERS[kind] ? kpiBand(v, ...DORA_TIERS[kind]) : null;
+const band = (kind, value) => { const el = doraBand(kind, value); return el ? el.textContent : null; };
 
 /** One lead-time definition everywhere (KPI, DORA card, by-type table): to release when any merged PR in
  *  the selection has a release, else to merge. In release mode PRs not yet released are left out. */
@@ -716,11 +714,11 @@ function renderKpis(app, sel) {
   app.append(h("div", { class: "kpis", id: "overview" },
     kpi("Merged PRs", fmtInt(merged.length), `${fmtNum(merged.length / days * 7)} per week`),
     kpi("Median PR size", merged.length ? fmtInt(size.median) : "–", `lines changed · p90 ${fmtInt(size.p90)}`, kpiBand(size.median, 25, 100, 500)),
-    kpi("Median lead time", fmtDur(lead.median), `${lm.label} · p90 ${fmtDur(lead.p90)}`, kpiBand(lead.median, DAY, 7 * DAY, 30 * DAY)),
+    kpi("Median lead time", fmtDur(lead.median), `${lm.label} · p90 ${fmtDur(lead.p90)}`, doraBand("lead", lead.median)),
     kpi("Median review cycles", cyc.reviewed.length ? fmtNum(cyc.stReviewed.median) : "–", cyc.known.length ? `reviewed PRs · p90 ${fmtNum(cyc.stReviewed.p90)} · ${fmtNum(cyc.stAll.median)} incl. unreviewed` : noCyc, kpiBand(cyc.stReviewed.median, 1, 2, 3)),
     kpi("Merged without review", cyc.known.length ? fmtInt(cyc.unreviewed.length) : "–", cyc.known.length ? `${fmtPct(unrev)} of merged PRs · ${fmtInt(cyc.unreviewed.filter((p) => statusOf(p) === "self").length)} self-reviewed · ${fmtInt(cyc.unreviewed.filter((p) => statusOf(p) === "bot").length)} bot only` : noCyc, kpiBand(unrev, 0, 0.05, 0.20)),
-    kpi("Releases", fmtInt(deploys.length), deploys.length ? `${fmtNum(freq * 7)} per week` : "no release tags matched", deploys.length ? kpiBand(freq, 1, 1 / 7, 1 / 30, true) : null),
-    kpi("Change failure rate", fmtPct(cfr), `${fails} revert/hotfix PRs`, kpiBand(cfr, 0.05, 0.10, 0.15)),
+    kpi("Releases", fmtInt(deploys.length), deploys.length ? `${fmtNum(freq * 7)} per week` : "no release tags matched", deploys.length ? doraBand("freq", freq) : null),
+    kpi("Change failure rate", fmtPct(cfr), `${fails} revert/hotfix PRs`, doraBand("cfr", cfr)),
     kpi("High or critical risk", fmtPct(hiRisk), "share of merged PRs", kpiBand(hiRisk, 0.05, 0.10, 0.25)),
     kpi("Lines of code", locEnd ? fmtCompact(locEnd[1]) : "–", locEnd ? `at end of range · ${fmtPct(locEnd[1] > 0 ? Math.max(0, locEnd[4]) / locEnd[1] : null)} test` : ""),
   ));
@@ -1056,27 +1054,27 @@ function renderDora(app, sel) {
   });
   fc.body.append(statsTable(rows));
   const perDay = times.length / Math.max(1, (r.hi - r.lo) / DAY);
-  fc.body.append(h("p", { class: "note" }, `Average ${fmtNum(perDay * 7)} per week.`, times.length ? kpiBand(perDay, 1, 1 / 7, 1 / 30, true) : null));
+  fc.body.append(h("p", { class: "note" }, `Average ${fmtNum(perDay * 7)} per week.`, times.length ? doraBand("freq", perDay) : null));
 
   const lc = card(grid, "Lead time for changes", { wide: true });
   const lm = leadMode(merged);
   const lt = stats(merged.map((p) => p[lm.key]));
   lc.body.append(statsTable([{ label: lm.release ? "First commit to release" : "First commit to merge", st: lt, fmt: fmtDur }]));
   const unreleased = lm.release ? merged.filter((p) => p.lead_to_deploy == null).length : 0;
-  lc.body.append(h("p", { class: "note" }, lm.release ? `Measured to the first release tag that contains the change${unreleased ? `; ${unreleased} merged PR(s) not yet released are left out` : ""}. The overview card and the by-type table use the same definition.` : "No merged PR in this range has a release, so this stops at merge time.", kpiBand(lt.median, DAY, 7 * DAY, 30 * DAY)));
+  lc.body.append(h("p", { class: "note" }, lm.release ? `Measured to the first release tag that contains the change${unreleased ? `; ${unreleased} merged PR(s) not yet released are left out` : ""}. The overview card and the by-type table use the same definition.` : "No merged PR in this range has a release, so this stops at merge time.", doraBand("lead", lt.median)));
 
   const cf = card(grid, "Change failure rate", { wide: true, note: "Revert or hotfix PRs as a share of merged PRs, by month." });
   const byM = groupBy(merged, (p) => bucketStart(p.merged, "month"));
   const mk = [...byM.keys()].sort((a, b) => a - b);
   const fails = merged.filter((p) => p.kind);
   lineChart(cf.body, { xs: mk, series: [{ name: "Failure rate", color: css("--c8"), ys: mk.map((m) => 100 * byM.get(m).filter((p) => p.kind).length / byM.get(m).length) }], yFmt: (v) => Math.round(v) + "%", tipFmt: (v) => nf.format(v) + "%", xTip: (x) => bucketLabel(x, "month"), label: "Change failure rate by month", table: cf.table, h: 200 });
-  cf.body.append(h("p", { class: "note" }, `${fails.length} of ${merged.length} merged PRs (${fmtPct(merged.length ? fails.length / merged.length : null)}): ${fails.filter((p) => p.kind === "revert").length} reverts, ${fails.filter((p) => p.kind === "hotfix").length} hotfixes.` + (deploys.length ? ` ${deploys.filter((d) => d.fix).length} of ${deploys.length} releases contain one.` : ""), kpiBand(merged.length ? fails.length / merged.length : null, 0.05, 0.10, 0.15)));
+  cf.body.append(h("p", { class: "note" }, `${fails.length} of ${merged.length} merged PRs (${fmtPct(merged.length ? fails.length / merged.length : null)}): ${fails.filter((p) => p.kind === "revert").length} reverts, ${fails.filter((p) => p.kind === "hotfix").length} hotfixes.` + (deploys.length ? ` ${deploys.filter((d) => d.fix).length} of ${deploys.length} releases contain one.` : ""), doraBand("cfr", merged.length ? fails.length / merged.length : null)));
 
   const rc = card(grid, "Time to restore", { wide: true });
   const rs = stats(merged.map((p) => p.restore));
   if (rs.n) {
     rc.body.append(statsTable([{ label: "Revert merged after the change it reverts", st: rs, fmt: fmtDur }]));
-    rc.body.append(h("p", { class: "note" }, `Based on ${rs.n} revert commits that name the change they undo. Hotfixes cannot be matched to a failure from git, so they are not included.`, kpiBand(rs.median, 3600, DAY, 7 * DAY)));
+    rc.body.append(h("p", { class: "note" }, `Based on ${rs.n} revert commits that name the change they undo. Hotfixes cannot be matched to a failure from git, so they are not included.`, doraBand("restore", rs.median)));
   } else rc.body.append(h("div", { class: "empty" }, "No reverts that reference the commit they undo were found."));
 }
 

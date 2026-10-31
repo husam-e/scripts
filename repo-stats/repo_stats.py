@@ -1915,11 +1915,11 @@ def collect(args: argparse.Namespace, environ: Optional[Mapping[str, str]] = Non
 
     name = args.title or (parsed[1].rsplit("/", 1)[-1] if parsed else os.path.basename(repo))
     fp_in_window = [c for c in first_parent if until is None or c["ct"] < until]
-    head_sha = (fp_in_window[-1] if fp_in_window else first_parent[-1])["sha"]
+    head_sha = fp_in_window[-1]["sha"] if fp_in_window else None
     commit_url = (f"https://{api_host}/{parsed[1]}/{'commit' if provider == 'github' else '-/commit'}/{head_sha}"
-                  if parsed and provider and api_host and not args.no_titles and re.fullmatch(r"[\w./-]+", parsed[1]) else None)
+                  if head_sha and parsed and provider and api_host and not args.no_titles and re.fullmatch(r"[\w./-]+", parsed[1]) else None)
     meta = {
-        "name": name, "branch": branch, "commit": head_sha[:7], "commit_url": commit_url,
+        "name": name, "branch": branch, "commit": head_sha[:7] if head_sha else None, "commit_url": commit_url,
         "generated": int(time.time()), "version": __version__,
         # The --since / --until window (Unix seconds, until exclusive), or None. Lines of code keep the whole
         # history so the totals are right, so the dashboard clamps its date range to this window.
