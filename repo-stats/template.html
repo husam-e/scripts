@@ -1201,7 +1201,7 @@ function renderAll() {
 document.title = "Repo stats – " + META.name;
 $("#title").textContent = META.name;
 const shaNode = META.commit ? (/^https:\/\/[\w.-]+\//.test(META.commit_url || "") ? h("a", { href: META.commit_url, target: "_blank", rel: "noopener noreferrer" }, META.commit) : META.commit) : null;
-$("#subtitle").replaceChildren(`Branch ${META.branch} · ${fmtInt(META.commits)} commits · ${fmtDate(DATA_LO)} to ${fmtDate(DATA_HI)} · generated ${fmtDate(META.generated)}`, ...(shaNode ? [" (", shaNode, ")"] : []));
+$("#subtitle").replaceChildren(`Branch ${META.branch} · ${fmtInt(META.commits)} commits · ${fmtDate(DATA_LO)} to ${fmtDate(DATA_HI)} · generated ${fmtDate(META.generated)}`, ...(shaNode ? [" as of ", shaNode] : []));
 renderBanner();
 renderAll();
 let resizeTimer;
