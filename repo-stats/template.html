@@ -10,7 +10,7 @@
   color-scheme: dark;
   --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
   --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10); --hover: rgba(255,255,255,0.07);
-  --good-text: #0ca30c; --bad-text: #e66767;
+  --good-text: #0ca30c; --bad-text: #e66767; --elite-text: #fbbf24;
   --c1: #3987e5; --c2: #d95926; --c3: #199e70; --c4: #c98500; --c5: #d55181; --c6: #008300; --c7: #9085e9; --c8: #e66767;
   --other: #898781;
   --st-good: #0ca30c; --st-warn: #fab219; --st-serious: #ec835a; --st-crit: #d03b3b;
@@ -19,7 +19,7 @@
   color-scheme: light;
   --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
   --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10); --hover: rgba(11,11,11,0.05);
-  --good-text: #006300; --bad-text: #b91c1c;
+  --good-text: #006300; --bad-text: #b91c1c; --elite-text: #9a6700;
   --c1: #2a78d6; --c2: #eb6834; --c3: #1baf7a; --c4: #eda100; --c5: #e87ba4; --c6: #008300; --c7: #6250d6; --c8: #e34948;
 }
 * { box-sizing: border-box; }
@@ -67,6 +67,7 @@ button[aria-pressed="true"] { border-color: var(--ink2); font-weight: 600; }
 .kpi .value { display: inline-block; font-size: 26px; font-weight: 650; line-height: 1.2; margin-top: 2px; vertical-align: middle; }
 .kpi .hint { color: var(--muted); font-size: 12px; margin-top: 2px; }
 .band { display: inline-block; font-size: 11px; font-weight: 650; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); margin-left: 6px; vertical-align: middle; }
+.band.elite { color: var(--elite-text); border-color: color-mix(in srgb, var(--st-warn) 55%, transparent); background: color-mix(in srgb, var(--st-warn) 16%, transparent); }
 .band.good { color: var(--good-text); border-color: color-mix(in srgb, var(--st-good) 45%, transparent); background: color-mix(in srgb, var(--st-good) 14%, transparent); }
 .band.neutral { color: var(--ink2); background: var(--hover); }
 .band.bad { color: var(--bad-text); border-color: color-mix(in srgb, var(--st-crit) 45%, transparent); background: color-mix(in srgb, var(--st-crit) 14%, transparent); }
@@ -652,8 +653,14 @@ function band(kind, value) {
   for (const [t, n] of tiers) if (value <= t) return n;
   return "Low";
 }
-const bandEl = (b) => b ? h("span", { class: "band", title: "Approximate DORA performance band (see Methodology)" }, b) : null;
-const kpiBand = (v, lo, hi, higherGood) => v == null || !isFinite(v) ? null : h("span", { class: "band " + (v <= lo ? (higherGood ? "bad" : "good") : v <= hi ? "neutral" : (higherGood ? "good" : "bad")) }, v <= lo ? "Low" : v <= hi ? "Medium" : "High");
+const bandEl = (b) => b ? h("span", { class: "band " + ({ Elite: "elite", High: "good", Medium: "neutral", Low: "bad" }[b] || ""), title: "Approximate DORA performance band (see Methodology)" }, b) : null;
+const kpiBand = (v, elite, lo, hi, higherGood) => {
+  if (v == null || !isFinite(v)) return null;
+  const [label, cls] = higherGood
+    ? (v >= elite ? ["Elite", "elite"] : v >= hi ? ["High", "good"] : v >= lo ? ["Medium", "neutral"] : ["Low", "bad"])
+    : (v <= elite ? ["Elite", "elite"] : v <= lo ? ["Low", "good"] : v <= hi ? ["Medium", "neutral"] : ["High", "bad"]);
+  return h("span", { class: "band " + cls }, label);
+};
 
 /** One lead-time definition everywhere (KPI, DORA card, by-type table): to release when any merged PR in
  *  the selection has a release, else to merge. In release mode PRs not yet released are left out. */
@@ -709,13 +716,13 @@ function renderKpis(app, sel) {
   const noCyc = META.mode === "git" ? "needs API review data" : "no review data";
   app.append(h("div", { class: "kpis", id: "overview" },
     kpi("Merged PRs", fmtInt(merged.length), `${fmtNum(merged.length / days * 7)} per week`),
-    kpi("Median PR size", merged.length ? fmtInt(size.median) : "–", `lines changed · p90 ${fmtInt(size.p90)}`, kpiBand(size.median, 100, 500)),
-    kpi("Median lead time", fmtDur(lead.median), `${lm.label} · p90 ${fmtDur(lead.p90)}`, kpiBand(lead.median, 7 * DAY, 30 * DAY)),
-    kpi("Median review cycles", cyc.reviewed.length ? fmtNum(cyc.stReviewed.median) : "–", cyc.known.length ? `reviewed PRs · p90 ${fmtNum(cyc.stReviewed.p90)} · ${fmtNum(cyc.stAll.median)} incl. unreviewed` : noCyc, kpiBand(cyc.stReviewed.median, 1.5, 3)),
-    kpi("Merged without review", cyc.known.length ? fmtInt(cyc.unreviewed.length) : "–", cyc.known.length ? `${fmtPct(unrev)} of merged PRs · ${fmtInt(cyc.unreviewed.filter((p) => statusOf(p) === "self").length)} self-reviewed · ${fmtInt(cyc.unreviewed.filter((p) => statusOf(p) === "bot").length)} bot only` : noCyc, kpiBand(unrev, 0.05, 0.20)),
-    kpi("Releases", fmtInt(deploys.length), deploys.length ? `${fmtNum(freq * 7)} per week` : "no release tags matched", deploys.length ? kpiBand(freq, 1 / 30, 1 / 7 - 1e-9, true) : null),
-    kpi("Change failure rate", fmtPct(cfr), `${fails} revert/hotfix PRs`, kpiBand(cfr, 0.10, 0.15)),
-    kpi("High or critical risk", fmtPct(hiRisk), "share of merged PRs", kpiBand(hiRisk, 0.10, 0.25)),
+    kpi("Median PR size", merged.length ? fmtInt(size.median) : "–", `lines changed · p90 ${fmtInt(size.p90)}`, kpiBand(size.median, 25, 100, 500)),
+    kpi("Median lead time", fmtDur(lead.median), `${lm.label} · p90 ${fmtDur(lead.p90)}`, kpiBand(lead.median, DAY, 7 * DAY, 30 * DAY)),
+    kpi("Median review cycles", cyc.reviewed.length ? fmtNum(cyc.stReviewed.median) : "–", cyc.known.length ? `reviewed PRs · p90 ${fmtNum(cyc.stReviewed.p90)} · ${fmtNum(cyc.stAll.median)} incl. unreviewed` : noCyc, kpiBand(cyc.stReviewed.median, 1, 1.5, 3)),
+    kpi("Merged without review", cyc.known.length ? fmtInt(cyc.unreviewed.length) : "–", cyc.known.length ? `${fmtPct(unrev)} of merged PRs · ${fmtInt(cyc.unreviewed.filter((p) => statusOf(p) === "self").length)} self-reviewed · ${fmtInt(cyc.unreviewed.filter((p) => statusOf(p) === "bot").length)} bot only` : noCyc, kpiBand(unrev, 0, 0.05, 0.20)),
+    kpi("Releases", fmtInt(deploys.length), deploys.length ? `${fmtNum(freq * 7)} per week` : "no release tags matched", deploys.length ? kpiBand(freq, 1, 1 / 30, 1 / 7, true) : null),
+    kpi("Change failure rate", fmtPct(cfr), `${fails} revert/hotfix PRs`, kpiBand(cfr, 0.05, 0.10, 0.15)),
+    kpi("High or critical risk", fmtPct(hiRisk), "share of merged PRs", kpiBand(hiRisk, 0.05, 0.10, 0.25)),
     kpi("Lines of code", locEnd ? fmtCompact(locEnd[1]) : "–", locEnd ? `at end of range · ${fmtPct(locEnd[1] > 0 ? Math.max(0, locEnd[4]) / locEnd[1] : null)} test` : ""),
   ));
 }
