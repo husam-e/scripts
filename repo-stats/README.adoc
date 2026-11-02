@@ -1,4 +1,7 @@
 = repo-stats
+:toc:
+
+== Overview
 
 Generate a self-contained HTML dashboard of code statistics for any git repository.
 
